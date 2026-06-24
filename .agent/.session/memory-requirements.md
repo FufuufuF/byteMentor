@@ -14,13 +14,12 @@ Byte Mentor 的记忆模块不是普通聊天记录存储，也不是简单的�
 
 > 把用户学习过程中的表现沉淀成 AI 可读取、可更新、可用于后续教学决策的长期知识状态。
 
-这里的知识图谱不是对整个计算机知识体系建模。
+当前需要区分两个概念：
 
-它代表的是：
+- 全局知识图谱：为教学规划和记忆召回服务的知识节点与关系索引，不追求覆盖整个计算机知识体系。
+- 用户知识状态：某个用户对某个知识点的掌握情况，是长期记忆真正承载的内容。
 
-> 用户个人对计算机知识的掌握情况。
-
-因此，系统关注的不是“计算机世界中所有知识点之间的完整关系”，而是：
+因此，系统关注的不是“计算机世界中所有知识点之间的完整关系”，而是围绕用户学习状态回答：
 
 - 用户学过什么
 - 用户没学过什么
@@ -30,23 +29,28 @@ Byte Mentor 的记忆模块不是普通聊天记录存储，也不是简单的�
 - 用户已有知识能否帮助理解新知识
 - AI 下次教学时应该参考哪些历史状态
 
-## 3. 当前确定的三块结构
+## 3. 当前确定的分层结构
 
-当前记忆模块分为三块：
+当前记忆模块分为四个正式层：
 
-1. 知识目录层
-2. 用户知识状态图谱
-3. 用户可读笔记
+1. 知识目录索引层（CatalogIndex）
+2. 知识图谱层（KnowledgeGraph）
+3. 用户知识状态层（UserKnowledgeState）
+4. 用户可读笔记层（UserReadableNote）
 
 其中：
 
-- 知识目录层和用户知识状态图谱主要服务 AI。
-- 用户可读笔记主要服务用户复习。
-- 用户知识状态图谱和用户可读笔记可以互相引用，但不应该混成同一个东西。
+- 知识目录索引层负责通过路径稳定定位知识点 ID。
+- 知识图谱层负责描述知识点之间的全局关系，并作为召回相关知识状态的关系索引。
+- 用户知识状态层负责记录某个用户对某个知识点的长期掌握状态。
+- 用户可读笔记层主要服务用户复习。
+- 用户知识状态层和用户可读笔记层可以互相引用，但不应该混成同一个结构。
 
-## 4. 知识目录层
+Observation Log 是会话过程中的证据记录，服务会话结束后的统一更新，不属于以上四个正式层之一。
 
-知识目录层按照类似教科书目录的方式组织知识点。
+## 4. 知识目录索引层（CatalogIndex）
+
+知识目录索引层按照类似教科书目录的方式组织知识点路径。
 
 示例：
 
@@ -62,51 +66,248 @@ JavaScript
     继承
 ```
 
-这一层的职责是提供稳定的知识锚点。
+这一层的职责是提供稳定、低成本的定位入口。
 
 它回答的是：
 
-> 这个知识点叫什么？它在学习体系中属于哪里？
+> 用户给出的学习目标，对应知识图谱中的哪个 knowledgeNodeId？
 
-这一层暂时只承担目录和定位作用，不表达复杂关系，也不直接表达用户掌握情况。
+知识图谱中的 `belongs_to` 关系本身可以隐含目录结构，但如果每次都从图中遍历目录，会产生额外成本，也会让 LLM 更难稳定拿到单个知识点的 ID。
+
+因此，当前确定显式维护一层 CatalogIndex，作为性能优化和稳定定位入口。
+
+CatalogIndex 只做索引，不表达复杂语义关系，也不直接表达用户掌握情况。
+
+它主要索引：
+
+- 路径到 `knowledgeNodeId` 的映射
+- 当前节点的展示路径
+- 当前节点的直接父级目录项
+- 当前节点是 `topic` 还是 `learning_unit`
+
+初版结构示例：
+
+```ts
+type CatalogEntry = {
+  id: string
+
+  knowledgeNodeId: string
+
+  path: string[]
+  pathKey: string
+
+  name: string
+  kind: "topic" | "learning_unit"
+
+  parentCatalogEntryId?: string
+
+  status: "draft" | "active" | "deprecated"
+}
+```
+
+查询用户状态时，路径是：
+
+```text
+pathKey
+  -> CatalogEntry
+  -> knowledgeNodeId
+  -> UserKnowledgeState(userId, knowledgeNodeId)
+```
 
 后续可以用 JSON 文档、MongoDB、SQLite、Postgres JSONB 或其他形式维护。当前不绑定具体数据库。
 
-## 5. 用户知识状态图谱
+## 5. 知识图谱层（KnowledgeGraph）
 
-用户知识状态图谱是 AI 读的核心结构。
+知识图谱层描述知识点本身以及知识点之间的全局教学关系。
 
-它不是全量知识图谱，而是围绕某个用户逐渐生长出来的个人知识掌握图谱。
+它不是用户个人状态，也不是完整百科知识图谱。
 
-一个知识点进入用户知识状态图谱，通常来自：
+它的主要作用是：
+
+- 定义知识点节点
+- 表达知识点之间的关系
+- 在生成 Teaching Brief 时决定应该读取哪些用户知识状态
+- 在会话中单节点加载时提供该节点的局部上下文
+
+当前确定采用“点和边分开维护”的方式：
+
+```text
+KnowledgeNode
+KnowledgeEdge
+```
+
+邻接表、children 列表、完整 path 等结构都可以作为派生索引或缓存，但不作为唯一事实来源。
+
+### 5.1 KnowledgeNode
+
+KnowledgeNode 只描述“这个知识点是什么”，不存用户掌握状态，也不直接存父子关系。
+
+当前确定的节点类型有两种：
+
+```ts
+type KnowledgeNodeKind = "topic" | "learning_unit"
+```
+
+`topic` 是任意深度的目录或章节节点。
+
+示例：
+
+```text
+JavaScript
+JavaScript / 异步
+JavaScript / 异步 / async/await
+计算机网络
+计算机网络 / 传输层
+计算机网络 / 传输层 / TCP协议
+```
+
+`learning_unit` 是可教学、可测评、可记录用户掌握状态的最小学习单元。
+
+示例：
+
+```text
+await 的暂停与恢复
+await 后续代码进入微任务
+TCP 三次握手过程
+this 的调用位置绑定规则
+```
+
+判断一个节点是否应该是 `learning_unit` 的标准是：
+
+> 它能否被单独教学、单独追问、单独答错、单独记录误解，并单独影响后续教学。
+
+如果一个节点下面还能自然拆出多个可独立教学和测评的单元，它更适合作为 `topic`。
+
+因此：
+
+- `函数` 通常是 `topic`
+- `this 绑定规则` 通常是 `learning_unit`
+- `TCP协议` 通常是 `topic`
+- `TCP 三次握手过程` 通常是 `learning_unit`
+
+KnowledgeNode 初版字段：
+
+```ts
+type KnowledgeNode = {
+  id: string
+
+  kind: "topic" | "learning_unit"
+
+  name: string
+  definition: string
+
+  learningGoals?: string[]
+  assessmentPrompts?: string[]
+  commonMisconceptions?: string[]
+
+  nonGoals?: string[]
+
+  noteRef?: {
+    type: "markdown" | "database"
+    target: string
+  }
+
+  difficulty?: "intro" | "basic" | "intermediate" | "advanced"
+
+  status: "draft" | "active" | "deprecated"
+
+  createdAt: string
+  updatedAt: string
+}
+```
+
+字段说明：
+
+- `id`：知识节点稳定 ID，供边、用户状态和笔记引用。
+- `kind`：节点类型，区分 `topic` 和 `learning_unit`。
+- `name`：当前节点名，只表示最近一级名称，不表示完整路径。
+- `definition`：节点边界的一句话定义。
+- `learningGoals`：学习目标，主要用于 `learning_unit`。
+- `assessmentPrompts`：用于检测掌握情况的追问或题目方向。
+- `commonMisconceptions`：该知识点的全局常见误解，不表示某个用户已经存在这些误解。
+- `nonGoals`：可选字段，只在容易混淆的地方手动说明当前节点不覆盖什么。
+- `noteRef`：指向该知识点的通用用户可读笔记，可以是 Markdown 路径，也可以是数据库 ID。
+- `difficulty`：大致教学难度。
+- `status`：节点状态。
+- `createdAt` / `updatedAt`：创建和更新时间。
+
+当前确定不在 KnowledgeNode 中维护 `aliases`。
+
+当前也不使用自由发挥式的 `scope.includes/excludes` 作为核心字段。节点边界主要由 `definition`、`learningGoals` 和必要时手写的 `nonGoals` 共同约束。
+
+### 5.2 KnowledgeEdge
+
+KnowledgeEdge 描述知识点之间的关系。
+
+当前只确定以下原则：
+
+- 边是独立结构，不嵌入 KnowledgeNode。
+- `belongs_to` 用于表达目录从属关系。
+- `belongs_to` 的方向统一为 `child -> parent`。
+- 其他语义边用于表达前置、对比、类比、易混淆、应用场景等教学关系。
+- 具体语义边类型后续继续设计。
+
+示例：
+
+```text
+异步 -> belongs_to -> JavaScript
+async/await -> belongs_to -> 异步
+await 的暂停与恢复 -> belongs_to -> async/await
+TCP协议 -> belongs_to -> 传输层
+TCP 三次握手过程 -> belongs_to -> TCP协议
+```
+
+KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，原因是它提供更直接、更稳定的路径定位能力。
+
+## 6. 用户知识状态层（UserKnowledgeState）
+
+用户知识状态层是 AI 读的核心长期记忆。
+
+它不是全局知识图谱，而是围绕某个用户逐渐生长出来的个人知识掌握状态集合。
+
+一个知识点进入用户知识状态层，通常来自：
 
 - 用户主动学习了这个知识点
 - 用户在学习其他内容时暴露出这个知识点的缺失
 - 用户在问答、复述或模拟面试中暴露了相关误解
 - agent 判断该知识点是后续学习的关键前置
 
-因此，用户知识状态图谱不应该只包含“已经学过”的知识点，也可以包含：
+因此，用户知识状态层不应该只包含“已经学过”的知识点，也可以包含：
 
 - 未学但已暴露为前置缺失的知识点
 - 被提到但尚未系统学习的知识点
 - 影响当前学习效果的薄弱知识点
 
-图谱中的节点不是抽象知识本身，而是：
+用户知识状态不是抽象知识本身，而是：
 
-> 某个用户对某个知识点的掌握状态。
+> 某个用户对某个 knowledgeNodeId 的掌握状态。
 
 示例：
 
 ```text
-节点：用户 A 对 async/await 的掌握状态
-- 对应知识目录节点：JavaScript / 异步 / async/await
+状态：用户 A 对 async/await 的掌握状态
+- 对应 KnowledgeNode：JavaScript / 异步 / async/await
 - 当前状态：学过但不稳定
 - 误解：容易把 await 后续代码理解成同步继续执行
 - 证据：2026-06-11 模拟面试中跳过 async/await 输出题
 - 下次教学提示：先回顾 Promise.then 微任务，再讲 async/await 的恢复机制
 ```
 
-## 6. 用户可读笔记
+初版可以按 `(userId, knowledgeNodeId)` 建立唯一状态记录。
+
+这一层应该至少能表达：
+
+- 用户是否接触过该知识点
+- 当前掌握是否稳定
+- 已知误解
+- 相关证据
+- 最近一次学习或测评时间
+- 下次教学提示
+- 用户个人笔记引用
+
+具体字段后续单独设计。
+
+## 7. 用户可读笔记层（UserReadableNote）
 
 用户可读笔记单独维护。
 
@@ -138,53 +339,71 @@ async/await 是基于 Promise 的异步控制流语法糖。
 - await 后续代码会进入微任务队列。
 ```
 
-## 7. 三块结构之间的关系
+KnowledgeNode 中的 `noteRef` 指向该知识点的通用笔记入口。
+
+用户个人笔记应该由用户可读笔记层或 UserKnowledgeState 中的个人 `noteRef` 引用，不应该和通用笔记混在一起。
+
+## 8. 四层结构之间的关系
 
 当前确定的关系是：
 
 ```text
-知识目录层
+CatalogIndex
+  pathKey -> knowledgeNodeId
     ↓
-用户知识状态图谱  <->  用户可读笔记
+KnowledgeGraph
+  KnowledgeNode + KnowledgeEdge
+    ↓
+UserKnowledgeState
+  userId + knowledgeNodeId
+    ↔
+UserReadableNote
 ```
 
 具体含义：
 
-- 知识目录层提供稳定知识点 ID。
-- 用户知识状态图谱中的节点引用知识目录层中的知识点。
-- 用户可读笔记也引用知识目录层中的知识点。
-- 用户知识状态图谱和用户可读笔记可以互相引用。
-- 两者不能混为一个结构。
+- CatalogIndex 负责从路径稳定定位 `knowledgeNodeId`。
+- KnowledgeGraph 负责用 `knowledgeNodeId` 描述全局知识节点和关系。
+- UserKnowledgeState 负责记录某个用户在某个 `knowledgeNodeId` 上的长期状态。
+- UserReadableNote 负责用户可读复习材料。
+- KnowledgeGraph 本身也能通过 `belongs_to` 推导目录结构，但 CatalogIndex 是为了性能和稳定定位而显式物化的索引层。
+- 用户知识状态层和用户可读笔记层可以互相引用，但不能混为一个结构。
 
 这样分离的原因是：
 
+- LLM 需要稳定、低成本地从学习目标定位到知识点 ID。
+- 知识图谱需要表达关系，但不应该承载具体用户状态。
+- 用户知识状态要适合检索、更新和教学决策。
 - 用户可读笔记要适合人读。
-- AI 可读状态要适合检索、更新和教学决策。
 - 如果混在一起，容易导致笔记对用户太碎、对 AI 又不够结构化。
 
-## 8. Agent 使用图谱的基本方式
+### 8.1 Agent 使用分层记忆的基本方式
 
-当前确定：agent 不应该直接自由遍历整个图谱。
+当前确定：agent 不应该直接自由遍历整个知识图谱。
 
 更合理的方式是：
 
 ```text
 用户提出学习目标
   ↓
-系统定位知识目录节点
+CatalogIndex 定位目标 knowledgeNodeId
   ↓
-系统读取用户知识状态图谱中的相关状态
+KnowledgeGraph 查找目标节点相关的节点集合
+  ↓
+系统批量读取这些节点对应的 UserKnowledgeState
   ↓
 系统生成 Teaching Brief
   ↓
 agent 根据 Teaching Brief 教学
 ```
 
-也就是说，图谱不直接作为一大段上下文塞给 agent，而是先被整理成一份当前会话可用的教学上下文。
+也就是说，知识图谱不直接作为一大段上下文塞给 agent，而是作为关系索引，帮助系统决定应该读取哪些用户知识状态。
+
+最终进入 agent 上下文的是整理后的 Teaching Brief。
 
 ## 9. Teaching Brief
 
-Teaching Brief 是会话开始前根据图谱生成的教学上下文。
+Teaching Brief 是会话开始前根据 CatalogIndex、KnowledgeGraph 和 UserKnowledgeState 生成的教学上下文。
 
 它的作用类似 coding agent 中的 plan：先确定当前教学应该如何展开，再进入正式教学。
 
@@ -216,19 +435,30 @@ Teaching Brief 应该帮助 agent 判断：
 - 最后必须做一道执行顺序题
 ```
 
-## 10. 会话中的图谱加载机制
+## 10. 会话中的记忆加载机制
 
 当前确定的加载机制：
 
 ```text
 会话开始前：重加载
-会话进行中：默认不查图谱，只在必要时定点查询
-会话结束后：统一更新用户知识状态图谱和笔记
+会话进行中：默认不查全量记忆，只在必要时定点查询
+会话结束后：统一更新 UserKnowledgeState 和用户可读笔记
 ```
 
 ### 10.1 会话开始前重加载
 
-用户提出学习目标后，系统先定位目标知识点，并从用户知识状态图谱中读取相关信息。
+用户提出学习目标后，系统先通过 CatalogIndex 定位目标 `knowledgeNodeId`。
+
+然后系统通过 KnowledgeGraph 查找相关节点集合，例如：
+
+- 目标节点自身
+- 目标节点的父级 topic
+- 目标节点下的直接 learning_unit
+- 目标节点的前置节点
+- 目标节点的易混淆节点
+- 目标节点的可类比节点
+
+最后系统批量读取这些节点对应的 UserKnowledgeState。
 
 读取结果会被压缩成 Teaching Brief。
 
@@ -236,7 +466,7 @@ agent 后续主要依据 Teaching Brief 进行教学。
 
 ### 10.2 会话中默认不频繁检索
 
-正常教学过程中，agent 不应该每轮回答前都检索图谱。
+正常教学过程中，agent 不应该每轮回答前都检索全量知识图谱或全量用户状态。
 
 原因：
 
@@ -247,7 +477,7 @@ agent 后续主要依据 Teaching Brief 进行教学。
 
 ### 10.3 会话中允许定点查询
 
-如果教学过程中出现明确触发条件，可以定点查询图谱。
+如果教学过程中出现明确触发条件，可以定点查询记忆。
 
 触发条件示例：
 
@@ -256,9 +486,20 @@ agent 后续主要依据 Teaching Brief 进行教学。
 - 用户提到自己学过某个相关知识
 - 当前 Teaching Brief 不足以支撑继续教学
 
+会话中的单节点加载路径是：
+
+```text
+目标路径或目标名称
+  -> CatalogIndex
+  -> knowledgeNodeId
+  -> KnowledgeNode / 局部 KnowledgeEdge
+  -> UserKnowledgeState(userId, knowledgeNodeId)
+  -> Node Brief
+```
+
 ## 11. 会话中的观察日志
 
-会话过程中不应该频繁直接修改正式知识图谱。
+会话过程中不应该频繁直接修改正式 KnowledgeGraph 或 UserKnowledgeState。
 
 但 agent 需要在关键教学事件发生时记录 Observation Log。
 
@@ -274,7 +515,7 @@ Observation Log 是学习过程中的观察记录，用于防止重要学习证�
 - 用户跳过某个知识点
 - agent 发现用户存在前置知识缺失
 
-Observation Log 不等于正式图谱状态。
+Observation Log 不等于正式用户知识状态。
 
 它只是会话中的过程性证据。
 
@@ -282,8 +523,7 @@ Observation Log 不等于正式图谱状态。
 
 会话结束后，系统根据本轮教学过程和 Observation Log，统一更新：
 
-- 用户知识状态图谱
-- AI 读的记忆
+- UserKnowledgeState
 - 用户可读笔记
 
 写回的内容不应该是完整聊天记录，而应该是学习状态变化。
@@ -312,21 +552,21 @@ Promise:
 
 - Observation Log 主要服务当前会话结束后的统一更新。
 - 未完成会话的跨主题弱召回暂不作为当前设计目标。
-- 当前先优先跑通完整学习会话后的图谱更新闭环。
+- 当前先优先跑通完整学习会话后的状态更新闭环。
 
 ## 14. 下一步重点问题
 
 下一步最重要的问题是：
 
-> 用户知识状态图谱中的边应该如何建立？
+> KnowledgeEdge 和 UserKnowledgeState 的具体结构应该如何设计？
 
 待讨论内容包括：
 
-- 边表示什么
-- 哪些关系类型是必要的
+- KnowledgeEdge 需要哪些关系类型
 - 哪些边可以由系统规则生成
 - 哪些边可以由 LLM 提议
 - LLM 提议的边是否需要审核或置信度
-- 用户个性化边和全局知识关系是否需要区分
+- KnowledgeGraph 中的全局关系和 UserKnowledgeState 中的个人状态如何区分
 - 如何避免 LLM 自由发挥导致图谱污染
-- 如何让边真正影响后续教学
+- 如何让边真正影响 Teaching Brief
+- UserKnowledgeState 需要哪些字段来支撑会话开始重加载和会话中单节点加载
