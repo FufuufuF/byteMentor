@@ -197,10 +197,6 @@ type KnowledgeNode = {
   definition: string
 
   learningGoals?: string[]
-  assessmentPrompts?: string[]
-  commonMisconceptions?: string[]
-
-  nonGoals?: string[]
 
   noteRef?: {
     type: "markdown" | "database"
@@ -208,8 +204,6 @@ type KnowledgeNode = {
   }
 
   difficulty?: "intro" | "basic" | "intermediate" | "advanced"
-
-  status: "draft" | "active" | "deprecated"
 
   createdAt: string
   updatedAt: string
@@ -223,29 +217,91 @@ type KnowledgeNode = {
 - `name`：当前节点名，只表示最近一级名称，不表示完整路径。
 - `definition`：节点边界的一句话定义。
 - `learningGoals`：学习目标，主要用于 `learning_unit`。
-- `assessmentPrompts`：用于检测掌握情况的追问或题目方向。
-- `commonMisconceptions`：该知识点的全局常见误解，不表示某个用户已经存在这些误解。
-- `nonGoals`：可选字段，只在容易混淆的地方手动说明当前节点不覆盖什么。
 - `noteRef`：指向该知识点的通用用户可读笔记，可以是 Markdown 路径，也可以是数据库 ID。
 - `difficulty`：大致教学难度。
-- `status`：节点状态。
 - `createdAt` / `updatedAt`：创建和更新时间。
 
 当前确定不在 KnowledgeNode 中维护 `aliases`。
 
-当前也不使用自由发挥式的 `scope.includes/excludes` 作为核心字段。节点边界主要由 `definition`、`learningGoals` 和必要时手写的 `nonGoals` 共同约束。
+当前也不使用自由发挥式的 `scope.includes/excludes` 作为核心字段。节点边界主要由 `definition` 和 `learningGoals` 共同约束。
+
+当前确定不在 KnowledgeNode 初版中维护以下字段：
+
+- `assessmentPrompts`：测评题或追问更像教学素材，可以由 agent 根据 `definition` 和 `learningGoals` 临时生成，不作为知识节点核心字段。
+- `commonMisconceptions`：全局常见误解容易和 UserKnowledgeState 中的用户个人误解混淆，初版不放入 KnowledgeNode。
+- `nonGoals`：节点边界初版先由 `definition` 和 `learningGoals` 控制，不额外维护排除范围字段。
+- `status`：KnowledgeNode 初版不维护节点状态字段，先降低结构复杂度。
 
 ### 5.2 KnowledgeEdge
 
 KnowledgeEdge 描述知识点之间的关系。
 
-当前只确定以下原则：
+当前确定 KnowledgeEdge 的主要目的不是表达完整知识语义，而是在教学某个知识点时，帮助系统显式提示 LLM 还应该关注哪些可以顺带提一下或需要预先检查的知识点。
+
+初版结构：
+
+```ts
+type KnowledgeEdgeType =
+  | "belongs_to"
+  | "prerequisite_of"
+  | "mention_with"
+
+type KnowledgeEdge = {
+  id: string
+
+  type: KnowledgeEdgeType
+
+  sourceNodeId: string
+  targetNodeId: string
+
+  reason?: string
+
+  createdAt: string
+  updatedAt: string
+}
+```
+
+字段说明：
+
+- `id`：边的稳定 ID，供更新、引用和调试使用。
+- `type`：边的关系类型，决定这条边在生成 Teaching Brief 时如何影响相关知识点召回。
+- `sourceNodeId`：边的起点知识节点 ID。
+- `targetNodeId`：边的终点知识节点 ID。
+- `reason`：可选字段，用一句话说明为什么需要这条边，尤其是 `mention_with` 边需要写清楚具体教学理由。
+- `createdAt` / `updatedAt`：创建和更新时间。
+
+当前确定不在 KnowledgeEdge 初版中维护以下字段：
+
+- `weight`：初版不做权重排序，避免过早引入复杂召回策略。
+- `status`：初版不维护边状态字段，先降低结构复杂度。
+- `source`：初版不记录边由系统、人工还是 LLM 创建；是否需要审核和溯源后续再设计。
+
+当前确定的边类型只有三种：
+
+- `belongs_to`：目录从属关系。表示 `sourceNodeId` 属于 `targetNodeId`。方向统一为 `child -> parent`。它用于组织知识结构，不直接表示教学依赖。
+- `prerequisite_of`：前置知识关系。表示学习 `targetNodeId` 前，最好先掌握 `sourceNodeId`。生成 Teaching Brief 时，如果目标是 `targetNodeId`，系统应该优先读取 `sourceNodeId` 的用户知识状态。
+- `mention_with`：顺带提示关系。表示教学 `sourceNodeId` 时，值得顺带提一下 `targetNodeId`。它不是泛泛的相关关系，也不表示前置依赖，而是一个有方向的教学提示边。
+
+`mention_with` 的定义是：
+
+> 当教学 `sourceNodeId` 时，系统应该提示 LLM 可以顺带提一下 `targetNodeId`，因为这个提示能让当前知识点更容易理解、更不容易误解，或更容易建立边界。
+
+`mention_with` 的建边标准必须严格：
+
+- 这条边必须改变教学行为。如果加不加这条边，Teaching Brief 都不会变化，则不建边。
+- 不能只是“同属一个大类”。目录归属已经由 `belongs_to` 表达。
+- 不能只是“有共同点”。必须能说清楚教学 `sourceNodeId` 时提到 `targetNodeId` 是为了完成一个具体教学动作。
+- `reason` 必须能写成一句具体教学理由。如果写不出具体理由，则不建边。
+- 初版建议限制每个节点的 `mention_with` 出边数量，例如最多 3 条，避免图谱因为主观“相关性”而膨胀。
+
+当前确定以下原则：
 
 - 边是独立结构，不嵌入 KnowledgeNode。
 - `belongs_to` 用于表达目录从属关系。
 - `belongs_to` 的方向统一为 `child -> parent`。
-- 其他语义边用于表达前置、对比、类比、易混淆、应用场景等教学关系。
-- 具体语义边类型后续继续设计。
+- `prerequisite_of` 用于表达前置知识关系。
+- `mention_with` 用于表达教学时可以顺带提示的知识点。
+- 不使用 `related_to` 这类过宽泛的关系类型，避免图谱被低价值连接污染。
 
 示例：
 
@@ -255,6 +311,11 @@ async/await -> belongs_to -> 异步
 await 的暂停与恢复 -> belongs_to -> async/await
 TCP协议 -> belongs_to -> 传输层
 TCP 三次握手过程 -> belongs_to -> TCP协议
+
+Promise.then 回调进入微任务 -> prerequisite_of -> await 后续代码进入微任务
+
+并发 -> mention_with -> 并行
+await 后续代码进入微任务 -> mention_with -> Promise.then 回调进入微任务
 ```
 
 KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，原因是它提供更直接、更稳定的路径定位能力。
@@ -558,11 +619,10 @@ Promise:
 
 下一步最重要的问题是：
 
-> KnowledgeEdge 和 UserKnowledgeState 的具体结构应该如何设计？
+> UserKnowledgeState 的具体结构应该如何设计，以及 KnowledgeEdge 的创建规则如何落地？
 
 待讨论内容包括：
 
-- KnowledgeEdge 需要哪些关系类型
 - 哪些边可以由系统规则生成
 - 哪些边可以由 LLM 提议
 - LLM 提议的边是否需要审核或置信度
