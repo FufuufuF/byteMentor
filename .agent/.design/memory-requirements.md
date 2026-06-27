@@ -35,7 +35,7 @@ Byte Mentor 的记忆模块不是普通聊天记录存储，也不是简单的�
 
 1. 知识目录索引层（CatalogIndex）
 2. 知识图谱层（KnowledgeGraph）
-3. 用户知识状态层（UserKnowledgeState）
+3. 用户知识状态层（UserKnowledgeStatus）
 4. 用户可读笔记层（UserReadableNote）
 
 其中：
@@ -111,7 +111,7 @@ type CatalogEntry = {
 pathKey
   -> CatalogEntry
   -> knowledgeNodeId
-  -> UserKnowledgeState(userId, knowledgeNodeId)
+  -> UserKnowledgeStatus(userId, knowledgeNodeId)
 ```
 
 后续可以用 JSON 文档、MongoDB、SQLite、Postgres JSONB 或其他形式维护。当前不绑定具体数据库。
@@ -199,11 +199,9 @@ type KnowledgeNode = {
   learningGoals?: string[]
 
   noteRef?: {
-    type: "markdown" | "database"
+    type: "UserReadableNote"
     target: string
   }
-
-  difficulty?: "intro" | "basic" | "intermediate" | "advanced"
 
   createdAt: string
   updatedAt: string
@@ -217,8 +215,7 @@ type KnowledgeNode = {
 - `name`：当前节点名，只表示最近一级名称，不表示完整路径。
 - `definition`：节点边界的一句话定义。
 - `learningGoals`：学习目标，主要用于 `learning_unit`。
-- `noteRef`：指向该知识点的通用用户可读笔记，可以是 Markdown 路径，也可以是数据库 ID。
-- `difficulty`：大致教学难度。
+- `noteRef`：只在 `kind` 为 `topic` 时填写，用于指向该知识模块对应的完整用户可读笔记。`learning_unit` 通常不填写该字段，因为它是更小粒度的可教学、可测评知识点。
 - `createdAt` / `updatedAt`：创建和更新时间。
 
 当前确定不在 KnowledgeNode 中维护 `aliases`。
@@ -228,8 +225,10 @@ type KnowledgeNode = {
 当前确定不在 KnowledgeNode 初版中维护以下字段：
 
 - `assessmentPrompts`：测评题或追问更像教学素材，可以由 agent 根据 `definition` 和 `learningGoals` 临时生成，不作为知识节点核心字段。
-- `commonMisconceptions`：全局常见误解容易和 UserKnowledgeState 中的用户个人误解混淆，初版不放入 KnowledgeNode。
+- `commonMisconceptions`：全局常见误解容易和 UserKnowledgeStatus 中的用户个人误解混淆，初版不放入 KnowledgeNode。
 - `nonGoals`：节点边界初版先由 `definition` 和 `learningGoals` 控制，不额外维护排除范围字段。
+- `statusRef` / `statusIdRef`：KnowledgeNode 是全局知识图谱节点，不直接指向某个用户的 UserKnowledgeStatus。用户状态通过 `(userId, knowledgeNodeId)` 查询。
+- `difficulty`：当前认为该字段对知识图谱召回和教学决策帮助不大，初版不维护。
 - `status`：KnowledgeNode 初版不维护节点状态字段，先降低结构复杂度。
 
 ### 5.2 KnowledgeEdge
@@ -320,7 +319,7 @@ await 后续代码进入微任务 -> mention_with -> Promise.then 回调进入�
 
 KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，原因是它提供更直接、更稳定的路径定位能力。
 
-## 6. 用户知识状态层（UserKnowledgeState）
+## 6. 用户知识状态层（UserKnowledgeStatus）
 
 用户知识状态层是 AI 读的核心长期记忆。
 
@@ -341,7 +340,7 @@ KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，
 
 用户知识状态不是抽象知识本身，而是：
 
-> 某个用户对某个 knowledgeNodeId 的掌握状态。
+> 某个用户对某个 `learning_unit` 的掌握状态。
 
 示例：
 
@@ -354,19 +353,91 @@ KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，
 - 下次教学提示：先回顾 Promise.then 微任务，再讲 async/await 的恢复机制
 ```
 
-初版可以按 `(userId, knowledgeNodeId)` 建立唯一状态记录。
+初版按 `(userId, knowledgeNodeId)` 建立唯一状态记录。
 
-这一层应该至少能表达：
+其中：
 
-- 用户是否接触过该知识点
-- 当前掌握是否稳定
-- 已知误解
-- 相关证据
-- 最近一次学习或测评时间
-- 下次教学提示
-- 用户个人笔记引用
+- `knowledgeNodeId` 必须指向 `kind` 为 `learning_unit` 的 KnowledgeNode。
+- `topic` 不直接拥有 UserKnowledgeStatus。
+- `topic` 的整体掌握情况后续可以由其下属 `learning_unit` 的 UserKnowledgeStatus 聚合得到。
+- KnowledgeNode 不直接指向某个用户的 UserKnowledgeStatus，因为 KnowledgeNode 是全局节点，而 UserKnowledgeStatus 是用户个人状态。
 
-具体字段后续单独设计。
+初版结构：
+
+```ts
+type UserKnowledgeStatus = {
+  id: string
+
+  userId: string
+  knowledgeNodeId: string
+
+  exposure: "unseen" | "mentioned" | "studied" | "practiced"
+
+  mastery: "unknown" | "missing" | "partial" | "unstable" | "stable"
+
+  misconceptions?: UserMisconception[]
+
+  evidence?: UserKnowledgeEvidence[]
+
+  nextTeachingHint?: string
+
+  lastStudiedAt?: string
+  lastAssessedAt?: string
+
+  createdAt: string
+  updatedAt: string
+}
+
+type UserMisconception = {
+  id: string
+  description: string
+  status: "active" | "resolved"
+  evidenceIds?: string[]
+  updatedAt: string
+}
+
+type UserKnowledgeEvidence = {
+  id: string
+  type: "user_answer" | "user_question" | "self_report" | "agent_observation" | "assessment"
+
+  summary: string
+
+  result?: "correct" | "partially_correct" | "incorrect" | "unclear"
+
+  observedAt: string
+}
+```
+
+字段说明：
+
+- `id`：这条用户知识状态记录的稳定 ID。
+- `userId`：用户 ID。
+- `knowledgeNodeId`：对应的知识节点 ID，必须指向 `kind` 为 `learning_unit` 的 KnowledgeNode。
+- `exposure`：用户是否接触过这个知识点。
+- `mastery`：用户当前对这个知识点的掌握状态。
+- `misconceptions`：用户在这个知识点上的具体误解。
+- `evidence`：支持当前状态判断的证据摘要，不存完整聊天记录。
+- `nextTeachingHint`：下次教学这个知识点时给 agent 的提示。
+- `lastStudiedAt`：最近一次学习时间。
+- `lastAssessedAt`：最近一次测评、追问或复述时间。
+- `createdAt` / `updatedAt`：创建和更新时间。
+
+`exposure` 的取值含义：
+
+- `unseen`：尚未接触，但可能因为前置缺失被记录。
+- `mentioned`：被提到过，但没有系统学习。
+- `studied`：系统学过。
+- `practiced`：做过复述、题目、追问或模拟面试。
+
+`mastery` 的取值含义：
+
+- `unknown`：无法判断。
+- `missing`：明显缺失。
+- `partial`：有部分理解，但不完整。
+- `unstable`：能说出一些内容，但容易答错或混淆。
+- `stable`：当前表现稳定。
+
+UserKnowledgeStatus 初版不使用分数字段。掌握程度先用离散状态表达，避免过早引入不稳定的量化评分。
 
 ## 7. 用户可读笔记层（UserReadableNote）
 
@@ -400,9 +471,11 @@ async/await 是基于 Promise 的异步控制流语法糖。
 - await 后续代码会进入微任务队列。
 ```
 
-KnowledgeNode 中的 `noteRef` 指向该知识点的通用笔记入口。
+KnowledgeNode 的 `noteRef` 只在 `topic` 上使用，用于指向完整模块笔记。
 
-用户个人笔记应该由用户可读笔记层或 UserKnowledgeState 中的个人 `noteRef` 引用，不应该和通用笔记混在一起。
+`learning_unit` 通常不直接引用完整笔记。教学某个 `learning_unit` 时，可以沿 `belongs_to` 找到父级 `topic`，再读取父级 `topic.noteRef` 对应的模块笔记。
+
+用户个人笔记后续可以由用户可读笔记层或 UserKnowledgeStatus 引用，不应该和 KnowledgeNode 的全局结构混在一起。
 
 ## 8. 四层结构之间的关系
 
@@ -415,7 +488,7 @@ CatalogIndex
 KnowledgeGraph
   KnowledgeNode + KnowledgeEdge
     ↓
-UserKnowledgeState
+UserKnowledgeStatus
   userId + knowledgeNodeId
     ↔
 UserReadableNote
@@ -425,7 +498,7 @@ UserReadableNote
 
 - CatalogIndex 负责从路径稳定定位 `knowledgeNodeId`。
 - KnowledgeGraph 负责用 `knowledgeNodeId` 描述全局知识节点和关系。
-- UserKnowledgeState 负责记录某个用户在某个 `knowledgeNodeId` 上的长期状态。
+- UserKnowledgeStatus 负责记录某个用户在某个 `knowledgeNodeId` 上的长期状态。
 - UserReadableNote 负责用户可读复习材料。
 - KnowledgeGraph 本身也能通过 `belongs_to` 推导目录结构，但 CatalogIndex 是为了性能和稳定定位而显式物化的索引层。
 - 用户知识状态层和用户可读笔记层可以互相引用，但不能混为一个结构。
@@ -451,7 +524,7 @@ CatalogIndex 定位目标 knowledgeNodeId
   ↓
 KnowledgeGraph 查找目标节点相关的节点集合
   ↓
-系统批量读取这些节点对应的 UserKnowledgeState
+系统批量读取这些节点对应的 UserKnowledgeStatus
   ↓
 系统生成 Teaching Brief
   ↓
@@ -464,7 +537,7 @@ agent 根据 Teaching Brief 教学
 
 ## 9. Teaching Brief
 
-Teaching Brief 是会话开始前根据 CatalogIndex、KnowledgeGraph 和 UserKnowledgeState 生成的教学上下文。
+Teaching Brief 是会话开始前根据 CatalogIndex、KnowledgeGraph 和 UserKnowledgeStatus 生成的教学上下文。
 
 它的作用类似 coding agent 中的 plan：先确定当前教学应该如何展开，再进入正式教学。
 
@@ -503,7 +576,7 @@ Teaching Brief 应该帮助 agent 判断：
 ```text
 会话开始前：重加载
 会话进行中：默认不查全量记忆，只在必要时定点查询
-会话结束后：统一更新 UserKnowledgeState 和用户可读笔记
+会话结束后：统一更新 UserKnowledgeStatus 和用户可读笔记
 ```
 
 ### 10.1 会话开始前重加载
@@ -516,14 +589,17 @@ Teaching Brief 应该帮助 agent 判断：
 - 目标节点的父级 topic
 - 目标节点下的直接 learning_unit
 - 目标节点的前置节点
-- 目标节点的易混淆节点
-- 目标节点的可类比节点
+- 目标节点的 `mention_with` 节点
 
-最后系统批量读取这些节点对应的 UserKnowledgeState。
+最后系统批量读取这些节点对应的 UserKnowledgeStatus。
 
 读取结果会被压缩成 Teaching Brief。
 
 agent 后续主要依据 Teaching Brief 进行教学。
+
+如果目标节点是 `learning_unit`，系统可以沿 `belongs_to` 找到父级 `topic`，再读取父级 `topic.noteRef` 对应的完整模块笔记。
+
+但完整模块笔记不应该默认全文进入 agent 上下文。它更适合作为可查资料，在生成 Teaching Brief 时被摘要成当前教学需要的上下文。
 
 ### 10.2 会话中默认不频繁检索
 
@@ -554,13 +630,13 @@ agent 后续主要依据 Teaching Brief 进行教学。
   -> CatalogIndex
   -> knowledgeNodeId
   -> KnowledgeNode / 局部 KnowledgeEdge
-  -> UserKnowledgeState(userId, knowledgeNodeId)
+  -> UserKnowledgeStatus(userId, knowledgeNodeId)
   -> Node Brief
 ```
 
 ## 11. 会话中的观察日志
 
-会话过程中不应该频繁直接修改正式 KnowledgeGraph 或 UserKnowledgeState。
+会话过程中不应该频繁直接修改正式 KnowledgeGraph 或 UserKnowledgeStatus。
 
 但 agent 需要在关键教学事件发生时记录 Observation Log。
 
@@ -584,7 +660,7 @@ Observation Log 不等于正式用户知识状态。
 
 会话结束后，系统根据本轮教学过程和 Observation Log，统一更新：
 
-- UserKnowledgeState
+- UserKnowledgeStatus
 - 用户可读笔记
 
 写回的内容不应该是完整聊天记录，而应该是学习状态变化。
@@ -619,14 +695,14 @@ Promise:
 
 下一步最重要的问题是：
 
-> UserKnowledgeState 的具体结构应该如何设计，以及 KnowledgeEdge 的创建规则如何落地？
+> UserKnowledgeStatus 的更新规则如何设计，以及 KnowledgeEdge 的创建规则如何落地？
 
 待讨论内容包括：
 
 - 哪些边可以由系统规则生成
 - 哪些边可以由 LLM 提议
 - LLM 提议的边是否需要审核或置信度
-- KnowledgeGraph 中的全局关系和 UserKnowledgeState 中的个人状态如何区分
+- KnowledgeGraph 中的全局关系和 UserKnowledgeStatus 中的个人状态如何区分
 - 如何避免 LLM 自由发挥导致图谱污染
 - 如何让边真正影响 Teaching Brief
-- UserKnowledgeState 需要哪些字段来支撑会话开始重加载和会话中单节点加载
+- Observation Log 如何稳定更新 UserKnowledgeStatus
