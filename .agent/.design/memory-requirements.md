@@ -114,6 +114,49 @@ pathKey
   -> UserKnowledgeStatus(userId, knowledgeNodeId)
 ```
 
+### 4.1 CatalogIndex 对 agent 的暴露方式
+
+MVP 阶段，CatalogIndex 不只作为内部索引，也会通过工具渐进式暴露给 agent。
+
+agent 不应该一次性读取完整目录树，而应该按需浏览和检索。
+
+典型方式是：
+
+```text
+root
+  -> JavaScript / 网络 / Python
+JavaScript
+  -> 异步 / 对象 / 函数
+JavaScript / 异步
+  -> Promise / async-await / Event Loop
+JavaScript / 异步 / Promise
+  -> then 回调进入微任务 / Promise 状态流转 / Promise.all
+```
+
+初版工具可以包含：
+
+```ts
+catalog.listChildren(parentCatalogEntryId?: string)
+catalog.search(query: string, parentCatalogEntryId?: string)
+catalog.getEntry(catalogEntryId: string)
+```
+
+其中：
+
+- `listChildren` 用于渐进式浏览目录。
+- `search` 用于根据名称、路径、关键词做轻量检索。
+- `getEntry` 用于读取单个目录项的完整信息。
+
+MVP 阶段暂不依赖 embedding。
+
+节点对齐优先使用：
+
+- Catalog 路径精确匹配
+- Catalog 渐进式浏览
+- 名称、关键词、路径片段的轻量文本检索
+- 类似 BM25 的关键词匹配
+- agent 对少量候选节点做最终关系判断
+
 后续可以用 JSON 文档、MongoDB、SQLite、Postgres JSONB 或其他形式维护。当前不绑定具体数据库。
 
 ## 5. 知识图谱层（KnowledgeGraph）
@@ -535,6 +578,164 @@ agent 根据 Teaching Brief 教学
 
 最终进入 agent 上下文的是整理后的 Teaching Brief。
 
+### 8.2 目标主题不存在时的 Topic Bootstrap
+
+如果用户提出的学习目标无法直接定位到已有 `knowledgeNodeId`，系统不应该直接进入自由教学。
+
+当前确定先进入 Topic Bootstrap 流程：
+
+```text
+用户提出新的学习目标
+  ↓
+CatalogIndex 尝试定位已有节点
+  ↓
+如果不存在，agent 根据模型内部知识生成本轮 Draft Topic Graph
+  ↓
+系统用 Draft Topic Graph 中的节点去已有 CatalogIndex / KnowledgeGraph 做节点对齐
+  ↓
+系统读取对齐节点以及相关节点的 UserKnowledgeStatus
+  ↓
+系统生成 Teaching Brief
+  ↓
+agent 根据 Teaching Brief 教学
+```
+
+Draft Topic Graph 是本轮教学的局部草稿图，不等同于正式 KnowledgeGraph。
+
+它的作用是：
+
+- 把新的学习主题拆成适合教学的 `topic` 和 `learning_unit`
+- 为每个草稿节点生成可检索的节点签名
+- 帮助系统从已有知识图谱中召回相关节点
+- 帮助后续生成 Teaching Brief
+- 为会话结束后的图谱同步提供候选结构
+
+草稿节点不应该只包含名称。
+
+初版结构示例：
+
+```ts
+type DraftKnowledgeNode = {
+  tempId: string
+
+  kind: "topic" | "learning_unit"
+
+  name: string
+  definition: string
+
+  learningGoals?: string[]
+
+  pathHint?: string[]
+  keywords?: string[]
+
+  matchedKnowledgeNodeId?: string
+}
+```
+
+其中：
+
+- `tempId`：本轮草稿图内的临时 ID。
+- `kind`：草稿节点类型，仍然只使用 `topic` 和 `learning_unit`。
+- `name` / `definition` / `learningGoals`：用于约束节点边界。
+- `pathHint`：agent 推测的目录路径，用于 CatalogIndex 对齐。
+- `keywords`：用于轻量文本检索。
+- `matchedKnowledgeNodeId`：如果该草稿节点已经匹配到正式 KnowledgeNode，则记录正式节点 ID。
+
+示例：
+
+```text
+用户目标：学习 JavaScript 异步
+
+Draft Topic Graph:
+- JavaScript 异步 topic
+- Event Loop topic
+- Promise topic
+- Promise.then 回调进入微任务 learning_unit
+- async-await topic
+- await 暂停当前 async 函数 learning_unit
+- await 后续代码进入微任务 learning_unit
+```
+
+### 8.3 Draft 节点对齐和召回
+
+Draft Topic Graph 生成后，系统需要对每个草稿节点做节点对齐。
+
+节点对齐不是简单的关键词检索后合并，而是：
+
+```text
+Draft 节点签名
+  ↓
+CatalogIndex / KnowledgeGraph 候选召回
+  ↓
+agent 或规则判断草稿节点与候选节点的关系
+  ↓
+选择性纳入本轮 Teaching Brief
+```
+
+MVP 阶段的召回依据包括：
+
+- `pathHint`
+- `name`
+- `definition`
+- `learningGoals`
+- `keywords`
+
+召回候选节点后，需要判断它们和草稿节点的关系：
+
+```ts
+type DraftNodeMatchType =
+  | "same_concept"
+  | "parent_topic"
+  | "child_unit"
+  | "prerequisite"
+  | "mention_with"
+  | "analogy"
+  | "irrelevant"
+```
+
+关系含义：
+
+- `same_concept`：草稿节点和已有节点表达同一个知识点，草稿节点绑定已有 `knowledgeNodeId`。
+- `parent_topic`：已有节点是草稿节点适合挂载的父级 topic。
+- `child_unit`：已有节点是草稿 topic 下已经存在的 learning_unit。
+- `prerequisite`：已有节点是本轮教学需要关注的前置知识。
+- `mention_with`：已有节点是本轮教学可以顺带提示的知识点。
+- `analogy`：已有节点可以作为类比或对比材料。
+- `irrelevant`：候选节点不进入本轮教学上下文。
+
+召回节点不应该无条件补进本轮 Draft Topic Graph。
+
+当前确定分两类使用：
+
+```text
+对齐替换：
+  Draft 节点其实已经存在于正式图谱中
+  -> draft node 绑定 existing knowledgeNodeId
+
+上下文扩展：
+  召回节点不是本轮要教的主节点，但会影响教学
+  -> 进入 Teaching Brief 的 prerequisites / relatedContext / analogies
+```
+
+例如：
+
+```text
+Draft 节点：async-await
+召回节点：JavaScript / 异步 / async-await
+关系：same_concept
+结果：绑定 existing knowledgeNodeId
+
+Draft 节点：await 后续代码进入微任务
+召回节点：Promise.then 回调进入微任务
+关系：prerequisite 或 mention_with
+结果：不替换 draft 节点，但进入 Teaching Brief
+
+Draft 节点：并发
+召回节点：并行
+关系：analogy
+结果：只有在用户历史状态有教学价值时才进入 Teaching Brief
+```
+
 ## 9. Teaching Brief
 
 Teaching Brief 是会话开始前根据 CatalogIndex、KnowledgeGraph 和 UserKnowledgeStatus 生成的教学上下文。
@@ -582,6 +783,8 @@ Teaching Brief 应该帮助 agent 判断：
 ### 10.1 会话开始前重加载
 
 用户提出学习目标后，系统先通过 CatalogIndex 定位目标 `knowledgeNodeId`。
+
+如果无法定位已有节点，系统先执行 Topic Bootstrap，生成本轮 Draft Topic Graph，并用草稿节点对齐已有 CatalogIndex / KnowledgeGraph。
 
 然后系统通过 KnowledgeGraph 查找相关节点集合，例如：
 
@@ -662,6 +865,7 @@ Observation Log 不等于正式用户知识状态。
 
 - UserKnowledgeStatus
 - 用户可读笔记
+- 必要时将本轮 Draft Topic Graph 中的有效节点同步到正式 KnowledgeGraph
 
 写回的内容不应该是完整聊天记录，而应该是学习状态变化。
 
@@ -677,6 +881,81 @@ async/await:
 Promise:
 - 作为前置知识被复测
 - Promise.then 回调时机回答正确
+```
+
+### 12.1 Draft Topic Graph 同步到正式 KnowledgeGraph
+
+当本轮学习目标来自一个新的主题，且会话开始前生成了 Draft Topic Graph 时，会话结束后需要判断哪些草稿节点应该进入正式 KnowledgeGraph。
+
+同步的依据不是把整个草稿图直接写入正式图谱，而是基于节点对齐阶段得到的正式图谱锚点。
+
+同步流程：
+
+```text
+Draft Topic Graph
+  ↓
+节点对齐得到 anchors
+  ↓
+结合本轮 Observation Log 和实际教学过程
+  ↓
+生成 Graph Sync Plan
+  ↓
+把本轮真正教学过、粒度合适、位置明确的节点写入正式 KnowledgeGraph
+```
+
+草稿节点在同步时可以分为：
+
+```ts
+type DraftNodeSyncState =
+  | "matched_existing"
+  | "new_under_anchor"
+  | "candidate_only"
+  | "discarded"
+```
+
+含义：
+
+- `matched_existing`：草稿节点已经匹配到已有正式节点，不需要新建。
+- `new_under_anchor`：草稿节点是新节点，并且有明确父级锚点，可以写入正式图谱。
+- `candidate_only`：草稿节点本轮被提到，但没有被真正教学或粒度尚不稳定，暂不写入正式图谱。
+- `discarded`：草稿节点无关、重复或粒度不合适。
+
+锚点需要区分类型：
+
+```text
+same_concept anchor:
+  草稿节点就是已有正式节点，直接绑定 existing knowledgeNodeId
+
+parent_topic anchor:
+  草稿节点是新知识点，可以挂到该已有 topic 下
+
+related_context anchor:
+  召回节点只是前置、类比或顺带提示，不作为新节点父级
+```
+
+只有 `parent_topic anchor` 可以决定新节点挂载位置。
+
+`prerequisite`、`mention_with`、`analogy` 等相关上下文不能直接作为父级锚点。
+
+示例：
+
+```text
+用户目标：学习 JavaScript 异步
+
+召回锚点：
+- JavaScript / 异步
+- JavaScript / 异步 / Promise
+- JavaScript / 异步 / Event Loop
+
+本轮真正教学过的新节点：
+- async-await
+- await 暂停当前 async 函数
+- await 后续代码进入微任务
+
+同步结果：
+- 如果 async-await 不存在，则创建 topic：JavaScript / 异步 / async-await
+- 将两个 await 相关 learning_unit 挂到 async-await 下
+- 如果本轮只是顺带提到 Generator，则暂不写入正式图谱
 ```
 
 ## 13. 当前 MVP 暂不处理的中断场景
