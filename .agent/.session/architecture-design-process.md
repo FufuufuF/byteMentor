@@ -77,11 +77,9 @@ packages/core
 - 核心运行流程
 - 明确不做的范围
 
-## 接下来的目标
+## 工程初始化进度
 
-下一步目标是做工程初始化。
-
-工程初始化应该基于已经确认的 6 个 workspace project：
+工程初始化已经开始，并基于已经确认的 6 个 workspace project 建立了最小工程骨架：
 
 ```text
 apps/cli
@@ -92,7 +90,50 @@ packages/session
 packages/core
 ```
 
-初始化时需要注意：
+当前已经完成：
+
+- 建立 `pnpm-workspace.yaml`，使用 pnpm workspace 管理 `apps/*` 和 `packages/*`。
+- 建立根目录 `package.json`，项目使用 ESM，设置 `private: true`、`packageManager`、`engines` 和统一脚本。
+- 建立 `.npmrc`，启用 `engine-strict=true`。
+- 建立根目录 TypeScript 配置：
+  - `tsconfig.base.json`：共享 TypeScript 编译规则。
+  - `tsconfig.json`：TypeScript project references 总入口。
+- 建立 6 个 workspace package 的 `package.json`：
+  - `@byte-mentor/cli`
+  - `@byte-mentor/tui`
+  - `@byte-mentor/agent`
+  - `@byte-mentor/knowledge`
+  - `@byte-mentor/session`
+  - `@byte-mentor/core`
+- 建立 6 个 workspace package 的 `tsconfig.json`，并让 TypeScript references 与 package 依赖关系保持一致。
+- 建立 6 个 package 的最小 `src/index.ts` 入口文件。
+- 加入 TypeScript 构建脚本：
+  - `pnpm build`
+  - `pnpm typecheck`
+  - `pnpm clean`
+- 加入 Prettier：
+  - `.prettierrc.json`
+  - `.prettierignore`
+  - `pnpm format`
+  - `pnpm format:check`
+- 加入 ESLint：
+  - `eslint.config.mjs`
+  - `pnpm lint`
+- 加入 Vitest：
+  - `vitest.config.ts`
+  - `pnpm test`
+  - `pnpm test:watch`
+- 已生成 `pnpm-lock.yaml`。
+
+当前验证结果：
+
+- `pnpm install` 已成功。
+- `pnpm build` 已成功。
+- `pnpm format:check` 已成功。
+- `pnpm lint` 已成功。
+- `pnpm test` 已成功。
+
+当前初始化仍需注意：
 
 - 不要重新讨论 package 拆分，除非发现当前设计有阻塞问题。
 - 不要先实现复杂业务逻辑。
@@ -105,6 +146,23 @@ packages/core
 - `@byte-mentor/tui` 不应该直接依赖 `@byte-mentor/agent` 或 `@byte-mentor/knowledge` 的内部实现。
 - `@byte-mentor/knowledge` 不应该依赖 `@byte-mentor/agent` 或 `@byte-mentor/tui`。
 
+## 下一步目标
+
+下一步目标是加入 CI 配置。
+
+CI 初版应该先覆盖当前已经建立的工程质量门禁：
+
+```bash
+pnpm install --frozen-lockfile
+pnpm format:check
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+CI 暂时不引入发布、部署、缓存优化或复杂矩阵测试。第一阶段只需要保证当前 workspace 骨架在干净环境中可以稳定安装、检查、测试和构建。
+
 ## 恢复上下文时的推荐步骤
 
 如果之后清空上下文，需要先阅读以下文档：
@@ -114,7 +172,7 @@ packages/core
 3. `.agent/.design/architecture-design.md`
 4. `.agent/.session/architecture-design-process.md`
 
-然后继续下一步：工程初始化。
+然后继续下一步：CI 配置。
 
 ## 重要协作约定
 
