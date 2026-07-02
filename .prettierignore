@@ -1,0 +1,12 @@
+node_modules/
+.agent/
+.agents/
+.claude/
+.codex/
+.opencode/
+dist/
+build/
+out/
+coverage/
+*.tsbuildinfo
+pnpm-lock.yaml

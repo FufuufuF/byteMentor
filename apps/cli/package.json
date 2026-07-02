@@ -1,0 +1,19 @@
+{
+  "name": "@byte-mentor/cli",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "byte-mentor": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@byte-mentor/agent": "workspace:*",
+    "@byte-mentor/core": "workspace:*",
+    "@byte-mentor/knowledge": "workspace:*",
+    "@byte-mentor/session": "workspace:*",
+    "@byte-mentor/tui": "workspace:*"
+  }
+}
