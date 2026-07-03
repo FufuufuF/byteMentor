@@ -1,10 +1,10 @@
 # Byte Mentor 架构设计进度记录
 
-更新时间：2026-07-02
+更新时间：2026-07-03
 
 ## 当前状态
 
-Byte Mentor 的 MVP 高层架构设计已经基本完成。
+Byte Mentor 的 MVP 高层架构设计已经基本完成，最小工程骨架和 CI 初版已经完成。
 
 当前主要架构结论已经记录在：
 
@@ -124,14 +124,22 @@ packages/core
   - `pnpm test`
   - `pnpm test:watch`
 - 已生成 `pnpm-lock.yaml`。
+- 已加入 GitHub Actions CI 初版：
+  - `.github/workflows/ci.yml`
+  - 触发条件：push 到 `main`、pull request、手动触发。
+  - 运行环境：Ubuntu latest、Node.js 22。
+  - 通过 Corepack 使用项目声明的 pnpm 版本。
+  - 暂不引入缓存优化、发布、部署或复杂矩阵测试。
 
 当前验证结果：
 
 - `pnpm install` 已成功。
+- `pnpm install --frozen-lockfile` 已成功。
 - `pnpm build` 已成功。
 - `pnpm format:check` 已成功。
 - `pnpm lint` 已成功。
 - `pnpm test` 已成功。
+- `pnpm typecheck` 已成功。
 
 当前初始化仍需注意：
 
@@ -148,20 +156,15 @@ packages/core
 
 ## 下一步目标
 
-下一步目标是加入 CI 配置。
+CI 初版已经完成。
 
-CI 初版应该先覆盖当前已经建立的工程质量门禁：
+下一步应该进入第一个可运行产品切片，但具体切片需要再和用户确认。合理候选方向包括：
 
-```bash
-pnpm install --frozen-lockfile
-pnpm format:check
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build
-```
+- 建立 CLI 最小入口，让 `apps/cli` 可以启动并输出当前版本 / 帮助信息。
+- 建立 TUI 最小入口，让 CLI 能进入一个极简 TUI shell。
+- 先设计学习会话的最小运行闭环，再决定 CLI / TUI 如何驱动它。
 
-CI 暂时不引入发布、部署、缓存优化或复杂矩阵测试。第一阶段只需要保证当前 workspace 骨架在干净环境中可以稳定安装、检查、测试和构建。
+在用户确认前，不要把这些候选方向写成已经确定的产品或架构结论。
 
 ## 恢复上下文时的推荐步骤
 
@@ -172,7 +175,7 @@ CI 暂时不引入发布、部署、缓存优化或复杂矩阵测试。第一�
 3. `.agent/.design/architecture-design.md`
 4. `.agent/.session/architecture-design-process.md`
 
-然后继续下一步：CI 配置。
+然后继续下一步：确认第一个可运行产品切片。
 
 ## 重要协作约定
 
