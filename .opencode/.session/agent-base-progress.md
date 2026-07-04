@@ -12,7 +12,7 @@
 - [x] Commit 2: In-memory session store
 - [x] Commit 3: Provider and tool registry
 - [x] Commit 4: AgentRunner
-- [ ] Commit 5: ContextBuilder and AgentLoop
+- [x] Commit 5: ContextBuilder and AgentLoop
 - [ ] Commit 6: Public API and final integration
 
 ## Commit 1: Core runtime contracts（已完成）
@@ -172,7 +172,7 @@ turn.failed        { sessionId, message }
 
 ### 测试
 
-- `test/agent/agent-runner.test.ts` — 4 tests
+- `test/agent/agent-runner.test.ts` — 5 tests
 
 ### 实现要点
 
@@ -187,14 +187,68 @@ turn.failed        { sessionId, message }
 - RuntimeEvent 使用外部传入的 `turnId`
 - `maxIterations` 默认 10，计 provider 调用次数
 - 达到 provider 调用上限后返回 `stopReason: "max_iterations"`
+- Provider 抛错时返回 `stopReason: "failed"`，保留已产生的 `model.requested` event，不向外 reject
+- Provider 错误详情暂不落入 RuntimeEvent，已留 TODO，后续接入 OpenAI SDK 或其他真实 Provider 时补齐
 
 ### 完成状态
 
-- pnpm test test/agent/agent-runner.test.ts: 4 passed
-- pnpm test: 66 passed（累计）
+- pnpm test test/agent/agent-runner.test.ts: 5 passed
+- pnpm test: 67 passed（provider-error-catch 补丁后累计）
 - pnpm typecheck: 通过
 - pnpm lint: 通过
 
+### 补充提交
+
+- `9259a4f feat: add provider-error-catch` — 修复进度文件中已确认但代码缺失的 Provider throw → failed result 契约。
+
+## Commit 5: ContextBuilder and AgentLoop（已完成）
+
+### 新增文件
+
+- `packages/agent/src/context-builder.ts` — ContextBuilder 最小实现，将 session history 与本轮 user message 拼接为模型输入消息。
+- `packages/agent/src/agent-loop.ts` — AgentLoop / HeadlessTurnInput / HeadlessTurnResult / AgentLoopInput，实现通用 headless turn 编排。
+- `test/agent/context-builder.test.ts` — ContextBuilder 行为测试。
+- `test/agent/agent-loop.test.ts` — AgentLoop 新 session、已有 session、工具 trace、RuntimeEvent 测试。
+
+### 修改文件
+
+- `packages/agent/src/index.ts` — 导出 `AgentLoop` 与 `ContextBuilder` public API。
+- `eslint.config.mjs` — 增加 `**/dist/**` ignore，避免 `tsc -b` 生成的 package dist 声明文件被 lint。
+
+### 测试
+
+- `test/agent/context-builder.test.ts` — 1 test
+- `test/agent/agent-loop.test.ts` — 4 tests
+
+合计 5 个新增测试，全部通过。
+
+### 实现要点
+
+- `ContextBuilder.build({ history, userMessage })` 返回 `[...history, userMessage]`，不注入 system prompt。
+- `AgentLoop` 构造器使用对象参数：`{ sessionStore, contextBuilder, runner }`。
+- `AgentLoop.runTurn({ sessionId?, userMessage })` 是 headless turn API，输入 user message string，由 loop 生成 `UserMessage` 与 `MessageId`。
+- 无 `sessionId` 时创建新 session；有 `sessionId` 时复用已有 session 并读取 history。
+- turn 开始先 `appendMessages(sessionId, [userMessage])`；runner 完成后再保存 assistant/tool 增量 messages。
+- `AgentLoop` 内部创建并持有 `readonly tools = new ToolRegistry()`，外部通过 `loop.tools.register(tool)` 注册工具，和 nanobot 的 `self.tools = ToolRegistry()` 方向一致。
+- `AgentLoop` 调用 `ContextBuilder` 生成完整 runner input messages，再调用 `AgentRunner.run({ turnId, messages, tools })`。
+- 工具调用场景下 session 保存完整 trace：user、assistant tool-call、tool result、final assistant。
+- `HeadlessTurnResult.newMessages` 返回本轮完整新增 messages：user + runner newMessages。
+- `RuntimeEvent` 序列包含 loop 层事件和 runner 层事件：`turn.started`、`context.built`、`model.*`、`tool.*`、`turn.completed`。
+- 同一 turn 内所有 RuntimeEvent 共用 `AgentLoop` 生成的 `turnId`。
+
+### 完成状态
+
+- pnpm test: 72 passed（累计）
+- pnpm typecheck: 通过
+- pnpm lint: 通过
+
+### Plan 范围核对
+
+- Plan 范围内文件：`packages/agent/src/context-builder.ts`、`packages/agent/src/agent-loop.ts`、`packages/agent/src/index.ts`、`test/agent/agent-loop.test.ts`。
+- 额外测试文件：`test/agent/context-builder.test.ts`，用于将 ContextBuilder 独立小步 TDD 化。
+- Plan 范围外补丁：`82d16f0 chore(lint): ignore package dist outputs`，仅用于忽略 package dist 构建产物，保证 `pnpm lint` 在 `pnpm typecheck` 后仍稳定通过。
+- 未触及 CLI / TUI / Knowledge / 真实 Provider / 文件持久化。
+
 ## 下一步
 
-进入 Commit 5: ContextBuilder and AgentLoop 的 Phase 2 步骤拆分。
+进入 Commit 6: Public API and final integration。
