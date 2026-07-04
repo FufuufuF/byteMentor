@@ -11,7 +11,7 @@
 - [x] Commit 1: Core runtime contracts
 - [x] Commit 2: In-memory session store
 - [x] Commit 3: Provider and tool registry
-- [ ] Commit 4: AgentRunner
+- [x] Commit 4: AgentRunner
 - [ ] Commit 5: ContextBuilder and AgentLoop
 - [ ] Commit 6: Public API and final integration
 
@@ -52,12 +52,12 @@
 #### 接口签名（后续 commit 落地）
 
 - SessionStore: `create()` / `get(id)` / `appendMessages(id, messages)` / `getHistory(id)`；Session 仅 `{ id }`
-- ModelProvider: `complete(req)` → `{ message, stopReason }`；req `{ messages, tools? }`
+- ModelProvider: `invoke(req)` → `{ message, stopReason }`；req `{ messages, tools? }`
 - AgentTool: `{ name, description, parametersJsonSchema?, execute(args):Promise<ToolResult> }`
 - ToolResult = `{ ok:true; result:string } | { ok:false; error:ToolError }`
 - ToolError = `{ kind:'unknown_tool'|'invalid_args'|'execution_failed'; message:string }`
 - ToolRegistry: `register` / `list():ToolDefinition[]` / `execute(name, args)`
-- AgentRunner: `run({ messages, tools:ToolRegistry, provider, maxIterations? })` → `{ messages, finalMessage, stopReason, events }`；events 含 model/tool
+- AgentRunner: `new AgentRunner(provider).run({ turnId, messages, tools:ToolRegistry, maxIterations? })` → `{ newMessages, stopReason, events }`；`newMessages` 只包含本轮增量消息；events 含 model/tool
 - ContextBuilder: 异步返回 `Promise<Message[]>`，本分支同步实现包 Promise；不注入 system prompt
 - AgentLoop: `runTurn({ sessionId?, userMessage })` → `{ sessionId, finalMessage, newMessages, stopReason, events }`
 
@@ -157,6 +157,44 @@ turn.failed        { sessionId, message }
 - pnpm typecheck: 通过
 - pnpm lint: 通过
 
+## Commit 4: AgentRunner（已完成）
+
+### 新增文件
+
+- `packages/agent/src/agent-runner.ts` — AgentRunner provider/tool loop 实现
+- `test/agent/agent-runner.test.ts` — AgentRunner 无工具、单工具调用、事件、maxIterations 测试
+
+### 修改文件
+
+- `packages/agent/src/index.ts` — 导出 AgentRunner public API
+- `packages/agent/src/provider.ts` — ModelProvider 方法名从 `complete` 调整为 `invoke`
+- `test/agent/tool-contracts.test.ts` — 同步 ModelProvider `invoke` 契约测试
+
+### 测试
+
+- `test/agent/agent-runner.test.ts` — 4 tests
+
+### 实现要点
+
+- `AgentRunner` 构造器只持有 `provider`
+- `run()` 入参携带 `turnId`、`messages`、`tools`、`maxIterations?`
+- `AgentRunnerResult` 返回 `{ newMessages, stopReason, events }`
+- `newMessages` 只包含本轮增量消息，不返回输入 history
+- 无工具路径直接返回 final assistant 增量消息
+- 单工具路径返回 assistant tool-call、tool result、final assistant 三条增量消息
+- Runner 内部维护 working messages，用于将 tool result 回填给下一次 provider 请求
+- RuntimeEvent 覆盖 `model.requested`、`model.responded`、`tool.started`、`tool.completed`、`tool.failed`
+- RuntimeEvent 使用外部传入的 `turnId`
+- `maxIterations` 默认 10，计 provider 调用次数
+- 达到 provider 调用上限后返回 `stopReason: "max_iterations"`
+
+### 完成状态
+
+- pnpm test test/agent/agent-runner.test.ts: 4 passed
+- pnpm test: 66 passed（累计）
+- pnpm typecheck: 通过
+- pnpm lint: 通过
+
 ## 下一步
 
-进入 Commit 4: AgentRunner 的 Phase 2 步骤拆分。
+进入 Commit 5: ContextBuilder and AgentLoop 的 Phase 2 步骤拆分。

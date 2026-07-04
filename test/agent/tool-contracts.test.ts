@@ -76,9 +76,9 @@ describe("agent tool type contracts", () => {
 });
 
 describe("ModelProvider contract", () => {
-  it("ModelProvider is an interface with complete(req): Promise<ProviderResponse>", async () => {
+  it("ModelProvider is an interface with invoke(req): Promise<ProviderResponse>", async () => {
     const fake: ModelProvider = {
-      async complete(_req) {
+      async invoke(_req) {
         const message: AssistantMessage = {
           role: "assistant",
           content: "hi",
@@ -87,7 +87,7 @@ describe("ModelProvider contract", () => {
       },
     };
     const messages: Message[] = [{ role: "user", content: "q" }];
-    const res = await fake.complete({ messages });
+    const res = await fake.invoke({ messages });
     expect(res.message.role).toBe("assistant");
     expect(res.stopReason).toBe("completed");
   });
@@ -95,7 +95,7 @@ describe("ModelProvider contract", () => {
   it("ProviderRequest carries optional tools field", async () => {
     const seen: { tools?: ToolDefinition[] }[] = [];
     const fake: ModelProvider = {
-      async complete(req) {
+      async invoke(req) {
         seen.push(req);
         return {
           message: { role: "assistant", content: "ok" },
@@ -103,8 +103,8 @@ describe("ModelProvider contract", () => {
         };
       },
     };
-    await fake.complete({ messages: [] });
-    await fake.complete({
+    await fake.invoke({ messages: [] });
+    await fake.invoke({
       messages: [],
       tools: [{ name: "t", description: "d" }],
     });

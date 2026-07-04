@@ -32,5 +32,5 @@ export interface ProviderResponse {
 }
 
 export interface ModelProvider {
-  complete(req: ProviderRequest): Promise<ProviderResponse>;
+  invoke(req: ProviderRequest): Promise<ProviderResponse>;
 }
