@@ -9,7 +9,7 @@
 按 `.agents/.plan/agent-base-implementation-plan.md` 推进，共 6 个 commit。
 
 - [x] Commit 1: Core runtime contracts
-- [ ] Commit 2: In-memory session store
+- [x] Commit 2: In-memory session store
 - [ ] Commit 3: Provider and tool registry
 - [ ] Commit 4: AgentRunner
 - [ ] Commit 5: ContextBuilder and AgentLoop
@@ -85,6 +85,36 @@ turn.failed        { sessionId, message }
 
 公共基: `{ type, turnId, ts:number }`
 
+## Commit 2: In-memory session store（已完成）
+
+### 新增文件
+
+- `packages/session/src/in-memory-session-store.ts` — Session 接口 + SessionStore 接口 + InMemorySessionStore 实现
+- `packages/session/src/index.ts` — 公共导出
+
+### 测试
+
+- `test/session/session-store.test.ts` — 6 tests（create / get）
+- `test/session/session-store-history.test.ts` — 6 tests（appendMessages / getHistory）
+
+合计 12 个测试，全部通过。
+
+### 实现要点
+
+- `Session` 接口仅 `{ id: SessionId }`，messages 不在 Session 上
+- `SessionStore` 接口 4 个方法：`create` / `get` / `appendMessages` / `getHistory`
+- `InMemorySessionStore` 用 `Map<SessionId, Message[]>` 存储
+- `appendMessages` 对未知 sessionId 抛错
+- `getHistory` 返回副本（`[...history]`），避免外部修改内部状态
+- `getHistory` 对未知 sessionId 返回空数组
+
+### 完成状态
+
+- pnpm test: 36 passed（累计）
+- pnpm typecheck: 通过
+- pnpm lint: 通过
+
 ## 下一步
 
-进入 Commit 2: In-memory session store 的 Phase 2 步骤拆分。
+进入 Commit 3: Provider and tool registry 的 Phase 2 步骤拆分。
+进入 Commit 3: Provider and tool registry 的 Phase 2 步骤拆分。
