@@ -59,9 +59,14 @@ export class ToolRegistry {
       return undefined;
     }
 
-    const validate = this.getValidator(tool);
-    if (!validate(args)) {
-      return `args do not match parametersJsonSchema: ${ajv.errorsText(validate.errors)}`;
+    try {
+      const validate = this.getValidator(tool);
+      if (!validate(args)) {
+        return `args do not match parametersJsonSchema: ${ajv.errorsText(validate.errors)}`;
+      }
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      return `invalid parametersJsonSchema: ${message}`;
     }
     return undefined;
   }

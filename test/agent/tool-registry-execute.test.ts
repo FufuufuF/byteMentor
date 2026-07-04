@@ -157,6 +157,26 @@ describe("ToolRegistry.execute invalid args", () => {
       expect(r.error.kind).toBe("invalid_args");
     }
   });
+
+  it("returns invalid_args instead of rejecting when parametersJsonSchema is invalid", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "bad-schema",
+      description: "bad schema",
+      parametersJsonSchema: "not-an-object",
+      async execute() {
+        return { ok: true, result: "should not run" };
+      },
+    });
+
+    const r = await registry.execute("bad-schema", {});
+
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.message).toContain("invalid parametersJsonSchema");
+    }
+  });
 });
 
 describe("ToolRegistry.execute tool throws", () => {
