@@ -10,7 +10,7 @@
 
 - [x] Commit 1: Core runtime contracts
 - [x] Commit 2: In-memory session store
-- [ ] Commit 3: Provider and tool registry
+- [x] Commit 3: Provider and tool registry
 - [ ] Commit 4: AgentRunner
 - [ ] Commit 5: ContextBuilder and AgentLoop
 - [ ] Commit 6: Public API and final integration
@@ -114,7 +114,49 @@ turn.failed        { sessionId, message }
 - pnpm typecheck: 通过
 - pnpm lint: 通过
 
+## Commit 3: Provider and tool registry（已完成）
+
+### 新增文件
+
+- `packages/agent/src/provider.ts` — ModelProvider / ProviderRequest / ProviderResponse / AgentTool / ToolDefinition / ToolResult / ToolError 契约
+- `packages/agent/src/tool-registry.ts` — ToolRegistry 注册、列表、执行、参数校验和受控失败
+- `test/agent/tool-contracts.test.ts` — provider/tool 类型契约测试
+- `test/agent/tool-registry.test.ts` — register/list/sort 测试
+- `test/agent/tool-registry-execute.test.ts` — execute 成功、未知工具、非法参数、schema 校验、工具异常测试
+
+### 修改文件
+
+- `packages/agent/src/index.ts` — 导出 provider 和 tool-registry public API
+- `packages/agent/package.json` — 新增 `ajv`
+- `pnpm-lock.yaml` — 锁定 `ajv@8.20.0`
+
+### 测试
+
+- `test/agent/tool-contracts.test.ts` — 10 tests
+- `test/agent/tool-registry.test.ts` — 6 tests
+- `test/agent/tool-registry-execute.test.ts` — 10 tests
+
+合计 26 个 agent 测试，全部通过。
+
+### 实现要点
+
+- `ToolRegistry.list()` 返回 `ToolDefinition[]`，不泄漏 `execute`
+- `ToolRegistry.list()` 按 name 字典序稳定排序
+- `ToolRegistry.execute()` 对未知工具返回 `unknown_tool`
+- `ToolRegistry.execute()` 对工具异常返回 `execution_failed`
+- 无 `parametersJsonSchema` 时允许 `null` 表达 no-arg tool
+- 无 `parametersJsonSchema` 且有参数时，参数必须是非数组 object
+- 有 `parametersJsonSchema` 时使用 Ajv 显式校验参数
+- JSON Schema 可选参数语义: 不在 `required` 的字段可缺省；字段出现时必须符合 schema
+- schema 校验失败返回 `invalid_args`
+
+### 完成状态
+
+- pnpm test test/agent: 26 passed
+- pnpm test: 62 passed（累计）
+- pnpm typecheck: 通过
+- pnpm lint: 通过
+
 ## 下一步
 
-进入 Commit 3: Provider and tool registry 的 Phase 2 步骤拆分。
-进入 Commit 3: Provider and tool registry 的 Phase 2 步骤拆分。
+进入 Commit 4: AgentRunner 的 Phase 2 步骤拆分。
