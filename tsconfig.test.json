@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "outDir": "./dist-test",
+    "tsBuildInfoFile": "dist-test/tsconfig.tsbuildinfo",
+    "noEmit": true,
+    "composite": false,
+    "paths": {
+      "@byte-mentor/core": ["./packages/core/src/index.ts"],
+      "@byte-mentor/session": ["./packages/session/src/index.ts"],
+      "@byte-mentor/agent": ["./packages/agent/src/index.ts"]
+    }
+  },
+  "include": ["test/**/*.ts"],
+  "references": [
+    { "path": "./packages/core" },
+    { "path": "./packages/session" },
+    { "path": "./packages/agent" }
+  ]
+}
+

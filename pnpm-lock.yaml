@@ -8,11 +8,20 @@ importers:
 
   .:
     devDependencies:
+      '@byte-mentor/agent':
+        specifier: workspace:*
+        version: link:packages/agent
+      '@byte-mentor/core':
+        specifier: workspace:*
+        version: link:packages/core
+      '@byte-mentor/session':
+        specifier: workspace:*
+        version: link:packages/session
       '@eslint/js':
         specifier: ^10.0.1
         version: 10.0.1(eslint@10.6.0)
       '@types/node':
-        specifier: ^22.20.0
+        specifier: '22'
         version: 22.20.0
       eslint:
         specifier: ^10.6.0
