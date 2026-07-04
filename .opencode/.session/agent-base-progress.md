@@ -13,7 +13,7 @@
 - [x] Commit 3: Provider and tool registry
 - [x] Commit 4: AgentRunner
 - [x] Commit 5: ContextBuilder and AgentLoop
-- [ ] Commit 6: Public API and final integration
+- [x] Commit 6: Public API and final integration
 
 ## Commit 1: Core runtime contracts（已完成）
 
@@ -249,6 +249,43 @@ turn.failed        { sessionId, message }
 - Plan 范围外补丁：`82d16f0 chore(lint): ignore package dist outputs`，仅用于忽略 package dist 构建产物，保证 `pnpm lint` 在 `pnpm typecheck` 后仍稳定通过。
 - 未触及 CLI / TUI / Knowledge / 真实 Provider / 文件持久化。
 
+## Commit 6: Public API and final integration（已完成）
+
+### 新增文件
+
+- `test/agent/headless-turn.integration.test.ts` — 通过 public package exports 跑完整 headless turn 集成验收。
+
+### 测试
+
+- `test/agent/headless-turn.integration.test.ts` — 1 test
+
+### 实现要点
+
+- 本 commit 为 test-only integration commit，未修改生产代码。
+- 从 `@byte-mentor/core` 导入 `createToolCallId`。
+- 从 `@byte-mentor/session` 导入 `InMemorySessionStore`。
+- 从 `@byte-mentor/agent` 导入 `AgentLoop`、`AgentRunner`、`ContextBuilder`、`AgentTool`、`ModelProvider`。
+- 使用 fake provider + fake tool + in-memory session 跑完整 headless turn。
+- 验证最终 assistant 回复、session messages、工具调用闭环、RuntimeEvent sequence、provider 调用次数。
+- 集成测试直接通过，说明 Commit 5 已完成必要 public exports。
+
+### 完成状态
+
+- pnpm test test/agent/headless-turn.integration.test.ts: 1 passed
+- pnpm test: 73 passed（累计）
+- pnpm typecheck: 通过
+- pnpm lint: 通过
+
+## 分支完成定义核对
+
+- [x] 可以通过 TypeScript API 跑通一次通用 Headless agent turn。
+- [x] 支持一次工具调用闭环。
+- [x] Session 保存本轮完整 messages。
+- [x] RuntimeEvent 能观察 turn、model、tool 的关键过程。
+- [x] pnpm test 通过（73 passed）。
+- [x] pnpm typecheck 通过。
+- [x] 不包含 CLI / TUI / Knowledge / 真实 Provider / 真实持久化。
+
 ## 下一步
 
-进入 Commit 6: Public API and final integration。
+`feat/agent-base` 计划内 6 个 commit 已完成，可以进入下一模块或后续分支。
