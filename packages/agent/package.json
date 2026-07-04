@@ -17,6 +17,7 @@
   "dependencies": {
     "@byte-mentor/core": "workspace:*",
     "@byte-mentor/knowledge": "workspace:*",
-    "@byte-mentor/session": "workspace:*"
+    "@byte-mentor/session": "workspace:*",
+    "ajv": "^8.20.0"
   }
 }
