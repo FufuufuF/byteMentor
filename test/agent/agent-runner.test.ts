@@ -37,6 +37,25 @@ describe("AgentRunner.run", () => {
     expect(Array.isArray(result.events)).toBe(true);
   });
 
+  it("returns failed result when provider throws", async () => {
+    const turnId = createTurnId();
+    const provider: ModelProvider = {
+      async invoke() {
+        throw new Error("provider unavailable");
+      },
+    };
+
+    const result = await new AgentRunner(provider).run({
+      turnId,
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+    });
+
+    expect(result.stopReason).toBe("failed");
+    expect(result.newMessages).toEqual([]);
+    expect(result.events.map((event) => event.type)).toEqual(["model.requested"]);
+  });
+
   it("executes one tool call before final provider response", async () => {
     const inputMessages: Message[] = [
       { id: createMessageId(), role: "user", content: "find docs" },

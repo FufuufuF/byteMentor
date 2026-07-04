@@ -45,10 +45,17 @@ export class AgentRunner {
         messageCount: workingMessages.length,
         toolCount: toolDefinitions.length,
       });
-      const response = await this.provider.invoke({
+      const response = await this.invokeProvider({
         messages: workingMessages,
         tools: toolDefinitions,
       });
+      if (response === undefined) {
+        return {
+          newMessages,
+          stopReason: "failed",
+          events,
+        };
+      }
       const assistantMessage = withMessageId(response.message);
       events.push({
         type: "model.responded",
@@ -112,6 +119,18 @@ export class AgentRunner {
       stopReason: "max_iterations",
       events,
     };
+  }
+
+  private async invokeProvider(input: {
+    messages: Message[];
+    tools: ReturnType<ToolRegistry["list"]>;
+  }) {
+    try {
+      return await this.provider.invoke(input);
+    } catch {
+      // TODO: 后续接入真实Provider后, 在这里返回真正的错误信息
+      return undefined;
+    }
   }
 }
 
