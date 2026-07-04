@@ -62,9 +62,7 @@ describe("core messages", () => {
       { role: "tool", toolCallId: createToolCallId(), content: "r" },
     ];
     const userMsg = messages.find((m): m is UserMessage => m.role === "user");
-    const assistantMsg = messages.find(
-      (m): m is AssistantMessage => m.role === "assistant",
-    );
+    const assistantMsg = messages.find((m): m is AssistantMessage => m.role === "assistant");
     const toolMsg = messages.find((m): m is ToolMessage => m.role === "tool");
     expect(userMsg?.content).toBe("q");
     expect(assistantMsg?.content).toBe("a");
@@ -89,12 +87,7 @@ describe("core messages", () => {
 
 describe("StopReason", () => {
   it("accepts each declared variant", () => {
-    const reasons: StopReason[] = [
-      "completed",
-      "failed",
-      "max_iterations",
-      "tool_calls",
-    ];
+    const reasons: StopReason[] = ["completed", "failed", "max_iterations", "tool_calls"];
     expect(reasons).toContain("completed");
     expect(reasons).toContain("failed");
     expect(reasons).toContain("max_iterations");

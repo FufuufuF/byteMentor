@@ -1,8 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-  InMemorySessionStore,
-  type SessionStore,
-} from "@byte-mentor/session";
+import { InMemorySessionStore, type SessionStore } from "@byte-mentor/session";
 import type { SessionId } from "@byte-mentor/core";
 
 describe("InMemorySessionStore create", () => {

@@ -6,9 +6,7 @@ import type { ModelProvider } from "@byte-mentor/agent";
 
 describe("AgentRunner.run", () => {
   it("returns final assistant message when provider completes", async () => {
-    const inputMessages: Message[] = [
-      { id: createMessageId(), role: "user", content: "hello" },
-    ];
+    const inputMessages: Message[] = [{ id: createMessageId(), role: "user", content: "hello" }];
     const providerRequests: Message[][] = [];
     const provider: ModelProvider = {
       async invoke(req) {

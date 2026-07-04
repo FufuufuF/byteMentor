@@ -7,9 +7,7 @@ export interface ToolError {
   message: string;
 }
 
-export type ToolResult =
-  | { ok: true; result: string }
-  | { ok: false; error: ToolError };
+export type ToolResult = { ok: true; result: string } | { ok: false; error: ToolError };
 
 export interface ToolDefinition {
   name: string;

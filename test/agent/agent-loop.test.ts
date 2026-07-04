@@ -40,10 +40,7 @@ describe("AgentLoop.runTurn", () => {
       content: "done",
     };
     const runner = {
-      async run(input: {
-        messages: Message[];
-        tools: { list(): unknown[] };
-      }) {
+      async run(input: { messages: Message[]; tools: { list(): unknown[] } }) {
         runnerInputs.push({
           messages: input.messages,
           toolCount: input.tools.list().length,
@@ -99,10 +96,7 @@ describe("AgentLoop.runTurn", () => {
         }>;
       };
     }) => {
-      runTurn(input: {
-        sessionId: SessionId;
-        userMessage: string;
-      }): Promise<{
+      runTurn(input: { sessionId: SessionId; userMessage: string }): Promise<{
         sessionId: SessionId;
         finalMessage: Message;
         newMessages: Message[];
@@ -152,11 +146,7 @@ describe("AgentLoop.runTurn", () => {
         },
       ],
     ]);
-    expect(history).toEqual([
-      ...previousMessages,
-      runnerMessages[0]?.at(-1),
-      assistantMessage,
-    ]);
+    expect(history).toEqual([...previousMessages, runnerMessages[0]?.at(-1), assistantMessage]);
   });
 
   it("persists tool-call trace from runner", async () => {

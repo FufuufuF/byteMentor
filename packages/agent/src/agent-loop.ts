@@ -43,9 +43,7 @@ export interface MaxIterationsHeadlessTurnResult extends HeadlessTurnResultBase 
 }
 
 export type HeadlessTurnResult =
-  | CompletedHeadlessTurnResult
-  | FailedHeadlessTurnResult
-  | MaxIterationsHeadlessTurnResult;
+  CompletedHeadlessTurnResult | FailedHeadlessTurnResult | MaxIterationsHeadlessTurnResult;
 
 export interface AgentLoopInput {
   sessionStore: SessionStore;
