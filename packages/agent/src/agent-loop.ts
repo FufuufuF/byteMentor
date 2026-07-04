@@ -2,6 +2,7 @@ import { createMessageId, createTurnId } from "@byte-mentor/core";
 import type {
   AssistantMessage,
   Message,
+  MessageId,
   RuntimeEvent,
   SessionId,
   StopReason,
@@ -16,13 +17,35 @@ export interface HeadlessTurnInput {
   userMessage: string;
 }
 
-export interface HeadlessTurnResult {
+interface HeadlessTurnResultBase {
   sessionId: SessionId;
-  finalMessage: AssistantMessage;
   newMessages: Message[];
   stopReason: StopReason;
   events: RuntimeEvent[];
 }
+
+export interface CompletedHeadlessTurnResult extends HeadlessTurnResultBase {
+  status: "completed";
+  finalMessage: AssistantMessage;
+  stopReason: "completed";
+}
+
+export interface FailedHeadlessTurnResult extends HeadlessTurnResultBase {
+  status: "failed";
+  error: { message: string };
+  stopReason: "failed";
+}
+
+export interface MaxIterationsHeadlessTurnResult extends HeadlessTurnResultBase {
+  status: "max_iterations";
+  error: { message: string };
+  stopReason: "max_iterations";
+}
+
+export type HeadlessTurnResult =
+  | CompletedHeadlessTurnResult
+  | FailedHeadlessTurnResult
+  | MaxIterationsHeadlessTurnResult;
 
 export interface AgentLoopInput {
   sessionStore: SessionStore;
@@ -83,8 +106,48 @@ export class AgentLoop {
       tools: this.tools,
     });
     await this.sessionStore.appendMessages(session.id, result.newMessages);
-    const finalMessage = result.newMessages.at(-1) as AssistantMessage;
-    if (finalMessage.id === undefined) {
+    const newMessages = [userMessage, ...result.newMessages];
+    if (result.stopReason === "failed") {
+      const message = result.error?.message ?? failureMessageFor(result.stopReason);
+      events.push(...result.events, {
+        type: "turn.failed",
+        turnId,
+        ts: Date.now(),
+        sessionId: session.id,
+        message,
+      });
+      return {
+        status: result.stopReason,
+        sessionId: session.id,
+        error: { message },
+        newMessages,
+        stopReason: result.stopReason,
+        events,
+      };
+    }
+    if (result.stopReason === "max_iterations") {
+      const message = failureMessageFor(result.stopReason);
+      events.push(...result.events, {
+        type: "turn.failed",
+        turnId,
+        ts: Date.now(),
+        sessionId: session.id,
+        message,
+      });
+      return {
+        status: "max_iterations",
+        sessionId: session.id,
+        error: { message },
+        newMessages,
+        stopReason: "max_iterations",
+        events,
+      };
+    }
+    if (result.stopReason !== "completed") {
+      throw new Error(`runner returned non-terminal stopReason: ${result.stopReason}`);
+    }
+    const finalMessage = result.newMessages.at(-1);
+    if (!isAssistantMessageWithId(finalMessage)) {
       throw new Error("runner final message missing id");
     }
     events.push(...result.events, {
@@ -97,11 +160,24 @@ export class AgentLoop {
     });
 
     return {
+      status: "completed",
       sessionId: session.id,
       finalMessage,
-      newMessages: [userMessage, ...result.newMessages],
+      newMessages,
       stopReason: result.stopReason,
       events,
     };
   }
+}
+
+function failureMessageFor(stopReason: "failed" | "max_iterations"): string {
+  return stopReason === "failed"
+    ? "agent turn failed before final assistant message"
+    : "reached max iterations before final assistant message";
+}
+
+function isAssistantMessageWithId(
+  message: Message | undefined,
+): message is AssistantMessage & { id: MessageId } {
+  return message?.role === "assistant" && message.id !== undefined;
 }

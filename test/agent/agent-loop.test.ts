@@ -202,6 +202,10 @@ describe("AgentLoop.runTurn", () => {
     const result = await loop.runTurn({ userMessage: "find docs" });
 
     const history = await sessionStore.getHistory(result.sessionId);
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") {
+      throw new Error(`expected completed result, got ${result.status}`);
+    }
     expect(result.stopReason).toBe("completed");
     expect(result.newMessages).toEqual(history);
     expect(history).toHaveLength(4);
@@ -256,6 +260,10 @@ describe("AgentLoop.runTurn", () => {
 
     const result = await loop.runTurn({ userMessage: "find docs" });
 
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") {
+      throw new Error(`expected completed result, got ${result.status}`);
+    }
     expect(result.events.map((event) => event.type)).toEqual([
       "turn.started",
       "context.built",
@@ -292,6 +300,102 @@ describe("AgentLoop.runTurn", () => {
       sessionId: result.sessionId,
       messageId: result.finalMessage.id,
       stopReason: "completed",
+    });
+  });
+
+  it("returns structured failed result when provider throws", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: new AgentRunner({
+        async invoke() {
+          throw new Error("provider unavailable");
+        },
+      }),
+    });
+
+    const result = await loop.runTurn({ userMessage: "hello" });
+
+    const history = await sessionStore.getHistory(result.sessionId);
+    expect(result.status).toBe("failed");
+    if (result.status !== "failed") {
+      throw new Error(`expected failed result, got ${result.status}`);
+    }
+    expect(result.stopReason).toBe("failed");
+    expect("finalMessage" in result).toBe(false);
+    expect(result.error.message).toContain("provider unavailable");
+    expect(result.newMessages).toEqual(history);
+    expect(history).toEqual([
+      {
+        id: expect.any(String),
+        role: "user",
+        content: "hello",
+      },
+    ]);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "turn.started",
+      "context.built",
+      "model.requested",
+      "turn.failed",
+    ]);
+    expect(result.events.at(-1)).toMatchObject({
+      type: "turn.failed",
+      sessionId: result.sessionId,
+      message: expect.stringContaining("provider unavailable"),
+    });
+  });
+
+  it("returns structured max_iterations result without treating a tool message as final", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const toolCallId = createToolCallId();
+    const assistantMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+    };
+    const toolMessage: Message = {
+      id: createMessageId(),
+      role: "tool",
+      toolCallId,
+      content: "still needs more",
+    };
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run() {
+          return {
+            newMessages: [assistantMessage, toolMessage],
+            stopReason: "max_iterations" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    const result = await loop.runTurn({ userMessage: "find docs" });
+
+    const history = await sessionStore.getHistory(result.sessionId);
+    expect(result.status).toBe("max_iterations");
+    if (result.status !== "max_iterations") {
+      throw new Error(`expected max_iterations result, got ${result.status}`);
+    }
+    expect(result.stopReason).toBe("max_iterations");
+    expect("finalMessage" in result).toBe(false);
+    expect(result.error.message).toContain("max iterations");
+    expect(result.newMessages).toEqual(history);
+    expect(history.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "turn.started",
+      "context.built",
+      "turn.failed",
+    ]);
+    expect(result.events.at(-1)).toMatchObject({
+      type: "turn.failed",
+      sessionId: result.sessionId,
+      message: expect.stringContaining("max iterations"),
     });
   });
 });

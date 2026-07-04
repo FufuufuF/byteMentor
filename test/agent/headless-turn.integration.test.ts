@@ -63,6 +63,10 @@ describe("headless turn public API integration", () => {
     const result = await loop.runTurn({ userMessage: "Use lookup once." });
 
     const history = await sessionStore.getHistory(result.sessionId);
+    expect(result.status).toBe("completed");
+    if (result.status !== "completed") {
+      throw new Error(`expected completed result, got ${result.status}`);
+    }
     expect(result.stopReason).toBe("completed");
     expect(result.finalMessage).toMatchObject({
       role: "assistant",

@@ -25,6 +25,7 @@ export interface AgentRunnerResult {
   newMessages: Message[];
   stopReason: StopReason;
   events: RuntimeEvent[];
+  error?: { message: string };
 }
 
 export class AgentRunner {
@@ -45,17 +46,19 @@ export class AgentRunner {
         messageCount: workingMessages.length,
         toolCount: toolDefinitions.length,
       });
-      const response = await this.invokeProvider({
+      const providerResult = await this.invokeProvider({
         messages: workingMessages,
         tools: toolDefinitions,
       });
-      if (response === undefined) {
+      if (!providerResult.ok) {
         return {
           newMessages,
           stopReason: "failed",
           events,
+          error: { message: providerResult.message },
         };
       }
+      const response = providerResult.response;
       const assistantMessage = withMessageId(response.message);
       events.push({
         type: "model.responded",
@@ -124,12 +127,14 @@ export class AgentRunner {
   private async invokeProvider(input: {
     messages: Message[];
     tools: ReturnType<ToolRegistry["list"]>;
-  }) {
+  }): Promise<
+    | { ok: true; response: Awaited<ReturnType<ModelProvider["invoke"]>> }
+    | { ok: false; message: string }
+  > {
     try {
-      return await this.provider.invoke(input);
-    } catch {
-      // TODO: 后续接入真实Provider后, 在这里返回真正的错误信息
-      return undefined;
+      return { ok: true, response: await this.provider.invoke(input) };
+    } catch (e) {
+      return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
   }
 }
