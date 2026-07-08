@@ -133,7 +133,15 @@ byte-mentor chat "解释一下 Promise"
 
 ### 5.1 `@byte-mentor/session`
 
-新增 SQLite session 实现。
+#### 接口提取
+
+当前 `SessionStore` 和 `Session` 类型定义在 `in-memory-session-store.ts` 内部。本分支需要将它们提取到独立的 `session-store.ts` 文件，让接口和实现解耦，使 `SqliteSessionStore` 和 `InMemorySessionStore` 都从同一文件导入接口。
+
+#### `close()` 方法
+
+SQLite 实现需要关闭数据库连接。为保持多态契约一致，`SessionStore` 接口需要新增 `close(): Promise<void>` 方法。`InMemorySessionStore` 实现为 no-op。
+
+#### 新增 SQLite session 实现
 
 它负责：
 

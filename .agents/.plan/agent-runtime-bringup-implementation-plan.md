@@ -29,6 +29,8 @@
 
 范围：
 
+- 新增 `packages/session/src/session-store.ts`（从 `in-memory-session-store.ts` 提取 `SessionStore` 接口和 `Session` 类型）
+- 修改 `packages/session/src/in-memory-session-store.ts`（移除接口定义，改为从 `session-store.ts` 导入；新增 `close()` no-op 实现）
 - 新增 `packages/session/src/sqlite-session-store.ts`
 - 修改 `packages/session/src/index.ts`
 - 修改 `packages/session/package.json`
@@ -38,6 +40,8 @@
 
 目标：
 
+- 将 `SessionStore` 接口和 `Session` 类型提取到独立文件，使接口与实现解耦。
+- 在 `SessionStore` 接口上新增 `close(): Promise<void>` 方法，`InMemorySessionStore` 实现为 no-op。
 - 增加 `SessionStore` 的 SQLite 实现。
 - 支持创建 session、读取 session、追加 messages、按顺序读取 history。
 - 支持关闭数据库连接。
@@ -52,6 +56,8 @@
 
 Review 重点：
 
+- `SessionStore` 接口是否已提取到独立文件，`InMemorySessionStore` 和 `SqliteSessionStore` 均从该文件导入。
+- `close()` 是否已加入接口，`InMemorySessionStore` 是否实现为 no-op。
 - SQLite 层是否仍然只是通用 session/message 存储。
 - 是否完整保存现有 `Message` JSON。
 - 是否避免把教学、Knowledge 或 UI 语义放入 session。
@@ -180,6 +186,7 @@ Review 重点：
 
 预计新增：
 
+- `packages/session/src/session-store.ts`
 - `packages/session/src/sqlite-session-store.ts`
 - `packages/agent/src/openai-chat-provider.ts`
 - `apps/cli/src/config.ts`
@@ -193,6 +200,7 @@ Review 重点：
 
 预计修改：
 
+- `packages/session/src/in-memory-session-store.ts`
 - `packages/session/src/index.ts`
 - `packages/session/package.json`
 - `packages/agent/src/index.ts`
