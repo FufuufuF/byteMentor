@@ -1,16 +1,6 @@
 import type { Message, SessionId } from "@byte-mentor/core";
 import { createSessionId } from "@byte-mentor/core";
-
-export interface Session {
-  id: SessionId;
-}
-
-export interface SessionStore {
-  create(): Promise<Session>;
-  get(id: SessionId): Promise<Session | undefined>;
-  appendMessages(id: SessionId, messages: Message[]): Promise<void>;
-  getHistory(id: SessionId): Promise<Message[]>;
-}
+import type { Session, SessionStore } from "./session-store.js";
 
 export class InMemorySessionStore implements SessionStore {
   private readonly sessions = new Map<SessionId, Message[]>();
@@ -40,4 +30,6 @@ export class InMemorySessionStore implements SessionStore {
     const history = this.sessions.get(id);
     return history ? [...history] : [];
   }
+
+  async close(): Promise<void> {}
 }
