@@ -62,9 +62,6 @@ importers:
       '@byte-mentor/core':
         specifier: workspace:*
         version: link:../core
-      '@byte-mentor/knowledge':
-        specifier: workspace:*
-        version: link:../knowledge
       '@byte-mentor/session':
         specifier: workspace:*
         version: link:../session
