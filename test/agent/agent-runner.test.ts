@@ -127,6 +127,163 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  it("synthesizes a tool message for provider argument parse errors", async () => {
+    const inputMessages: Message[] = [
+      { id: createMessageId(), role: "user", content: "find docs" },
+    ];
+    const toolCallId = createToolCallId();
+    const providerRequests: Message[][] = [];
+    const provider: ModelProvider = {
+      async invoke(req) {
+        providerRequests.push([...req.messages]);
+        if (providerRequests.length === 1) {
+          return {
+            message: {
+              role: "assistant",
+              toolCalls: [
+                {
+                  id: toolCallId,
+                  name: "lookup",
+                  args: "{bad-json",
+                  argsParseError: "Unexpected token b in JSON",
+                },
+              ],
+            },
+            stopReason: "tool_calls",
+          };
+        }
+        return {
+          message: { role: "assistant", content: "recovered" },
+          stopReason: "completed",
+        };
+      },
+    };
+    let toolExecuted = false;
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        toolExecuted = true;
+        return { ok: true, result: "should not run" };
+      },
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: inputMessages,
+      tools,
+    });
+
+    expect(toolExecuted).toBe(false);
+    expect(result.stopReason).toBe("completed");
+    expect(providerRequests.length).toBe(2);
+    const [assistantMessage, toolMessage, finalMessage] = result.newMessages as [
+      AssistantMessage,
+      ToolMessage,
+      AssistantMessage,
+    ];
+    expect(assistantMessage.toolCalls).toEqual([
+      {
+        id: toolCallId,
+        name: "lookup",
+        args: "{bad-json",
+        argsParseError: "Unexpected token b in JSON",
+      },
+    ]);
+    expect(toolMessage).toMatchObject({
+      role: "tool",
+      toolCallId,
+      content: expect.stringContaining("Unexpected token b in JSON") as string,
+    });
+    expect(toolMessage.content).toContain("{bad-json");
+    expect(finalMessage).toMatchObject({ role: "assistant", content: "recovered" });
+    expect(providerRequests[1]).toEqual([inputMessages[0], assistantMessage, toolMessage]);
+  });
+
+  it("executes a valid retry after a parse error repair message", async () => {
+    const inputMessages: Message[] = [
+      { id: createMessageId(), role: "user", content: "find docs" },
+    ];
+    const malformedToolCallId = createToolCallId();
+    const validToolCallId = createToolCallId();
+    const provider: ModelProvider = {
+      async invoke(req) {
+        if (req.messages.length === 1) {
+          return {
+            message: {
+              role: "assistant",
+              toolCalls: [
+                {
+                  id: malformedToolCallId,
+                  name: "lookup",
+                  args: "{bad-json",
+                  argsParseError: "Unexpected token b in JSON",
+                },
+              ],
+            },
+            stopReason: "tool_calls",
+          };
+        }
+        if (req.messages.length === 3) {
+          return {
+            message: {
+              role: "assistant",
+              toolCalls: [
+                {
+                  id: validToolCallId,
+                  name: "lookup",
+                  args: { query: "docs" },
+                },
+              ],
+            },
+            stopReason: "tool_calls",
+          };
+        }
+        return {
+          message: { role: "assistant", content: "found docs" },
+          stopReason: "completed",
+        };
+      },
+    };
+    const executedArgs: unknown[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute(args) {
+        executedArgs.push(args);
+        return { ok: true, result: "result:docs" };
+      },
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: inputMessages,
+      tools,
+    });
+
+    expect(result.stopReason).toBe("completed");
+    expect(executedArgs).toEqual([{ query: "docs" }]);
+    expect(result.newMessages.map((message) => message.role)).toEqual([
+      "assistant",
+      "tool",
+      "assistant",
+      "tool",
+      "assistant",
+    ]);
+    expect(result.newMessages[1]).toMatchObject({
+      role: "tool",
+      toolCallId: malformedToolCallId,
+      content: expect.stringContaining("Unexpected token b in JSON") as string,
+    });
+    expect(result.newMessages[3]).toMatchObject({
+      role: "tool",
+      toolCallId: validToolCallId,
+      content: "result:docs",
+    });
+  });
+
   it("records model and tool runtime events", async () => {
     const turnId = createTurnId();
     const toolCallId = createToolCallId();

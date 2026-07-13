@@ -81,6 +81,17 @@ export class AgentRunner {
       newMessages.push(assistantMessage);
 
       for (const toolCall of assistantMessage.toolCalls) {
+        if (toolCall.argsParseError !== undefined) {
+          const toolMessage: ToolMessage = {
+            id: createMessageId(),
+            role: "tool",
+            toolCallId: toolCall.id,
+            content: toolCallArgsParseErrorContent(toolCall),
+          };
+          workingMessages.push(toolMessage);
+          newMessages.push(toolMessage);
+          continue;
+        }
         events.push({
           type: "tool.started",
           turnId: input.turnId,
@@ -150,4 +161,13 @@ function hasToolCalls(
   message: AssistantMessage,
 ): message is AssistantMessage & { toolCalls: [ToolCall, ...ToolCall[]] } {
   return message.toolCalls !== undefined && message.toolCalls.length > 0;
+}
+
+function toolCallArgsParseErrorContent(toolCall: ToolCall): string {
+  return [
+    `Tool call arguments could not be parsed for "${toolCall.name}".`,
+    `Error: ${toolCall.argsParseError}`,
+    `Raw arguments: ${String(toolCall.args)}`,
+    "Retry this tool call with arguments that match the tool schema.",
+  ].join("\n");
 }
