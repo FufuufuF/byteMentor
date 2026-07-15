@@ -27,16 +27,26 @@ interface FakeOpenAICompletion {
   ];
 }
 
+interface FakeOpenAIChunk {
+  choices: [
+    {
+      delta: FakeOpenAIMessage & { tool_calls?: Array<FakeOpenAIToolCall & { index: number }> };
+      finish_reason: string | null;
+    },
+  ];
+}
+
 interface FakeCreateRequest {
   model: string;
   messages: unknown[];
+  stream?: true;
   tools?: unknown[];
 }
 
 interface FakeOpenAIClient {
   chat: {
     completions: {
-      create(req: FakeCreateRequest): Promise<FakeOpenAICompletion>;
+      create(req: FakeCreateRequest): AsyncIterable<FakeOpenAIChunk>;
     };
   };
 }
@@ -51,7 +61,7 @@ function createFakeClient(responses: Array<FakeOpenAICompletion | Error>): {
     client: {
       chat: {
         completions: {
-          async create(req) {
+          async *create(req) {
             requests.push(req);
             const response = responses.shift();
             if (response === undefined) {
@@ -60,7 +70,27 @@ function createFakeClient(responses: Array<FakeOpenAICompletion | Error>): {
             if (response instanceof Error) {
               throw response;
             }
-            return response;
+            const choice = response.choices[0];
+            const { tool_calls: toolCalls, ...messageDelta } = choice.message;
+            const delta: FakeOpenAIChunk["choices"][0]["delta"] = {
+              ...messageDelta,
+              ...(toolCalls !== undefined
+                ? {
+                    tool_calls: toolCalls.map((toolCall, index) => ({
+                      ...toolCall,
+                      index,
+                    })),
+                  }
+                : {}),
+            };
+            yield {
+              choices: [
+                {
+                  delta,
+                  finish_reason: choice.finish_reason,
+                },
+              ],
+            };
           },
         },
       },
@@ -102,6 +132,7 @@ describe("OpenAIChatProvider.invoke", () => {
     expect(requests).toEqual([
       {
         model: "gpt-test",
+        stream: true,
         messages: [{ role: "user", content: "hello" }],
       },
     ]);
@@ -123,12 +154,12 @@ describe("OpenAIChatProvider.invoke", () => {
             {
               id: "call_search",
               type: "function",
-              function: { name: "search", arguments: "{\"query\":\"docs\"}" },
+              function: { name: "search", arguments: '{"query":"docs"}' },
             },
             {
               id: "call_read",
               type: "function",
-              function: { name: "read", arguments: "{\"id\":42}" },
+              function: { name: "read", arguments: '{"id":42}' },
             },
           ],
         },
@@ -234,9 +265,7 @@ describe("OpenAIChatProvider.invoke", () => {
   // 验证 OpenAI 返回既没有文本也没有工具调用时属于受控失败，
   // provider 直接抛错，后续由 AgentRunner 捕获为 failed turn。
   it("throws when OpenAI returns neither content nor tool calls", async () => {
-    const { client } = createFakeClient([
-      completion({ role: "assistant", content: null }, "stop"),
-    ]);
+    const { client } = createFakeClient([completion({ role: "assistant", content: null }, "stop")]);
     const provider = createProvider(client);
 
     await expect(
@@ -273,7 +302,7 @@ describe("OpenAIChatProvider.invoke", () => {
           {
             id: "call_lookup",
             type: "function",
-            function: { name: "lookup", arguments: "{\"query\":\"docs\"}" },
+            function: { name: "lookup", arguments: '{"query":"docs"}' },
           },
         ],
       },

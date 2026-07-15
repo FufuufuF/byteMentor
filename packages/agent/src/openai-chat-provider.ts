@@ -6,7 +6,13 @@ import type {
   ToolCall,
   ToolCallId,
 } from "@byte-mentor/core";
-import type { ModelProvider, ProviderRequest, ProviderResponse, ToolDefinition } from "./provider.js";
+import type {
+  ModelProvider,
+  ProviderRequest,
+  ProviderResponse,
+  ProviderStreamEvent,
+  ToolDefinition,
+} from "./provider.js";
 
 export interface OpenAIChatProviderConfig {
   model: string;
@@ -30,22 +36,67 @@ export class OpenAIChatProvider implements ModelProvider {
   }
 
   async invoke(req: ProviderRequest): Promise<ProviderResponse> {
-    const request: OpenAI.ChatCompletionCreateParamsNonStreaming = {
-      model: this.model,
-      messages: req.messages.map(toOpenAIMessage),
-      ...toolsRequestPart(req.tools),
-    };
-    const completion = await this.client.chat.completions.create(request);
-    const choice = completion.choices[0];
-    if (choice === undefined) {
-      throw new Error("OpenAI chat completion did not include choices");
+    let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
+    for await (const event of this.invokeStream(req)) {
+      if (event.type === "done") {
+        done = event;
+      }
+    }
+    if (done === undefined) {
+      throw new Error("OpenAI chat completion stream did not include a done event");
     }
     return {
-      message: toAssistantMessage(choice.message),
-      stopReason: toStopReason(choice.finish_reason),
+      message: done.message,
+      stopReason: done.stopReason,
     };
   }
+
+  async *invokeStream(req: ProviderRequest): AsyncIterable<ProviderStreamEvent> {
+    const request: OpenAI.ChatCompletionCreateParamsStreaming = {
+      model: this.model,
+      messages: req.messages.map(toOpenAIMessage),
+      stream: true,
+      ...toolsRequestPart(req.tools),
+    };
+    const stream = await this.client.chat.completions.create(request);
+    let content = "";
+    const toolCalls = new Map<number, StreamingToolCall>();
+
+    for await (const chunk of stream) {
+      const choice = chunk.choices[0];
+      if (choice === undefined) {
+        continue;
+      }
+      const contentDelta = choice.delta.content;
+      if (hasTextContent(contentDelta)) {
+        content += contentDelta;
+        yield { type: "content_delta", text: contentDelta };
+      }
+      for (const toolCallDelta of choice.delta.tool_calls ?? []) {
+        applyToolCallDelta(toolCalls, toolCallDelta);
+      }
+      if (choice.finish_reason !== null) {
+        yield {
+          type: "done",
+          message: toStreamedAssistantMessage(content, toolCalls),
+          stopReason: toStopReason(choice.finish_reason),
+        };
+        return;
+      }
+    }
+    throw new Error("OpenAI chat completion stream ended without finish_reason");
+  }
 }
+
+interface StreamingToolCall {
+  id?: string;
+  name?: string;
+  argumentsRaw: string;
+}
+
+type OpenAIToolCallDelta = NonNullable<
+  OpenAI.ChatCompletionChunk.Choice.Delta["tool_calls"]
+>[number];
 
 function toOpenAIMessage(message: Message): OpenAI.ChatCompletionMessageParam {
   if (message.role === "tool") {
@@ -81,9 +132,9 @@ function toOpenAIToolCall(toolCall: ToolCall): OpenAI.ChatCompletionMessageFunct
   };
 }
 
-function toolsRequestPart(
-  tools: ToolDefinition[] | undefined,
-): { tools?: OpenAI.ChatCompletionTool[] } {
+function toolsRequestPart(tools: ToolDefinition[] | undefined): {
+  tools?: OpenAI.ChatCompletionTool[];
+} {
   if (tools === undefined || tools.length === 0) {
     return {};
   }
@@ -101,16 +152,21 @@ function toolsRequestPart(
   };
 }
 
-function toAssistantMessage(message: OpenAI.ChatCompletionMessage): AssistantMessage {
-  const toolCalls = message.tool_calls?.map(toToolCall);
-  if (hasTextContent(message.content)) {
+function toStreamedAssistantMessage(
+  content: string,
+  toolCallMap: Map<number, StreamingToolCall>,
+): AssistantMessage {
+  const toolCalls = [...toolCallMap.entries()]
+    .sort(([a], [b]) => a - b)
+    .map(([, toolCall]) => toStreamedToolCall(toolCall));
+  if (hasTextContent(content)) {
     return {
       role: "assistant",
-      content: message.content,
-      ...(toolCalls !== undefined && toolCalls.length > 0 ? { toolCalls } : {}),
+      content,
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
     };
   }
-  if (toolCalls !== undefined && toolCalls.length > 0) {
+  if (toolCalls.length > 0) {
     return {
       role: "assistant",
       toolCalls,
@@ -123,14 +179,37 @@ function hasTextContent(content: string | null | undefined): content is string {
   return content !== null && content !== undefined && content.length > 0;
 }
 
-function toToolCall(toolCall: OpenAI.ChatCompletionMessageToolCall): ToolCall {
-  if (toolCall.type !== "function") {
-    throw new Error(`Unsupported OpenAI tool call type: ${toolCall.type}`);
+function applyToolCallDelta(
+  toolCalls: Map<number, StreamingToolCall>,
+  delta: OpenAIToolCallDelta,
+): void {
+  if (delta.type !== undefined && delta.type !== "function") {
+    throw new Error(`Unsupported OpenAI tool call type: ${delta.type}`);
   }
-  const argsResult = parseToolArguments(toolCall.function.arguments);
+  const current = toolCalls.get(delta.index) ?? { argumentsRaw: "" };
+  if (delta.id !== undefined) {
+    current.id = delta.id;
+  }
+  if (delta.function?.name !== undefined) {
+    current.name = delta.function.name;
+  }
+  if (delta.function?.arguments !== undefined) {
+    current.argumentsRaw += delta.function.arguments;
+  }
+  toolCalls.set(delta.index, current);
+}
+
+function toStreamedToolCall(toolCall: StreamingToolCall): ToolCall {
+  if (toolCall.id === undefined) {
+    throw new Error("OpenAI streamed tool call was missing id");
+  }
+  if (toolCall.name === undefined) {
+    throw new Error("OpenAI streamed tool call was missing function name");
+  }
+  const argsResult = parseToolArguments(toolCall.argumentsRaw);
   return {
     id: toolCall.id as ToolCallId,
-    name: toolCall.function.name,
+    name: toolCall.name,
     args: argsResult.args,
     ...(argsResult.argsParseError !== undefined
       ? { argsParseError: argsResult.argsParseError }
@@ -138,9 +217,9 @@ function toToolCall(toolCall: OpenAI.ChatCompletionMessageToolCall): ToolCall {
   };
 }
 
-function parseToolArguments(rawArguments: string):
-  | { args: unknown; argsParseError?: undefined }
-  | { args: string; argsParseError: string } {
+function parseToolArguments(
+  rawArguments: string,
+): { args: unknown; argsParseError?: undefined } | { args: string; argsParseError: string } {
   try {
     return { args: JSON.parse(rawArguments) as unknown };
   } catch (e) {

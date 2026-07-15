@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type {
   AgentTool,
   ModelProvider,
+  ProviderStreamEvent,
   ToolDefinition,
   ToolError,
   ToolResult,
@@ -85,6 +86,13 @@ describe("ModelProvider contract", () => {
         };
         return { message, stopReason: "completed" as StopReason };
       },
+      async *invokeStream() {
+        yield {
+          type: "done",
+          message: { role: "assistant", content: "hi" },
+          stopReason: "completed" as StopReason,
+        };
+      },
     };
     const messages: Message[] = [{ role: "user", content: "q" }];
     const res = await fake.invoke({ messages });
@@ -102,6 +110,14 @@ describe("ModelProvider contract", () => {
           stopReason: "completed",
         };
       },
+      async *invokeStream(req) {
+        seen.push(req);
+        yield {
+          type: "done",
+          message: { role: "assistant", content: "ok" },
+          stopReason: "completed",
+        };
+      },
     };
     await fake.invoke({ messages: [] });
     await fake.invoke({
@@ -110,5 +126,35 @@ describe("ModelProvider contract", () => {
     });
     expect(seen[0]?.tools).toBeUndefined();
     expect(seen[1]?.tools?.length).toBe(1);
+  });
+
+  it("ModelProvider can stream content deltas before a done event", async () => {
+    const fake: ModelProvider = {
+      async invoke() {
+        return {
+          message: { role: "assistant", content: "hello world" },
+          stopReason: "completed",
+        };
+      },
+      async *invokeStream() {
+        const events: ProviderStreamEvent[] = [
+          { type: "content_delta", text: "hello " },
+          { type: "content_delta", text: "world" },
+          {
+            type: "done",
+            message: { role: "assistant", content: "hello world" },
+            stopReason: "completed",
+          },
+        ];
+        yield* events;
+      },
+    };
+
+    const events: ProviderStreamEvent[] = [];
+    for await (const event of fake.invokeStream({ messages: [] })) {
+      events.push(event);
+    }
+
+    expect(events.map((event) => event.type)).toEqual(["content_delta", "content_delta", "done"]);
   });
 });

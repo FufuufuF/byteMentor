@@ -29,6 +29,11 @@ export interface ProviderResponse {
   stopReason: StopReason;
 }
 
+export type ProviderStreamEvent =
+  | { type: "content_delta"; text: string }
+  | { type: "done"; message: AssistantMessage; stopReason: StopReason };
+
 export interface ModelProvider {
   invoke(req: ProviderRequest): Promise<ProviderResponse>;
+  invokeStream(req: ProviderRequest): AsyncIterable<ProviderStreamEvent>;
 }

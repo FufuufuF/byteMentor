@@ -2,8 +2,34 @@ import { describe, expect, it } from "vitest";
 import { createMessageId, createToolCallId } from "@byte-mentor/core";
 import type { Message, RuntimeEvent, SessionId, StopReason } from "@byte-mentor/core";
 import { AgentLoop, AgentRunner, ContextBuilder } from "@byte-mentor/agent";
-import type { ModelProvider } from "@byte-mentor/agent";
+import type {
+  ModelProvider,
+  ProviderRequest,
+  ProviderResponse,
+  ProviderStreamEvent,
+} from "@byte-mentor/agent";
 import { InMemorySessionStore } from "@byte-mentor/session";
+
+function invokeProvider(
+  invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
+): ModelProvider {
+  return {
+    async invoke(req) {
+      return invoke(req);
+    },
+    async *invokeStream(req) {
+      const response = await invoke(req);
+      if (response.message.content !== undefined && response.message.content.length > 0) {
+        yield { type: "content_delta", text: response.message.content };
+      }
+      yield {
+        type: "done",
+        message: response.message,
+        stopReason: response.stopReason,
+      };
+    },
+  };
+}
 
 describe("AgentLoop.runTurn", () => {
   it("creates a session and persists a completed turn", async () => {
@@ -151,24 +177,22 @@ describe("AgentLoop.runTurn", () => {
 
   it("persists tool-call trace from runner", async () => {
     const toolCallId = createToolCallId();
-    const provider: ModelProvider = {
-      async invoke(req) {
-        if (req.messages.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              content: "",
-              toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      if (req.messages.length === 1) {
         return {
-          message: { role: "assistant", content: "found docs" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: { role: "assistant", content: "found docs" },
+        stopReason: "completed",
+      };
+    });
     const sessionStore = new InMemorySessionStore();
     const loop = new AgentLoop({
       sessionStore,
@@ -216,24 +240,22 @@ describe("AgentLoop.runTurn", () => {
 
   it("emits runtime event sequence for a tool turn", async () => {
     const toolCallId = createToolCallId();
-    const provider: ModelProvider = {
-      async invoke(req) {
-        if (req.messages.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              content: "",
-              toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      if (req.messages.length === 1) {
         return {
-          message: { role: "assistant", content: "done" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: { role: "assistant", content: "done" },
+        stopReason: "completed",
+      };
+    });
     const sessionStore = new InMemorySessionStore();
     const loop = new AgentLoop({
       sessionStore,
@@ -298,11 +320,11 @@ describe("AgentLoop.runTurn", () => {
     const loop = new AgentLoop({
       sessionStore,
       contextBuilder: new ContextBuilder(),
-      runner: new AgentRunner({
-        async invoke() {
+      runner: new AgentRunner(
+        invokeProvider(async () => {
           throw new Error("provider unavailable");
-        },
-      }),
+        }),
+      ),
     });
 
     const result = await loop.runTurn({ userMessage: "hello" });
@@ -387,5 +409,51 @@ describe("AgentLoop.runTurn", () => {
       sessionId: result.sessionId,
       message: expect.stringContaining("max iterations"),
     });
+  });
+
+  it("passes stream event callback option to runner", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const assistantMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "hello world",
+    };
+    const deltas: string[] = [];
+    const receivedCallbacks: Array<((event: ProviderStreamEvent) => void) | undefined> = [];
+    const runner = {
+      async run(input: {
+        messages: Message[];
+        onStreamEvent?: (event: ProviderStreamEvent) => void;
+      }) {
+        receivedCallbacks.push(input.onStreamEvent);
+        input.onStreamEvent?.({ type: "content_delta", text: "hello " });
+        input.onStreamEvent?.({ type: "content_delta", text: "world" });
+        return {
+          newMessages: [assistantMessage],
+          stopReason: "completed" as StopReason,
+          events: [],
+        };
+      },
+    };
+
+    const result = await new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner,
+    }).runTurn(
+      { userMessage: "hello" },
+      {
+        onStreamEvent(event) {
+          if (event.type === "content_delta") {
+            deltas.push(event.text);
+          }
+        },
+      },
+    );
+
+    expect(result.status).toBe("completed");
+    expect(receivedCallbacks).toHaveLength(1);
+    expect(receivedCallbacks[0]).toBeTypeOf("function");
+    expect(deltas).toEqual(["hello ", "world"]);
   });
 });

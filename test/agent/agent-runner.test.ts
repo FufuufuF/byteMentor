@@ -2,21 +2,63 @@ import { describe, expect, it } from "vitest";
 import { createMessageId, createToolCallId, createTurnId } from "@byte-mentor/core";
 import type { AssistantMessage, Message, MessageId, ToolMessage } from "@byte-mentor/core";
 import { AgentRunner, ToolRegistry } from "@byte-mentor/agent";
-import type { ModelProvider } from "@byte-mentor/agent";
+import type {
+  ModelProvider,
+  ProviderRequest,
+  ProviderResponse,
+  ProviderStreamEvent,
+} from "@byte-mentor/agent";
+
+function streamProvider(
+  invokeStream: (req: ProviderRequest) => AsyncIterable<ProviderStreamEvent>,
+): ModelProvider {
+  return {
+    async invoke(req) {
+      let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
+      for await (const event of invokeStream(req)) {
+        if (event.type === "done") {
+          done = event;
+        }
+      }
+      if (done === undefined) {
+        throw new Error("missing done event");
+      }
+      return {
+        message: done.message,
+        stopReason: done.stopReason,
+      } satisfies ProviderResponse;
+    },
+    invokeStream,
+  };
+}
+
+function invokeProvider(
+  invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
+): ModelProvider {
+  return streamProvider(async function* (req) {
+    const response = await invoke(req);
+    if (response.message.content !== undefined && response.message.content.length > 0) {
+      yield { type: "content_delta", text: response.message.content };
+    }
+    yield {
+      type: "done",
+      message: response.message,
+      stopReason: response.stopReason,
+    };
+  });
+}
 
 describe("AgentRunner.run", () => {
   it("returns final assistant message when provider completes", async () => {
     const inputMessages: Message[] = [{ id: createMessageId(), role: "user", content: "hello" }];
     const providerRequests: Message[][] = [];
-    const provider: ModelProvider = {
-      async invoke(req) {
-        providerRequests.push(req.messages);
-        return {
-          message: { role: "assistant", content: "done" },
-          stopReason: "completed",
-        };
-      },
-    };
+    const provider = invokeProvider(async (req) => {
+      providerRequests.push(req.messages);
+      return {
+        message: { role: "assistant", content: "done" },
+        stopReason: "completed",
+      };
+    });
 
     const result = await new AgentRunner(provider).run({
       turnId: createTurnId(),
@@ -37,11 +79,9 @@ describe("AgentRunner.run", () => {
 
   it("returns failed result when provider throws", async () => {
     const turnId = createTurnId();
-    const provider: ModelProvider = {
-      async invoke() {
-        throw new Error("provider unavailable");
-      },
-    };
+    const provider = invokeProvider(async () => {
+      throw new Error("provider unavailable");
+    });
 
     const result = await new AgentRunner(provider).run({
       turnId,
@@ -60,25 +100,23 @@ describe("AgentRunner.run", () => {
     ];
     const toolCallId = createToolCallId();
     const providerRequests: Message[][] = [];
-    const provider: ModelProvider = {
-      async invoke(req) {
-        providerRequests.push([...req.messages]);
-        if (providerRequests.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              content: "",
-              toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      providerRequests.push([...req.messages]);
+      if (providerRequests.length === 1) {
         return {
-          message: { role: "assistant", content: "found docs" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: { role: "assistant", content: "found docs" },
+        stopReason: "completed",
+      };
+    });
     const tools = new ToolRegistry();
     tools.register({
       name: "lookup",
@@ -133,31 +171,29 @@ describe("AgentRunner.run", () => {
     ];
     const toolCallId = createToolCallId();
     const providerRequests: Message[][] = [];
-    const provider: ModelProvider = {
-      async invoke(req) {
-        providerRequests.push([...req.messages]);
-        if (providerRequests.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              toolCalls: [
-                {
-                  id: toolCallId,
-                  name: "lookup",
-                  args: "{bad-json",
-                  argsParseError: "Unexpected token b in JSON",
-                },
-              ],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      providerRequests.push([...req.messages]);
+      if (providerRequests.length === 1) {
         return {
-          message: { role: "assistant", content: "recovered" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            toolCalls: [
+              {
+                id: toolCallId,
+                name: "lookup",
+                args: "{bad-json",
+                argsParseError: "Unexpected token b in JSON",
+              },
+            ],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: { role: "assistant", content: "recovered" },
+        stopReason: "completed",
+      };
+    });
     let toolExecuted = false;
     const tools = new ToolRegistry();
     tools.register({
@@ -207,45 +243,43 @@ describe("AgentRunner.run", () => {
     ];
     const malformedToolCallId = createToolCallId();
     const validToolCallId = createToolCallId();
-    const provider: ModelProvider = {
-      async invoke(req) {
-        if (req.messages.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              toolCalls: [
-                {
-                  id: malformedToolCallId,
-                  name: "lookup",
-                  args: "{bad-json",
-                  argsParseError: "Unexpected token b in JSON",
-                },
-              ],
-            },
-            stopReason: "tool_calls",
-          };
-        }
-        if (req.messages.length === 3) {
-          return {
-            message: {
-              role: "assistant",
-              toolCalls: [
-                {
-                  id: validToolCallId,
-                  name: "lookup",
-                  args: { query: "docs" },
-                },
-              ],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      if (req.messages.length === 1) {
         return {
-          message: { role: "assistant", content: "found docs" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            toolCalls: [
+              {
+                id: malformedToolCallId,
+                name: "lookup",
+                args: "{bad-json",
+                argsParseError: "Unexpected token b in JSON",
+              },
+            ],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      if (req.messages.length === 3) {
+        return {
+          message: {
+            role: "assistant",
+            toolCalls: [
+              {
+                id: validToolCallId,
+                name: "lookup",
+                args: { query: "docs" },
+              },
+            ],
+          },
+          stopReason: "tool_calls",
+        };
+      }
+      return {
+        message: { role: "assistant", content: "found docs" },
+        stopReason: "completed",
+      };
+    });
     const executedArgs: unknown[] = [];
     const tools = new ToolRegistry();
     tools.register({
@@ -287,24 +321,22 @@ describe("AgentRunner.run", () => {
   it("records model and tool runtime events", async () => {
     const turnId = createTurnId();
     const toolCallId = createToolCallId();
-    const provider: ModelProvider = {
-      async invoke(req) {
-        if (req.messages.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              content: "",
-              toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      if (req.messages.length === 1) {
         return {
-          message: { role: "assistant", content: "done" },
-          stopReason: "completed",
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+          },
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: { role: "assistant", content: "done" },
+        stopReason: "completed",
+      };
+    });
     const tools = new ToolRegistry();
     tools.register({
       name: "lookup",
@@ -365,19 +397,17 @@ describe("AgentRunner.run", () => {
   it("stops with max_iterations when provider keeps requesting tools", async () => {
     const toolCallId = createToolCallId();
     let providerCallCount = 0;
-    const provider: ModelProvider = {
-      async invoke() {
-        providerCallCount += 1;
-        return {
-          message: {
-            role: "assistant",
-            content: "",
-            toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
-          },
-          stopReason: "tool_calls",
-        };
-      },
-    };
+    const provider = invokeProvider(async () => {
+      providerCallCount += 1;
+      return {
+        message: {
+          role: "assistant",
+          content: "",
+          toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+        },
+        stopReason: "tool_calls",
+      };
+    });
     const tools = new ToolRegistry();
     tools.register({
       name: "lookup",
@@ -405,6 +435,87 @@ describe("AgentRunner.run", () => {
       role: "tool",
       toolCallId,
       content: "still needs more",
+    });
+  });
+
+  it("forwards content deltas for a final completed stream", async () => {
+    const deltas: string[] = [];
+    const provider = streamProvider(async function* () {
+      yield { type: "content_delta", text: "hello " };
+      yield { type: "content_delta", text: "world" };
+      yield {
+        type: "done",
+        message: { role: "assistant", content: "hello world" },
+        stopReason: "completed",
+      };
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      onStreamEvent(event) {
+        if (event.type === "content_delta") {
+          deltas.push(event.text);
+        }
+      },
+    });
+
+    expect(result.stopReason).toBe("completed");
+    expect(deltas).toEqual(["hello ", "world"]);
+  });
+
+  it("does not forward content deltas from intermediate tool-call streams", async () => {
+    const toolCallId = createToolCallId();
+    const deltas: string[] = [];
+    const provider = streamProvider(async function* (req) {
+      if (req.messages.length === 1) {
+        yield { type: "content_delta", text: "checking tool" };
+        yield {
+          type: "done",
+          message: {
+            role: "assistant",
+            content: "checking tool",
+            toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+          },
+          stopReason: "tool_calls",
+        };
+        return;
+      }
+      yield { type: "content_delta", text: "final " };
+      yield { type: "content_delta", text: "answer" };
+      yield {
+        type: "done",
+        message: { role: "assistant", content: "final answer" },
+        stopReason: "completed",
+      };
+    });
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        return { ok: true, result: "result:docs" };
+      },
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
+      tools,
+      onStreamEvent(event) {
+        if (event.type === "content_delta") {
+          deltas.push(event.text);
+        }
+      },
+    });
+
+    expect(result.stopReason).toBe("completed");
+    expect(deltas).toEqual(["final ", "answer"]);
+    expect(result.newMessages[0]).toMatchObject({
+      role: "assistant",
+      content: "checking tool",
+      toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
     });
   });
 });

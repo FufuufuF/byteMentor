@@ -9,7 +9,7 @@ import type {
   ToolMessage,
   TurnId,
 } from "@byte-mentor/core";
-import type { ModelProvider } from "./provider.js";
+import type { ModelProvider, ProviderResponse, ProviderStreamEvent } from "./provider.js";
 import type { ToolRegistry } from "./tool-registry.js";
 
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -19,6 +19,7 @@ export interface AgentRunnerInput {
   messages: Message[];
   tools: ToolRegistry;
   maxIterations?: number;
+  onStreamEvent?: (event: ProviderStreamEvent) => void;
 }
 
 export interface AgentRunnerResult {
@@ -69,6 +70,11 @@ export class AgentRunner {
       });
 
       if (!hasToolCalls(assistantMessage)) {
+        if (response.stopReason === "completed") {
+          for (const event of providerResult.contentDeltas) {
+            input.onStreamEvent?.(event);
+          }
+        }
         newMessages.push(assistantMessage);
         return {
           newMessages,
@@ -139,11 +145,34 @@ export class AgentRunner {
     messages: Message[];
     tools: ReturnType<ToolRegistry["list"]>;
   }): Promise<
-    | { ok: true; response: Awaited<ReturnType<ModelProvider["invoke"]>> }
+    | {
+        ok: true;
+        response: ProviderResponse;
+        contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>>;
+      }
     | { ok: false; message: string }
   > {
     try {
-      return { ok: true, response: await this.provider.invoke(input) };
+      let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
+      const contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>> = [];
+      for await (const event of this.provider.invokeStream(input)) {
+        if (event.type === "content_delta") {
+          contentDeltas.push(event);
+        } else {
+          done = event;
+        }
+      }
+      if (done === undefined) {
+        throw new Error("provider stream did not include a done event");
+      }
+      return {
+        ok: true,
+        response: {
+          message: done.message,
+          stopReason: done.stopReason,
+        },
+        contentDeltas,
+      };
     } catch (e) {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
