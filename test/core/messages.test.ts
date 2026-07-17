@@ -40,6 +40,18 @@ describe("core messages", () => {
     expect(msg.toolCalls?.[0].args).toEqual({ query: "tdd" });
   });
 
+  it("ToolCall can carry provider argument parse errors", () => {
+    const toolCallId = createToolCallId();
+    const call: ToolCall = {
+      id: toolCallId,
+      name: "search",
+      args: "{bad-json",
+      argsParseError: "Unexpected token b in JSON",
+    };
+    expect(call.args).toBe("{bad-json");
+    expect(call.argsParseError).toContain("Unexpected token");
+  });
+
   it("ToolMessage links back to AssistantMessage.toolCalls[].id via toolCallId", () => {
     const toolCallId = createToolCallId();
     const assistant: AssistantMessage = {

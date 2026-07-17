@@ -48,4 +48,19 @@ describe("SessionStore contract", () => {
     const store: SessionStore = new InMemorySessionStore();
     expect(store).toBeInstanceOf(InMemorySessionStore);
   });
+
+  it("close leaves an in-memory store usable", async () => {
+    const store: SessionStore = new InMemorySessionStore();
+    const session = await store.create();
+    await store.appendMessages(session.id, [{ role: "user", content: "before close" }]);
+
+    await store.close();
+    await store.appendMessages(session.id, [{ role: "assistant", content: "after close" }]);
+
+    await expect(store.get(session.id)).resolves.toEqual(session);
+    await expect(store.getHistory(session.id)).resolves.toEqual([
+      { role: "user", content: "before close" },
+      { role: "assistant", content: "after close" },
+    ]);
+  });
 });

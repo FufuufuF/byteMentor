@@ -10,11 +10,16 @@ import type {
 import type { SessionStore } from "@byte-mentor/session";
 import type { AgentRunner } from "./agent-runner.js";
 import type { ContextBuilder } from "./context-builder.js";
+import type { ProviderStreamEvent } from "./provider.js";
 import { ToolRegistry } from "./tool-registry.js";
 
 export interface HeadlessTurnInput {
   sessionId?: SessionId;
   userMessage: string;
+}
+
+export interface HeadlessTurnOptions {
+  onStreamEvent?: (event: ProviderStreamEvent) => void;
 }
 
 interface HeadlessTurnResultBase {
@@ -63,7 +68,10 @@ export class AgentLoop {
     this.runner = input.runner;
   }
 
-  async runTurn(input: HeadlessTurnInput): Promise<HeadlessTurnResult> {
+  async runTurn(
+    input: HeadlessTurnInput,
+    options?: HeadlessTurnOptions,
+  ): Promise<HeadlessTurnResult> {
     const turnId = createTurnId();
     const session =
       input.sessionId === undefined
@@ -102,6 +110,7 @@ export class AgentLoop {
       turnId,
       messages,
       tools: this.tools,
+      onStreamEvent: options?.onStreamEvent,
     });
     await this.sessionStore.appendMessages(session.id, result.newMessages);
     const newMessages = [userMessage, ...result.newMessages];

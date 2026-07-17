@@ -16,8 +16,8 @@
   ],
   "dependencies": {
     "@byte-mentor/core": "workspace:*",
-    "@byte-mentor/knowledge": "workspace:*",
     "@byte-mentor/session": "workspace:*",
-    "ajv": "^8.20.0"
+    "ajv": "^8.20.0",
+    "openai": "^6.46.0"
   }
 }

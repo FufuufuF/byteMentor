@@ -74,6 +74,7 @@ traces/
 logs/
 *.log
 *.log.*
+.byte-mentor/
 pids/
 *.pid
 *.seed

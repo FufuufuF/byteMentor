@@ -6,6 +6,7 @@ export interface ToolCall {
   id: ToolCallId;
   name: string;
   args: unknown;
+  argsParseError?: string;
 }
 
 interface BaseMessage {

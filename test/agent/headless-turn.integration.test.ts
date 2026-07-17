@@ -1,44 +1,68 @@
 import { describe, expect, it } from "vitest";
 import { createToolCallId } from "@byte-mentor/core";
 import { AgentLoop, AgentRunner, ContextBuilder } from "@byte-mentor/agent";
-import type { AgentTool, ModelProvider } from "@byte-mentor/agent";
+import type {
+  AgentTool,
+  ModelProvider,
+  ProviderRequest,
+  ProviderResponse,
+} from "@byte-mentor/agent";
 import { InMemorySessionStore } from "@byte-mentor/session";
+
+function invokeProvider(
+  invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
+): ModelProvider {
+  return {
+    async invoke(req) {
+      return invoke(req);
+    },
+    async *invokeStream(req) {
+      const response = await invoke(req);
+      if (response.message.content !== undefined && response.message.content.length > 0) {
+        yield { type: "content_delta", text: response.message.content };
+      }
+      yield {
+        type: "done",
+        message: response.message,
+        stopReason: response.stopReason,
+      };
+    },
+  };
+}
 
 describe("headless turn public API integration", () => {
   it("runs a tool-using headless turn through public package exports", async () => {
     const toolCallId = createToolCallId();
     const providerRequests: unknown[] = [];
-    const provider: ModelProvider = {
-      async invoke(req) {
-        providerRequests.push({
-          messages: req.messages,
-          tools: req.tools,
-        });
-        if (req.messages.length === 1) {
-          return {
-            message: {
-              role: "assistant",
-              content: "",
-              toolCalls: [
-                {
-                  id: toolCallId,
-                  name: "lookup",
-                  args: { query: "public api" },
-                },
-              ],
-            },
-            stopReason: "tool_calls",
-          };
-        }
+    const provider = invokeProvider(async (req) => {
+      providerRequests.push({
+        messages: req.messages,
+        tools: req.tools,
+      });
+      if (req.messages.length === 1) {
         return {
           message: {
             role: "assistant",
-            content: "The public API turn completed.",
+            content: "",
+            toolCalls: [
+              {
+                id: toolCallId,
+                name: "lookup",
+                args: { query: "public api" },
+              },
+            ],
           },
-          stopReason: "completed",
+          stopReason: "tool_calls",
         };
-      },
-    };
+      }
+      return {
+        message: {
+          role: "assistant",
+          content: "The public API turn completed.",
+        },
+        stopReason: "completed",
+      };
+    });
     const lookupTool: AgentTool = {
       name: "lookup",
       description: "lookup docs",

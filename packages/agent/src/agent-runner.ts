@@ -9,7 +9,7 @@ import type {
   ToolMessage,
   TurnId,
 } from "@byte-mentor/core";
-import type { ModelProvider } from "./provider.js";
+import type { ModelProvider, ProviderResponse, ProviderStreamEvent } from "./provider.js";
 import type { ToolRegistry } from "./tool-registry.js";
 
 const DEFAULT_MAX_ITERATIONS = 10;
@@ -19,6 +19,7 @@ export interface AgentRunnerInput {
   messages: Message[];
   tools: ToolRegistry;
   maxIterations?: number;
+  onStreamEvent?: (event: ProviderStreamEvent) => void;
 }
 
 export interface AgentRunnerResult {
@@ -69,6 +70,11 @@ export class AgentRunner {
       });
 
       if (!hasToolCalls(assistantMessage)) {
+        if (response.stopReason === "completed") {
+          for (const event of providerResult.contentDeltas) {
+            input.onStreamEvent?.(event);
+          }
+        }
         newMessages.push(assistantMessage);
         return {
           newMessages,
@@ -81,6 +87,17 @@ export class AgentRunner {
       newMessages.push(assistantMessage);
 
       for (const toolCall of assistantMessage.toolCalls) {
+        if (toolCall.argsParseError !== undefined) {
+          const toolMessage: ToolMessage = {
+            id: createMessageId(),
+            role: "tool",
+            toolCallId: toolCall.id,
+            content: toolCallArgsParseErrorContent(toolCall),
+          };
+          workingMessages.push(toolMessage);
+          newMessages.push(toolMessage);
+          continue;
+        }
         events.push({
           type: "tool.started",
           turnId: input.turnId,
@@ -128,11 +145,34 @@ export class AgentRunner {
     messages: Message[];
     tools: ReturnType<ToolRegistry["list"]>;
   }): Promise<
-    | { ok: true; response: Awaited<ReturnType<ModelProvider["invoke"]>> }
+    | {
+        ok: true;
+        response: ProviderResponse;
+        contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>>;
+      }
     | { ok: false; message: string }
   > {
     try {
-      return { ok: true, response: await this.provider.invoke(input) };
+      let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
+      const contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>> = [];
+      for await (const event of this.provider.invokeStream(input)) {
+        if (event.type === "content_delta") {
+          contentDeltas.push(event);
+        } else {
+          done = event;
+        }
+      }
+      if (done === undefined) {
+        throw new Error("provider stream did not include a done event");
+      }
+      return {
+        ok: true,
+        response: {
+          message: done.message,
+          stopReason: done.stopReason,
+        },
+        contentDeltas,
+      };
     } catch (e) {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
@@ -150,4 +190,13 @@ function hasToolCalls(
   message: AssistantMessage,
 ): message is AssistantMessage & { toolCalls: [ToolCall, ...ToolCall[]] } {
   return message.toolCalls !== undefined && message.toolCalls.length > 0;
+}
+
+function toolCallArgsParseErrorContent(toolCall: ToolCall): string {
+  return [
+    `Tool call arguments could not be parsed for "${toolCall.name}".`,
+    `Error: ${toolCall.argsParseError}`,
+    `Raw arguments: ${String(toolCall.args)}`,
+    "Retry this tool call with arguments that match the tool schema.",
+  ].join("\n");
 }
