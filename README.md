@@ -1,6 +1,6 @@
 # Byte Mentor
 
-Byte Mentor 目前处在 agent runtime bring-up 阶段。当前分支提供一个最小本地 smoke 闭环：
+Byte Mentor 目前处在 agent runtime bring-up 阶段。当前代码提供一个最小本地 smoke 闭环：
 
 ```text
 CLI 输入 -> SQLite session -> OpenAI Chat provider -> AgentLoop / AgentRunner -> 保存消息 -> 输出 assistant 回复
@@ -19,12 +19,12 @@ pnpm build
 
 Smoke 命令从环境变量读取配置：
 
-| 变量 | 必填 | 说明 |
-| --- | --- | --- |
-| `OPENAI_API_KEY` | 是 | API key。使用兼容 OpenAI Chat Completions 的服务时，也通过这个变量传入 key。 |
-| `BYTE_MENTOR_MODEL` | 是 | Chat Completions 模型名，例如 `.env.example` 中的 `deepseek-v4-pro`。 |
-| `BYTE_MENTOR_OPENAI_BASE_URL` | 否 | 可选的 OpenAI-compatible base URL。使用官方 OpenAI 时可以不设置。 |
-| `BYTE_MENTOR_DB_PATH` | 否 | 可选 SQLite 路径。相对路径会按当前工作目录解析。 |
+| 变量                          | 必填 | 说明                                                                         |
+| ----------------------------- | ---- | ---------------------------------------------------------------------------- |
+| `OPENAI_API_KEY`              | 是   | API key。使用兼容 OpenAI Chat Completions 的服务时，也通过这个变量传入 key。 |
+| `BYTE_MENTOR_MODEL`           | 是   | Chat Completions 模型名，例如 `.env.example` 中的 `deepseek-v4-pro`。        |
+| `BYTE_MENTOR_OPENAI_BASE_URL` | 否   | 可选的 OpenAI-compatible base URL。使用官方 OpenAI 时可以不设置。            |
+| `BYTE_MENTOR_DB_PATH`         | 否   | 可选 SQLite 路径。相对路径会按当前工作目录解析。                             |
 
 可以从 `.env.example` 创建本地 `.env`，再导出到当前 shell：
 
@@ -77,7 +77,7 @@ sqlite3 .byte-mentor/byte-mentor.sqlite "SELECT seq, role FROM messages"
 pnpm exec node apps/cli/dist/index.js chat "换个方式解释"
 ```
 
-当前分支还没有实现 `--session`，所以 CLI 每次启动都会创建新 session。同一个 SQLite 文件中此时应该能看到两条 session。
+当前阶段还没有实现 `--session`，所以 CLI 每次启动都会创建新 session。同一个 SQLite 文件中此时应该能看到两条 session。
 
 每次运行结束后，`.byte-mentor/byte-mentor.sqlite` 不应残留 `-journal` 或 `-wal` 文件。如果进程退出后这些文件仍然存在，需要检查 store close 路径。
 
@@ -85,14 +85,14 @@ pnpm exec node apps/cli/dist/index.js chat "换个方式解释"
 
 ## 当前范围
 
-当前分支已经实现：
+当前代码已经实现：
 
 - SQLite-backed session 和 message 存储。
 - OpenAI Chat Completions provider。
 - 最终 assistant content 的 provider streaming。
 - 非 TUI 的 CLI smoke command。
 
-当前分支不实现：
+当前阶段不实现：
 
 - Knowledge、Teaching Brief 或 Observation Log。
 - TUI。

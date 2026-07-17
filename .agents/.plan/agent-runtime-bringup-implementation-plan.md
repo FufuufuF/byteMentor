@@ -20,7 +20,7 @@
 - 架构边界以 `.agents/.design/agent-runtime-bringup-design.md` 为准。
 - 每个提交保持可审阅的小增量。
 - 每个提交必须有对应测试，真实 OpenAI API 调用只做手动 smoke。
-- 不实现 Knowledge、TUI、streaming、Responses API 或多 provider 注册中心。
+- 不实现 Knowledge、TUI、Responses API 或多 provider 注册中心。
 - 除非现有契约无法表达 Chat Completions 必需信息，否则不修改 `packages/core/**`。
 
 ## 3. 提交拆分
