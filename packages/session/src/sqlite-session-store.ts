@@ -49,8 +49,7 @@ export class SqliteSessionStore implements SessionStore {
   async get(id: SessionId): Promise<Session | undefined> {
     this.assertOpen();
     const row = this.db.prepare("SELECT id FROM sessions WHERE id = ?").get(id) as
-      | { id: SessionId }
-      | undefined;
+      { id: SessionId } | undefined;
     return row === undefined ? undefined : { id: row.id };
   }
 
