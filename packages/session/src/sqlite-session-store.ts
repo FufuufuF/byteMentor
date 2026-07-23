@@ -53,9 +53,8 @@ export class SqliteSessionStore implements SessionStore {
 
   async get(id: SessionId): Promise<Session | undefined> {
     this.assertOpen();
-    const row = this.db
-      .prepare("SELECT id, metadata_json FROM sessions WHERE id = ?")
-      .get(id) as { id: SessionId; metadata_json: string } | undefined;
+    const row = this.db.prepare("SELECT id, metadata_json FROM sessions WHERE id = ?").get(id) as
+      { id: SessionId; metadata_json: string } | undefined;
     return row === undefined
       ? undefined
       : { id: row.id, metadata: parseMetadata(row.metadata_json) };
@@ -93,9 +92,8 @@ export class SqliteSessionStore implements SessionStore {
   ): Promise<SessionMetadata> {
     this.assertOpen();
     const update = this.db.transaction(() => {
-      const row = this.db
-        .prepare("SELECT metadata_json FROM sessions WHERE id = ?")
-        .get(id) as { metadata_json: string } | undefined;
+      const row = this.db.prepare("SELECT metadata_json FROM sessions WHERE id = ?").get(id) as
+        { metadata_json: string } | undefined;
       if (row === undefined) {
         throw new Error(`session not found: ${id}`);
       }

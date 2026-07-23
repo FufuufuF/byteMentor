@@ -1,14 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-type TurnState =
-  | "RESTORE"
-  | "COMPACT"
-  | "COMMAND"
-  | "BUILD"
-  | "RUN"
-  | "SAVE"
-  | "RESPOND"
-  | "DONE";
+type TurnState = "RESTORE" | "COMPACT" | "COMMAND" | "BUILD" | "RUN" | "SAVE" | "RESPOND" | "DONE";
 type TurnStateEvent = "ok" | "dispatch" | "shortcut";
 type NextTurnState = (state: TurnState, event: TurnStateEvent) => TurnState;
 

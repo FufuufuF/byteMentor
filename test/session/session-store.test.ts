@@ -92,9 +92,7 @@ describe("InMemorySessionStore metadata", () => {
     const store = new InMemorySessionStore();
     const session = await store.create();
 
-    await expect(
-      store.updateMetadata(session.id, () => ({ a: 1 })),
-    ).resolves.toEqual({ a: 1 });
+    await expect(store.updateMetadata(session.id, () => ({ a: 1 }))).resolves.toEqual({ a: 1 });
 
     await expect(store.get(session.id)).resolves.toEqual({
       id: session.id,
