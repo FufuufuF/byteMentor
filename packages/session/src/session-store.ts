@@ -1,7 +1,10 @@
 import type { Message, SessionId } from "@byte-mentor/core";
 
+export type SessionMetadata = Record<string, unknown>;
+
 export interface Session {
   id: SessionId;
+  metadata: SessionMetadata;
 }
 
 export interface SessionStore {
@@ -9,6 +12,10 @@ export interface SessionStore {
   get(id: SessionId): Promise<Session | undefined>;
   appendMessages(id: SessionId, messages: Message[]): Promise<void>;
   getHistory(id: SessionId): Promise<Message[]>;
+  updateMetadata(
+    id: SessionId,
+    updater: (metadata: SessionMetadata) => SessionMetadata,
+  ): Promise<SessionMetadata>;
   close(): Promise<void>;
 }
 
