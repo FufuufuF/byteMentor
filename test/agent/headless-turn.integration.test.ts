@@ -1,13 +1,18 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createToolCallId } from "@byte-mentor/core";
+import { createMessageId, createToolCallId } from "@byte-mentor/core";
+import type { Message, StopReason } from "@byte-mentor/core";
 import { AgentLoop, AgentRunner, ContextBuilder } from "@byte-mentor/agent";
 import type {
   AgentTool,
   ModelProvider,
   ProviderRequest,
   ProviderResponse,
+  RuntimeCheckpoint,
 } from "@byte-mentor/agent";
-import { InMemorySessionStore } from "@byte-mentor/session";
+import { InMemorySessionStore, SqliteSessionStore } from "@byte-mentor/session";
 
 function invokeProvider(
   invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
@@ -124,5 +129,81 @@ describe("headless turn public API integration", () => {
       "turn.completed",
     ]);
     expect(providerRequests).toHaveLength(2);
+  });
+
+  it("restores a runtime checkpoint after reopening a SQLite session store", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "byte-mentor-checkpoint-integration-"));
+    const dbPath = join(dir, "session.sqlite");
+    const firstStore = new SqliteSessionStore({ dbPath });
+    let secondStore: SqliteSessionStore | undefined;
+    try {
+      const session = await firstStore.create();
+      const previousUserMessage: Message = {
+        id: createMessageId(),
+        role: "user",
+        content: "previous question",
+      };
+      const restoredAssistant = {
+        id: createMessageId(),
+        role: "assistant" as const,
+        content: "recovered answer",
+      };
+      await firstStore.appendMessages(session.id, [previousUserMessage]);
+      await firstStore.updateMetadata(session.id, () => ({
+        project: "byte-mentor",
+        pending_user_turn: true,
+        runtime_checkpoint: {
+          phase: "final_response",
+          iteration: 0,
+          newMessages: [restoredAssistant],
+          pendingToolCalls: [],
+        } satisfies RuntimeCheckpoint,
+      }));
+      await firstStore.close();
+
+      secondStore = new SqliteSessionStore({ dbPath });
+      const runnerMessages: Message[][] = [];
+      const loop = new AgentLoop({
+        sessionStore: secondStore,
+        contextBuilder: new ContextBuilder(),
+        runner: {
+          async run(input: { messages: Message[] }) {
+            runnerMessages.push(input.messages);
+            return {
+              newMessages: [
+                {
+                  id: createMessageId(),
+                  role: "assistant" as const,
+                  content: "current answer",
+                },
+              ],
+              stopReason: "completed" as StopReason,
+              events: [],
+            };
+          },
+        },
+      });
+
+      await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+      expect(runnerMessages).toEqual([
+        [
+          previousUserMessage,
+          restoredAssistant,
+          {
+            id: expect.any(String),
+            role: "user",
+            content: "current question",
+          },
+        ],
+      ]);
+      expect((await secondStore.get(session.id))?.metadata).toEqual({
+        project: "byte-mentor",
+      });
+    } finally {
+      await firstStore.close();
+      await secondStore?.close();
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
