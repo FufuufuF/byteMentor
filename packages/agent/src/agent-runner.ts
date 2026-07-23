@@ -10,9 +10,12 @@ import type {
   TurnId,
 } from "@byte-mentor/core";
 import type { ModelProvider, ProviderResponse, ProviderStreamEvent } from "./provider.js";
+import type { RuntimeCheckpoint } from "./runtime-checkpoint.js";
 import type { ToolRegistry } from "./tool-registry.js";
 
 const DEFAULT_MAX_ITERATIONS = 10;
+const CHECKPOINT_PERSISTENCE_FAILURE_TOOL_ERROR =
+  "Error: Tool execution skipped because checkpoint persistence failed.";
 
 export interface AgentRunnerInput {
   turnId: TurnId;
@@ -20,6 +23,7 @@ export interface AgentRunnerInput {
   tools: ToolRegistry;
   maxIterations?: number;
   onStreamEvent?: (event: ProviderStreamEvent) => void;
+  checkpoint?: (payload: RuntimeCheckpoint) => Promise<void>;
 }
 
 export interface AgentRunnerResult {
@@ -76,6 +80,17 @@ export class AgentRunner {
           }
         }
         newMessages.push(assistantMessage);
+        if (response.stopReason === "completed") {
+          const checkpointError = await emitCheckpoint(input.checkpoint, {
+            phase: "final_response",
+            iteration,
+            newMessages: [...newMessages],
+            pendingToolCalls: [],
+          });
+          if (checkpointError !== undefined) {
+            return checkpointFailed(newMessages, events, checkpointError);
+          }
+        }
         return {
           newMessages,
           stopReason: response.stopReason,
@@ -83,8 +98,26 @@ export class AgentRunner {
         };
       }
 
+      // 处理工具调用
       workingMessages.push(assistantMessage);
       newMessages.push(assistantMessage);
+      const awaitingToolsError = await emitCheckpoint(input.checkpoint, {
+        phase: "awaiting_tools",
+        iteration,
+        newMessages: [...newMessages],
+        pendingToolCalls: assistantMessage.toolCalls,
+      });
+      if (awaitingToolsError !== undefined) {
+        newMessages.push(
+          ...assistantMessage.toolCalls.map<ToolMessage>((toolCall) => ({
+            id: createMessageId(),
+            role: "tool",
+            toolCallId: toolCall.id,
+            content: CHECKPOINT_PERSISTENCE_FAILURE_TOOL_ERROR,
+          })),
+        );
+        return checkpointFailed(newMessages, events, awaitingToolsError);
+      }
 
       for (const toolCall of assistantMessage.toolCalls) {
         if (toolCall.argsParseError !== undefined) {
@@ -132,6 +165,15 @@ export class AgentRunner {
         workingMessages.push(toolMessage);
         newMessages.push(toolMessage);
       }
+      const toolsCompletedError = await emitCheckpoint(input.checkpoint, {
+        phase: "tools_completed",
+        iteration,
+        newMessages: [...newMessages],
+        pendingToolCalls: [],
+      });
+      if (toolsCompletedError !== undefined) {
+        return checkpointFailed(newMessages, events, toolsCompletedError);
+      }
     }
 
     return {
@@ -177,6 +219,34 @@ export class AgentRunner {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
   }
+}
+
+async function emitCheckpoint(
+  checkpoint: AgentRunnerInput["checkpoint"],
+  payload: RuntimeCheckpoint,
+): Promise<string | undefined> {
+  if (checkpoint === undefined) {
+    return undefined;
+  }
+  try {
+    await checkpoint(payload);
+    return undefined;
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
+function checkpointFailed(
+  newMessages: Message[],
+  events: RuntimeEvent[],
+  message: string,
+): AgentRunnerResult {
+  return {
+    newMessages,
+    stopReason: "failed",
+    events,
+    error: { message },
+  };
 }
 
 function withMessageId(message: AssistantMessage): AssistantMessage & { id: MessageId } {

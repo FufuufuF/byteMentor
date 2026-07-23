@@ -112,6 +112,7 @@ function completedTurn(content: string): HeadlessTurnResult {
     newMessages: [finalMessage],
     stopReason: "completed",
     events: [],
+    trace: [],
   };
 }
 
@@ -123,5 +124,6 @@ function failedTurn(message: string): HeadlessTurnResult {
     newMessages: [],
     stopReason: "failed",
     events: [],
+    trace: [],
   };
 }

@@ -3,7 +3,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteSessionStore } from "@byte-mentor/session";
+import { SqliteSessionStore, type SessionStore } from "@byte-mentor/session";
 
 interface RawStatement {
   get(...args: unknown[]): unknown;
@@ -48,11 +48,68 @@ describe("SqliteSessionStore create", () => {
     await expect(store.get(session.id)).resolves.toEqual(session);
   });
 
+  it("returns empty metadata", async () => {
+    const store = await createStore();
+
+    const session = await store.create();
+
+    expect(session.metadata).toEqual({});
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: {},
+    });
+  });
+
   it("returns undefined for an unknown sessionId", async () => {
     const store = await createStore();
     const unknownId = "00000000-0000-4000-8000-000000000000" as never;
 
     await expect(store.get(unknownId)).resolves.toBeUndefined();
+  });
+});
+
+describe("SqliteSessionStore metadata", () => {
+  it("updateMetadata persists metadata and get reads it back", async () => {
+    const store = await createStore();
+    const session = await store.create();
+
+    await expect(
+      store.updateMetadata(session.id, () => ({ a: 1 })),
+    ).resolves.toEqual({ a: 1 });
+
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1 },
+    });
+  });
+
+  it("updateMetadata updater receives previous metadata", async () => {
+    const store = await createStore();
+    const session = await store.create();
+
+    await store.updateMetadata(session.id, () => ({ a: 1 }));
+    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, b: 2 }));
+
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1, b: 2 },
+    });
+  });
+
+  it("restores metadata after reopening the same database file", async () => {
+    const dbPath = await createDbPath();
+    const firstStore = new SqliteSessionStore({ dbPath });
+    const session = await firstStore.create();
+    await firstStore.updateMetadata(session.id, () => ({ a: 1 }));
+    await firstStore.close();
+
+    const secondStore = new SqliteSessionStore({ dbPath });
+
+    await expect(secondStore.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1 },
+    });
+    await secondStore.close();
   });
 });
 
@@ -141,6 +198,17 @@ describe("SqliteSessionStore history", () => {
     await store.close();
 
     await expect(store.getHistory(session.id)).rejects.toMatchObject({
+      name: "SessionStoreClosedError",
+    });
+  });
+
+  it("rejects updateMetadata after close with SessionStoreClosedError", async () => {
+    const store: SessionStore = await createStore();
+    const session = await store.create();
+
+    await store.close();
+
+    await expect(store.updateMetadata(session.id, () => ({ a: 1 }))).rejects.toMatchObject({
       name: "SessionStoreClosedError",
     });
   });

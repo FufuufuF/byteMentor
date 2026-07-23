@@ -24,6 +24,14 @@ describe("InMemorySessionStore create", () => {
     const b = await store.create();
     expect(a.id).not.toBe(b.id);
   });
+
+  it("create returns empty metadata", async () => {
+    const store = new InMemorySessionStore();
+
+    const session = await store.create();
+
+    expect(session.metadata).toEqual({});
+  });
 });
 
 describe("InMemorySessionStore get", () => {
@@ -62,5 +70,48 @@ describe("SessionStore contract", () => {
       { role: "user", content: "before close" },
       { role: "assistant", content: "after close" },
     ]);
+  });
+
+  it("close leaves in-memory metadata methods usable", async () => {
+    const store: SessionStore = new InMemorySessionStore();
+    const session = await store.create();
+    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, a: 1 }));
+
+    await store.close();
+    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, b: 2 }));
+
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1, b: 2 },
+    });
+  });
+});
+
+describe("InMemorySessionStore metadata", () => {
+  it("updateMetadata persists metadata and get reads it back", async () => {
+    const store = new InMemorySessionStore();
+    const session = await store.create();
+
+    await expect(
+      store.updateMetadata(session.id, () => ({ a: 1 })),
+    ).resolves.toEqual({ a: 1 });
+
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1 },
+    });
+  });
+
+  it("updateMetadata updater receives previous metadata", async () => {
+    const store = new InMemorySessionStore();
+    const session = await store.create();
+
+    await store.updateMetadata(session.id, () => ({ a: 1 }));
+    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, b: 2 }));
+
+    await expect(store.get(session.id)).resolves.toEqual({
+      id: session.id,
+      metadata: { a: 1, b: 2 },
+    });
   });
 });

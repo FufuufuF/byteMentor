@@ -7,8 +7,16 @@ import type {
   ProviderRequest,
   ProviderResponse,
   ProviderStreamEvent,
+  RuntimeCheckpoint,
 } from "@byte-mentor/agent";
 import { InMemorySessionStore } from "@byte-mentor/session";
+
+interface ExpectedStateTraceEntry {
+  state: string;
+  startedAt: number;
+  durationMs: number;
+  event: string;
+}
 
 function invokeProvider(
   invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
@@ -56,6 +64,7 @@ describe("AgentLoop.runTurn", () => {
         newMessages: Message[];
         stopReason: StopReason;
         events: RuntimeEvent[];
+        trace: ExpectedStateTraceEntry[];
       }>;
     };
     const sessionStore = new InMemorySessionStore();
@@ -89,6 +98,24 @@ describe("AgentLoop.runTurn", () => {
     expect(result.stopReason).toBe("completed");
     expect(result.finalMessage).toBe(assistantMessage);
     expect(result.newMessages).toEqual([history[0], assistantMessage]);
+    expect(result.trace).toHaveLength(7);
+    expect(result.trace.map((entry) => entry.state)).toEqual([
+      "RESTORE",
+      "COMPACT",
+      "COMMAND",
+      "BUILD",
+      "RUN",
+      "SAVE",
+      "RESPOND",
+    ]);
+    expect(result.trace.find((entry) => entry.state === "COMMAND")?.event).toBe("dispatch");
+    for (const entry of result.trace) {
+      expect(entry.state).not.toBe("");
+      expect(entry.event).not.toBe("");
+      expect(entry.startedAt).toEqual(expect.any(Number));
+      expect(entry.durationMs).toEqual(expect.any(Number));
+      expect(entry.durationMs).toBeGreaterThanOrEqual(0);
+    }
     expect(runnerInputs).toEqual([
       {
         messages: [history[0]],
@@ -173,6 +200,502 @@ describe("AgentLoop.runTurn", () => {
       ],
     ]);
     expect(history).toEqual([...previousMessages, runnerMessages[0]?.at(-1), assistantMessage]);
+  });
+
+  it("establishes a pending user turn boundary before RUN", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    await sessionStore.updateMetadata(session.id, () => ({ project: "byte-mentor" }));
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run() {
+          throw new Error("stop at RUN boundary");
+        },
+      },
+    });
+
+    await expect(
+      loop.runTurn({ sessionId: session.id, userMessage: "current question" }),
+    ).rejects.toMatchObject({ state: "RUN" });
+
+    expect(await sessionStore.getHistory(session.id)).toEqual([
+      {
+        id: expect.any(String),
+        role: "user",
+        content: "current question",
+      },
+    ]);
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+      pending_user_turn: true,
+    });
+  });
+
+  it("clears pending user turn metadata after completed SAVE", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    await sessionStore.updateMetadata(session.id, () => ({
+      project: "byte-mentor",
+      pending_user_turn: false,
+    }));
+    const assistantMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "current answer",
+    };
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run() {
+          return {
+            newMessages: [assistantMessage],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
+  });
+
+  it("repairs a pending user turn before building the current turn", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    const interruptedUserMessage: Message = {
+      id: createMessageId(),
+      role: "user",
+      content: "interrupted question",
+    };
+    await sessionStore.appendMessages(session.id, [interruptedUserMessage]);
+    await sessionStore.updateMetadata(session.id, () => ({ pending_user_turn: true }));
+    const runnerMessages: Message[][] = [];
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { messages: Message[] }) {
+          runnerMessages.push(input.messages);
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(runnerMessages).toEqual([
+      [
+        interruptedUserMessage,
+        {
+          id: expect.any(String),
+          role: "assistant",
+          content: "Error: Task interrupted before a response was generated.",
+        },
+        {
+          id: expect.any(String),
+          role: "user",
+          content: "current question",
+        },
+      ],
+    ]);
+    expect(await sessionStore.getHistory(session.id)).toEqual([
+      interruptedUserMessage,
+      {
+        id: expect.any(String),
+        role: "assistant",
+        content: "Error: Task interrupted before a response was generated.",
+      },
+      runnerMessages[0]?.at(-1),
+      {
+        id: expect.any(String),
+        role: "assistant",
+        content: "current answer",
+      },
+    ]);
+  });
+
+  it("clears a stale pending flag without adding an interrupted placeholder", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    const previousMessages: Message[] = [
+      { id: createMessageId(), role: "user", content: "previous question" },
+      { id: createMessageId(), role: "assistant", content: "previous answer" },
+    ];
+    await sessionStore.appendMessages(session.id, previousMessages);
+    await sessionStore.updateMetadata(session.id, () => ({
+      project: "byte-mentor",
+      pending_user_turn: true,
+    }));
+    const runnerMessages: Message[][] = [];
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { messages: Message[] }) {
+          runnerMessages.push(input.messages);
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(runnerMessages).toEqual([
+      [
+        ...previousMessages,
+        {
+          id: expect.any(String),
+          role: "user",
+          content: "current question",
+        },
+      ],
+    ]);
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
+  });
+
+  it("persists runner checkpoints until SAVE completes", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    await sessionStore.updateMetadata(session.id, () => ({ project: "byte-mentor" }));
+    const assistantMessage = {
+      id: createMessageId(),
+      role: "assistant" as const,
+      content: "current answer",
+    };
+    const checkpoint: RuntimeCheckpoint = {
+      phase: "final_response",
+      iteration: 0,
+      newMessages: [assistantMessage],
+      pendingToolCalls: [],
+    };
+    let metadataDuringRun: Record<string, unknown> | undefined;
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { checkpoint?: (payload: RuntimeCheckpoint) => Promise<void> }) {
+          await input.checkpoint?.(checkpoint);
+          metadataDuringRun = (await sessionStore.get(session.id))?.metadata;
+          return {
+            newMessages: [assistantMessage],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(metadataDuringRun).toEqual({
+      project: "byte-mentor",
+      pending_user_turn: true,
+      runtime_checkpoint: checkpoint,
+    });
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
+  });
+
+  it("restores cumulative tool iterations before the current turn", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    const previousUserMessage: Message = {
+      id: createMessageId(),
+      role: "user",
+      content: "previous question",
+    };
+    const firstToolCallId = createToolCallId();
+    const secondToolCallId = createToolCallId();
+    const firstCheckpointAssistant = {
+      id: createMessageId(),
+      role: "assistant" as const,
+      content: "",
+      toolCalls: [{ id: firstToolCallId, name: "lookup", args: { query: "first" } }],
+    };
+    const firstCompletedToolResult = {
+      id: createMessageId(),
+      role: "tool" as const,
+      toolCallId: firstToolCallId,
+      content: "result:first",
+    };
+    const secondCheckpointAssistant = {
+      id: createMessageId(),
+      role: "assistant" as const,
+      content: "",
+      toolCalls: [{ id: secondToolCallId, name: "lookup", args: { query: "second" } }],
+    };
+    const secondCompletedToolResult = {
+      id: createMessageId(),
+      role: "tool" as const,
+      toolCallId: secondToolCallId,
+      content: "result:second",
+    };
+    await sessionStore.appendMessages(session.id, [previousUserMessage]);
+    await sessionStore.updateMetadata(session.id, () => ({
+      project: "byte-mentor",
+      pending_user_turn: true,
+      runtime_checkpoint: {
+        phase: "tools_completed",
+        iteration: 1,
+        newMessages: [
+          firstCheckpointAssistant,
+          firstCompletedToolResult,
+          secondCheckpointAssistant,
+          secondCompletedToolResult,
+        ],
+        pendingToolCalls: [],
+      } satisfies RuntimeCheckpoint,
+    }));
+    const runnerMessages: Message[][] = [];
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { messages: Message[] }) {
+          runnerMessages.push(input.messages);
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(runnerMessages).toEqual([
+      [
+        previousUserMessage,
+        firstCheckpointAssistant,
+        firstCompletedToolResult,
+        secondCheckpointAssistant,
+        secondCompletedToolResult,
+        {
+          id: expect.any(String),
+          role: "user",
+          content: "current question",
+        },
+      ],
+    ]);
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
+  });
+
+  it("synthesizes interrupted results for pending checkpoint tool calls", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    const previousUserMessage: Message = {
+      id: createMessageId(),
+      role: "user",
+      content: "previous question",
+    };
+    const toolCallId = createToolCallId();
+    const checkpointAssistant = {
+      id: createMessageId(),
+      role: "assistant" as const,
+      content: "",
+      toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    };
+    await sessionStore.appendMessages(session.id, [previousUserMessage]);
+    await sessionStore.updateMetadata(session.id, () => ({
+      runtime_checkpoint: {
+        phase: "awaiting_tools",
+        iteration: 0,
+        newMessages: [checkpointAssistant],
+        pendingToolCalls: checkpointAssistant.toolCalls,
+      } satisfies RuntimeCheckpoint,
+    }));
+    const runnerMessages: Message[][] = [];
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { messages: Message[] }) {
+          runnerMessages.push(input.messages);
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(runnerMessages).toEqual([
+      [
+        previousUserMessage,
+        checkpointAssistant,
+        {
+          id: expect.any(String),
+          role: "tool",
+          toolCallId,
+          content: "Error: Task interrupted before this tool finished.",
+        },
+        {
+          id: expect.any(String),
+          role: "user",
+          content: "current question",
+        },
+      ],
+    ]);
+  });
+
+  it("deduplicates checkpoint messages already present at the session tail", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    const toolCallId = createToolCallId();
+    const previousUserMessage: Message = {
+      id: createMessageId(),
+      role: "user",
+      content: "previous question",
+    };
+    const storedAssistant: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "",
+      toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    };
+    const checkpointAssistant = {
+      id: createMessageId(),
+      role: "assistant" as const,
+      content: "",
+      toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    };
+    const completedToolResult = {
+      id: createMessageId(),
+      role: "tool" as const,
+      toolCallId,
+      content: "result:docs",
+    };
+    await sessionStore.appendMessages(session.id, [previousUserMessage, storedAssistant]);
+    await sessionStore.updateMetadata(session.id, () => ({
+      runtime_checkpoint: {
+        phase: "tools_completed",
+        iteration: 0,
+        newMessages: [checkpointAssistant, completedToolResult],
+        pendingToolCalls: [],
+      } satisfies RuntimeCheckpoint,
+    }));
+    const runnerMessages: Message[][] = [];
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run(input: { messages: Message[] }) {
+          runnerMessages.push(input.messages);
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ sessionId: session.id, userMessage: "current question" });
+
+    expect(runnerMessages).toEqual([
+      [
+        previousUserMessage,
+        storedAssistant,
+        completedToolResult,
+        {
+          id: expect.any(String),
+          role: "user",
+          content: "current question",
+        },
+      ],
+    ]);
+  });
+
+  it("clears invalid runtime checkpoint metadata without blocking the turn", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    await sessionStore.updateMetadata(session.id, () => ({
+      project: "byte-mentor",
+      runtime_checkpoint: "invalid checkpoint",
+    }));
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run() {
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "current answer",
+              },
+            ],
+            stopReason: "completed" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    const result = await loop.runTurn({
+      sessionId: session.id,
+      userMessage: "current question",
+    });
+
+    expect(result.status).toBe("completed");
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
   });
 
   it("persists tool-call trace from runner", async () => {
@@ -317,6 +840,11 @@ describe("AgentLoop.runTurn", () => {
 
   it("returns structured failed result when provider throws", async () => {
     const sessionStore = new InMemorySessionStore();
+    const session = await sessionStore.create();
+    await sessionStore.updateMetadata(session.id, () => ({
+      project: "byte-mentor",
+      pending_user_turn: false,
+    }));
     const loop = new AgentLoop({
       sessionStore,
       contextBuilder: new ContextBuilder(),
@@ -327,7 +855,7 @@ describe("AgentLoop.runTurn", () => {
       ),
     });
 
-    const result = await loop.runTurn({ userMessage: "hello" });
+    const result = await loop.runTurn({ sessionId: session.id, userMessage: "hello" });
 
     const history = await sessionStore.getHistory(result.sessionId);
     expect(result.status).toBe("failed");
@@ -337,6 +865,17 @@ describe("AgentLoop.runTurn", () => {
     expect(result.stopReason).toBe("failed");
     expect("finalMessage" in result).toBe(false);
     expect(result.error.message).toContain("provider unavailable");
+    const trace = (result as typeof result & { trace: ExpectedStateTraceEntry[] }).trace;
+    expect(trace).toBeDefined();
+    expect(trace.map((entry) => entry.state)).toEqual([
+      "RESTORE",
+      "COMPACT",
+      "COMMAND",
+      "BUILD",
+      "RUN",
+      "SAVE",
+      "RESPOND",
+    ]);
     expect(result.newMessages).toEqual(history);
     expect(history).toEqual([
       {
@@ -344,7 +883,15 @@ describe("AgentLoop.runTurn", () => {
         role: "user",
         content: "hello",
       },
+      {
+        id: expect.any(String),
+        role: "assistant",
+        content: "[Assistant reply unavailable due to model error.]",
+      },
     ]);
+    expect((await sessionStore.get(session.id))?.metadata).toEqual({
+      project: "byte-mentor",
+    });
     expect(result.events.map((event) => event.type)).toEqual([
       "turn.started",
       "context.built",
@@ -356,6 +903,45 @@ describe("AgentLoop.runTurn", () => {
       sessionId: result.sessionId,
       message: expect.stringContaining("provider unavailable"),
     });
+  });
+
+  it("exports AgentLoopStateError for callers that inspect state failures", async () => {
+    const agent = await import("@byte-mentor/agent");
+
+    expect(agent).toHaveProperty("AgentLoopStateError");
+    expect(Reflect.get(agent, "AgentLoopStateError")).toBeTypeOf("function");
+  });
+
+  it("wraps handler errors with the failed state, cause, and partial trace", async () => {
+    const cause = new Error("context build failed");
+    const sessionStore = new InMemorySessionStore();
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: {
+        async build() {
+          throw cause;
+        },
+      },
+      runner: {
+        async run() {
+          throw new Error("runner should not be called");
+        },
+      },
+    });
+
+    const thrown = await loop.runTurn({ userMessage: "hello" }).catch((error: unknown) => error);
+
+    expect(thrown).toMatchObject({
+      name: "AgentLoopStateError",
+      state: "BUILD",
+      turnId: expect.any(String),
+      sessionId: expect.any(String),
+      trace: expect.any(Array),
+    });
+    expect(Reflect.get(thrown as object, "cause")).toBe(cause);
+    const trace = Reflect.get(thrown as object, "trace") as ExpectedStateTraceEntry[];
+    expect(trace.map((entry) => entry.state)).toEqual(["RESTORE", "COMPACT", "COMMAND"]);
+    expect(trace.some((entry) => entry.state === "BUILD")).toBe(false);
   });
 
   it("returns structured max_iterations result without treating a tool message as final", async () => {
