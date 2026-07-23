@@ -1,5 +1,19 @@
 # Agent Loop 状态机与 Checkpoint 实现计划
 
+## 当前实施进度
+
+更新时间：2026-07-23
+
+| Batch | 状态 | 说明 |
+| --- | --- | --- |
+| Batch 1: Session metadata contract | GREEN 已完成 | InMemory / SQLite metadata 实现、测试和 typecheck 已通过 |
+| Batch 2: AgentLoop state machine and TurnContext trace | GREEN 已完成 | 状态机、trace 和结构化错误已实现并通过验证 |
+| Batch 3: Pending user turn and SAVE semantics | GREEN 已完成 | pending user turn、RESTORE 修复和 SAVE 清理已通过验证 |
+| Batch 4: AgentRunner checkpoint and runtime restore | GREEN 已完成 | 累计 checkpoint、runtime restore、tail dedupe 与 SQLite reopen 已实现；全量 149 tests 通过 |
+| Batch 4.5: checkpoint persistence failure closure | GREEN 已完成 | checkpoint 失败闭合、全仓 151 tests、typecheck、lint、build 已通过 |
+
+当前执行点：本计划的实现批次已全部完成。AgentHook 已从本分支移除，后续使用独立 design、plan 和分支推进；当前分支下一步执行最终验收与收尾。
+
 ## 1. 目标
 
 按 `.agents/.design/agent-loop-state-machine-checkpoint-design.md` 实现 `feat/agent-loop-state-machine-checkpoint` 分支。
@@ -13,7 +27,6 @@ AgentLoop 状态机
   -> pending user turn restore
   -> AgentRunner checkpoint
   -> runtime checkpoint restore
-  -> 最小 AgentHook 监控面
 ```
 
 本计划是 review-oriented handoff，不重复设计文档的完整说明。实现时遇到设计未覆盖的架构决策，应先回到 design review，不在代码中临时拍板。
@@ -23,10 +36,10 @@ AgentLoop 状态机
 - 保持 `AgentLoop.runTurn(input, options)` 的 public API 入口不变。
 - `TurnContext` 只能由 `AgentLoop` 内部创建，调用方不传入。
 - `AgentRunner` 不依赖 `SessionStore`、SQLite、CLI、TUI、Knowledge。
-- checkpoint 是恢复机制，hook 是监控机制，两者不要合并。
+- checkpoint 只承担恢复职责；后续独立实现的 hook 只承担监控职责，两者不要合并。
 - `RuntimeEvent` 不新增 state-level 事件，本分支用 `StateTraceEntry` 表达状态机埋点。
 - `COMPACT` 和 `COMMAND` 在本分支保留为 no-op / 最小 handler，只固定扩展点。
-- 不实现 Knowledge、真实 compact、command router、MessageBus、subagent、mid-turn injection。
+- 不实现 Knowledge、真实 compact、command router、MessageBus、subagent、mid-turn injection、AgentHook。
 - 每个批次都要先补测试，再实现。
 - 批次粒度比之前分支适当放宽，但每个批次仍必须能独立 review。
 
@@ -87,8 +100,16 @@ export interface StateTraceEntry {
   state: TurnState;
   startedAt: number;
   durationMs: number;
-  event: TurnStateEvent | "";
-  error?: string;
+  event: TurnStateEvent;
+}
+
+export class AgentLoopStateError extends Error {
+  readonly state: TurnState;
+  readonly event?: TurnStateEvent;
+  readonly turnId: TurnId;
+  readonly sessionId?: SessionId;
+  readonly trace: readonly StateTraceEntry[];
+  readonly cause: unknown;
 }
 ```
 
@@ -97,7 +118,12 @@ export interface StateTraceEntry {
 - `TurnContext` 是 AgentLoop 内部 mutable workspace，不作为外部调用入参。
 - `HeadlessTurnResult` 新增 `trace: StateTraceEntry[]`。
 - completed turn 的 trace 至少覆盖 `RESTORE -> COMPACT -> COMMAND -> BUILD -> RUN -> SAVE -> RESPOND`。
-- handler 抛错时，trace 应记录当前 state、空 event 和 error 字符串，然后继续抛出异常。
+- trace 只记录成功完成的 state 流转和耗时。
+- handler、存储或 transition 异常包装为 `AgentLoopStateError` 后继续向外抛出，由 `runTurn()` 调用方捕获。
+- `AgentLoopStateError.trace` 是成功完成 trace 的快照。handler 失败时不包含当前 state；transition 失败时包含已成功返回 event 的当前 state。
+- `AgentLoopStateError.cause` 保留原始异常；transition 缺失时 `event` 记录 handler 返回的 event。
+- Runner 的 failed / max_iterations 仍通过 `HeadlessTurnResult` 返回，不包装为 `AgentLoopStateError`。
+- `nextTurnState(state, event)` 是 package internal 纯函数，不从 `@byte-mentor/agent` public API 导出。
 
 ### 3.3 RuntimeCheckpoint
 
@@ -108,22 +134,19 @@ export type RuntimeCheckpoint =
   | {
       phase: "awaiting_tools";
       iteration: number;
-      assistantMessage: AssistantMessage & { id: MessageId };
-      completedToolResults: [];
+      newMessages: Message[];
       pendingToolCalls: ToolCall[];
     }
   | {
       phase: "tools_completed";
       iteration: number;
-      assistantMessage: AssistantMessage & { id: MessageId };
-      completedToolResults: ToolMessage[];
+      newMessages: Message[];
       pendingToolCalls: [];
     }
   | {
       phase: "final_response";
       iteration: number;
-      assistantMessage: AssistantMessage & { id: MessageId };
-      completedToolResults: [];
+      newMessages: Message[];
       pendingToolCalls: [];
     };
 ```
@@ -131,25 +154,29 @@ export type RuntimeCheckpoint =
 约束：
 
 - checkpoint payload 必须可 JSON serialize。
+- metadata 只保存一个 latest checkpoint，但 `newMessages` 必须是当前未提交 turn 从第一轮 iteration 开始的累计快照。
+- 每次 callback 获得独立数组快照，后续 runner mutation 不得改变已发出的 payload。
+- `awaiting_tools.newMessages` 包含当前 assistant tool-call message，`pendingToolCalls` 与尚未完成的调用对应。
+- `tools_completed.newMessages` 包含截至当前 iteration 的全部 assistant/tool messages。
+- `final_response.newMessages` 包含此前全部 iteration 消息和最终 assistant message。
 - `final_response` 不允许携带 pending tool calls。
-- `awaiting_tools` 不允许携带 completed tool results。
 - `tools_completed` 不允许携带 pending tool calls。
 - checkpoint key 属于 `@byte-mentor/agent` 内部协议，不放入 `@byte-mentor/core`。
 
-### 3.4 AgentRunner checkpoint / hook
+### 3.4 AgentRunner checkpoint
 
 `AgentRunnerInput` 需要扩展：
 
 ```ts
 checkpoint?: (payload: RuntimeCheckpoint) => Promise<void>;
-hooks?: AgentHook[];
 ```
 
 约束：
 
 - checkpoint callback 失败时，runner 返回 failed result，不继续执行。
-- hook 用于监控，不负责 session 恢复。
-- hook 异常策略按 design 执行：生命周期 hook 默认隔离；`finalizeContent` 不隔离。
+- `awaiting_tools` checkpoint callback 失败时，runner 不执行 pending tools，为每个 pending call 追加对应 tool error，再返回 failed result。
+- checkpoint 失败返回的 `error.message` 保留原始 callback 错误原因。
+- `tools_completed` / `final_response` 失败时没有 pending call，不额外合成 tool error。
 - 现有 `onStreamEvent` 行为保持不变。
 
 ## 4. 批次拆分
@@ -195,6 +222,7 @@ Review 重点：
 - `packages/agent/src/turn-context.ts`（如拆文件）
 - `packages/agent/src/index.ts`
 - `test/agent/agent-loop.test.ts`
+- `test/agent/turn-state.test.ts`
 - `test/agent/headless-turn.integration.test.ts`
 
 目标：
@@ -210,8 +238,8 @@ Review 重点：
 - completed turn 的 `trace.map(t => t.state)` 等于 `RESTORE, COMPACT, COMMAND, BUILD, RUN, SAVE, RESPOND`。
 - 每条 trace 都有非空 `state`、`startedAt`、`durationMs` 和成功 event。
 - `COMMAND` 当前返回 `dispatch`，因此正常进入 BUILD。
-- 人为制造缺失 transition 时，runTurn 抛出包含 state 和 event 的错误。
-- 人为制造某个 state handler 抛错时，trace 中记录对应 state 的 `error`，错误继续向外抛出。
+- `nextTurnState` 对合法 state/event 返回预期 next state；缺失 transition 时抛出包含 state 和 event 的清晰错误。
+- 人为制造 handler 抛错时，runTurn 抛出 `AgentLoopStateError`，包含失败 state、原始 cause 和此前成功完成的 partial trace；trace 不包含失败 state。
 - 原有 tool call integration test 在状态机改造后仍通过。
 
 Review 重点：
@@ -220,6 +248,7 @@ Review 重点：
 - `runTurn()` 是否只负责创建 ctx、驱动状态机、返回 result。
 - 各 state handler 的职责是否清晰，没有把所有逻辑继续堆在 driver 里。
 - `RuntimeEvent` 与 `StateTraceEntry` 是否没有混用。
+- 状态机异常是否保留失败 state、原始 cause 和 immutable partial trace，且没有被错误转换为 RuntimeEvent。
 
 ### Batch 3: Pending user turn and SAVE semantics
 
@@ -269,19 +298,24 @@ Review 重点：
 目标：
 
 - AgentRunner 在 `awaiting_tools`、`tools_completed`、`final_response` 三个阶段产生 checkpoint。
+- 每个 checkpoint 携带当前未提交 turn 的累计 `newMessages`，后续 ReAct iteration 不覆盖早期消息。
 - AgentLoop 将 checkpoint 写入 session metadata。
-- RESTORE 阶段将 metadata 中的 runtime checkpoint materialize 到 session history。
+- RESTORE 阶段将 metadata 中的累计 runtime checkpoint materialize 到 session history，并为仍 pending 的 tool calls 合成 interrupted tool results。
+- RESTORE 终结旧 turn，不重新执行 pending tool，也不续跑旧 ReAct；当前输入基于恢复后的 history 启动新 turn。
 - restore 具备 tail dedupe。
 
 测试：
 
-- 无工具 completed turn 中，runner 调用一次 `final_response` checkpoint；payload 包含 final assistant message，且可 JSON serialize。
-- tool turn 中，runner 先调用 `awaiting_tools` checkpoint；payload 包含 assistant tool-call message 和 pending tool calls。
-- tool 执行完成后，runner 调用 `tools_completed` checkpoint；payload 包含 completed tool messages，pending tool calls 为空。
+- 无工具 completed turn 中，runner 调用一次 `final_response` checkpoint；`newMessages` 包含 final assistant message，且 payload 可 JSON serialize。
+- tool turn 中，runner 先调用 `awaiting_tools` checkpoint；`newMessages` 包含 assistant tool-call message，pending tool calls 与之对应。
+- tool 执行完成后，runner 调用 `tools_completed` checkpoint；`newMessages` 累计包含 assistant tool-call message 和 completed tool messages，pending tool calls 为空。
+- 连续两次 tool iteration 中，第二轮 `awaiting_tools` / `tools_completed` checkpoint 的 `newMessages` 保留第一轮 assistant/tool messages，并按实际执行顺序累计第二轮消息。
+- 每次 checkpoint 的 `newMessages` 是独立数组快照，不会被后续 iteration 的追加反向修改。
 - `ToolCall.argsParseError` 场景中，runner 不执行 tool registry，但仍产生 `awaiting_tools` 和 `tools_completed` checkpoint，后者包含合成 tool message。
 - checkpoint callback 抛错时，runner 返回 failed result，error message 包含 checkpoint 失败原因。
-- 手动写入 `runtime_checkpoint` metadata：RESTORE 会追加 assistant message 和 completed tool messages。
+- 手动写入包含多轮累计 `newMessages` 的 `runtime_checkpoint` metadata：RESTORE 会按顺序追加全部 assistant 和 completed tool messages。
 - 手动写入 `runtime_checkpoint` metadata 且包含 pending tool calls：RESTORE 会为 pending call 合成 interrupted tool message。
+- 同时存在 runtime checkpoint 和 `pending_user_turn` 时，RESTORE 不追加通用 assistant interrupted placeholder。
 - session 尾部已包含 checkpoint 部分消息时，RESTORE 不重复追加重叠消息。
 - RESTORE 成功后清理 `runtime_checkpoint` 和 `pending_user_turn`。
 - 非法 checkpoint metadata 被清理，不阻断当前 turn。
@@ -290,47 +324,46 @@ Review 重点：
 Review 重点：
 
 - `RuntimeCheckpoint` 是否使用 discriminated union，避免非法字段组合。
+- checkpoint 是否是 latest cumulative snapshot，而不是 latest iteration delta。
 - AgentRunner 是否仍然不知道 SessionStore。
 - AgentLoop restore 是否发生在 BUILD 读取 history 之前。
 - restore 的 interrupted tool result 是否保持合法 tool boundary。
+- restore 是否只闭合旧 turn，没有重执行工具或续跑旧 ReAct。
 - checkpoint 写入失败是否不会被静默吞掉。
 
-### Batch 5: AgentHook monitor and final integration
+### Batch 4.5: checkpoint persistence failure closure
 
 范围：
 
-- `packages/agent/src/agent-hook.ts`
 - `packages/agent/src/agent-runner.ts`
-- `packages/agent/src/index.ts`
 - `test/agent/agent-runner.test.ts`
-- `test/agent/tool-contracts.test.ts`
-- `test/agent/headless-turn.integration.test.ts`
-- 受 public type 变化影响的 CLI 测试
 
 目标：
 
-- 引入最小 AgentHook lifecycle。
-- 让 AgentRunner 通过 hook 暴露 iteration、stream、tool execution、after iteration、finalize content 等监控点。
-- 不把 hook 设计成插件系统，不接 TUI，不改变 checkpoint 恢复机制。
-- 完成全量回归和文档校准。
+- 当 `awaiting_tools` checkpoint 持久化失败时，由 AgentRunner 当场闭合 assistant tool-call message。
+- 不执行这一批 pending tools。
+- 为每个 pending tool call 合成内容为 `Error: Tool execution skipped because checkpoint persistence failed.` 的 tool message。
+- 返回 failed runner result，但 `error.message` 保留原始 checkpoint callback 错误；后续由现有 SAVE 路径持久化闭合后的 transcript。
+- 不在 RESTORE 增加扫描孤儿 tool call 的第二套修复逻辑。
 
 测试：
 
-- 无工具 completed turn 中，hook 调用顺序为 beforeIteration -> stream/onStreamEnd（如有 streaming）-> afterIteration。
-- tool turn 中，hook 调用顺序包含 beforeIteration -> beforeExecuteTools -> afterIteration，并且 hook context 能看到 tool calls 和 tool results。
-- 多 hooks 按注册顺序调用。
-- 生命周期 hook 抛错时，不导致 runner 崩溃；错误按设计记录或暴露。
-- `finalizeContent` 能修改 final assistant content；如果 `finalizeContent` 抛错，runner 按设计失败或抛出，不能静默吞掉。
-- 现有 `onStreamEvent` 仍只接收最终完成轮次的 content delta。
-- CLI `run-chat` 测试无需理解 hook，仍通过。
-- 完整 fake provider + fake tool + SQLite session 集成测试通过。
+- `awaiting_tools` checkpoint callback 抛错后，`newMessages` 包含 assistant tool-call message 和每个 pending call 对应的 tool error message。
+- checkpoint 写入失败后，tool registry 中对应工具没有被执行。
+- runner 返回 `stopReason: "failed"`，且 `error.message` 包含原始 checkpoint 失败原因。
 
 Review 重点：
 
-- hook 是否只是 runner 监控面，没有承担 checkpoint 持久化职责。
-- hook context 是否没有泄露 SessionStore / CLI / TUI 概念。
-- runner 主循环是否仍然可读，没有为了 hook 过度抽象。
-- 本分支是否没有引入 Knowledge/TUI/MessageBus 等非目标能力。
+- tool error 是否与 assistant message 中的每个 pending tool call 一一回链。
+- checkpoint 失败后是否在任何工具执行前终止。
+- failed result 是否同时保留可持久化的闭合 transcript 和原始错误原因。
+- 是否没有修改 RESTORE，也没有扩大到同批多 tool call 的部分完成 checkpoint。
+
+已知限制：同一 assistant 发出多个 tool call 时，当前仍只在整批执行前后写 checkpoint，不保存同批中部分工具已完成的中间状态。该问题留待后续 Tool 体系完善时处理。
+
+### 后续独立工作：AgentHook
+
+AgentHook 不属于本实现计划。后续需要重新确认 lifecycle、streaming、异常隔离、`finalizeContent` 和 UI 监控边界，并使用独立 design、plan 和分支按 TDD 推进。
 
 ## 5. 最终验收
 
@@ -351,16 +384,17 @@ pnpm build
 - `SessionStore` metadata 在 in-memory 和 SQLite 中行为一致。
 - interrupted pending user turn 能在下一次 RESTORE 中被修复。
 - AgentRunner 三个 checkpoint phase 都有测试覆盖。
+- `awaiting_tools` checkpoint 写入失败时，工具不执行，孤儿 assistant tool calls 被对应 tool error 闭合，且 failed result 保留原始失败原因。
+- 连续多轮 ReAct iteration 的 checkpoint 累计消息不会被后续 iteration 覆盖。
 - runtime checkpoint 能跨 SQLite store instance 恢复。
 - restore 具备 tail dedupe。
-- AgentHook 能观察 runner 生命周期，且不与 checkpoint 职责混淆。
 - 原有 headless turn、tool call、streaming、CLI smoke 行为保持兼容。
 
 ## 6. Review 前检查清单
 
 - 本计划是否与 design 文档一致。
-- 是否需要把 design 文档中的 `RuntimeCheckpoint` 从普通 interface 同步改为 discriminated union。
+- design 与 plan 中的 `RuntimeCheckpoint` 是否都使用累计 `newMessages` 的 discriminated union。
 - 是否接受 `HeadlessTurnResult.trace` 作为 public API。
 - 是否接受 failed turn 写 assistant placeholder 以保持 session turn boundary。
 - 是否接受 checkpoint callback 失败直接使 runner failed。
-- 是否接受本分支实现最小 hook，而不是把 hook 推迟到后续分支。
+- AgentHook 是否已完整移出本分支目标、接口、批次和验收范围。
