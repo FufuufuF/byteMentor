@@ -7,6 +7,7 @@ import type {
   ProviderRequest,
   ProviderResponse,
   ProviderStreamEvent,
+  RuntimeCheckpoint,
 } from "@byte-mentor/agent";
 
 function streamProvider(
@@ -48,6 +49,51 @@ function invokeProvider(
   });
 }
 
+async function runAwaitingToolsCheckpointFailure() {
+  const firstToolCallId = createToolCallId();
+  const secondToolCallId = createToolCallId();
+  const provider = invokeProvider(async () => ({
+    message: {
+      role: "assistant",
+      content: "",
+      toolCalls: [
+        { id: firstToolCallId, name: "lookup", args: { query: "docs" } },
+        { id: secondToolCallId, name: "summarize", args: { source: "docs" } },
+      ],
+    },
+    stopReason: "tool_calls",
+  }));
+  const toolExecutions: string[] = [];
+  const tools = new ToolRegistry();
+  tools.register({
+    name: "lookup",
+    description: "lookup docs",
+    async execute() {
+      toolExecutions.push("lookup");
+      return { ok: true, result: "lookup result" };
+    },
+  });
+  tools.register({
+    name: "summarize",
+    description: "summarize docs",
+    async execute() {
+      toolExecutions.push("summarize");
+      return { ok: true, result: "summary" };
+    },
+  });
+
+  const result = await new AgentRunner(provider).run({
+    turnId: createTurnId(),
+    messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+    tools,
+    async checkpoint() {
+      throw new Error("checkpoint storage unavailable");
+    },
+  });
+
+  return { firstToolCallId, secondToolCallId, result, toolExecutions };
+}
+
 describe("AgentRunner.run", () => {
   it("returns final assistant message when provider completes", async () => {
     const inputMessages: Message[] = [{ id: createMessageId(), role: "user", content: "hello" }];
@@ -77,6 +123,41 @@ describe("AgentRunner.run", () => {
     expect(Array.isArray(result.events)).toBe(true);
   });
 
+  it("checkpoints a final assistant response", async () => {
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const provider = invokeProvider(async () => ({
+      message: { role: "assistant", content: "done" },
+      stopReason: "completed",
+    }));
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    expect(result.stopReason).toBe("completed");
+    expect(checkpoints).toEqual([
+      {
+        phase: "final_response",
+        iteration: 0,
+        newMessages: [
+          {
+            id: expect.any(String),
+            role: "assistant",
+            content: "done",
+          },
+        ],
+        pendingToolCalls: [],
+      },
+    ]);
+    const serialized = JSON.stringify(checkpoints[0]);
+    expect(JSON.parse(serialized)).toEqual(checkpoints[0]);
+  });
+
   it("returns failed result when provider throws", async () => {
     const turnId = createTurnId();
     const provider = invokeProvider(async () => {
@@ -92,6 +173,41 @@ describe("AgentRunner.run", () => {
     expect(result.stopReason).toBe("failed");
     expect(result.newMessages).toEqual([]);
     expect(result.events.map((event) => event.type)).toEqual(["model.requested"]);
+  });
+
+  it("closes every pending tool call when awaiting-tools checkpoint persistence fails", async () => {
+    const { firstToolCallId, secondToolCallId, result } = await runAwaitingToolsCheckpointFailure();
+
+    expect(result.newMessages).toHaveLength(3);
+    expect(result.newMessages).toMatchObject([
+      {
+        role: "assistant",
+        toolCalls: [{ id: firstToolCallId }, { id: secondToolCallId }],
+      },
+      {
+        role: "tool",
+        toolCallId: firstToolCallId,
+        content: "Error: Tool execution skipped because checkpoint persistence failed.",
+      },
+      {
+        role: "tool",
+        toolCallId: secondToolCallId,
+        content: "Error: Tool execution skipped because checkpoint persistence failed.",
+      },
+    ]);
+  });
+
+  it("skips pending tools when awaiting-tools checkpoint persistence fails", async () => {
+    const { toolExecutions } = await runAwaitingToolsCheckpointFailure();
+
+    expect(toolExecutions).toEqual([]);
+  });
+
+  it("returns the original awaiting-tools checkpoint failure", async () => {
+    const { result } = await runAwaitingToolsCheckpointFailure();
+
+    expect(result.stopReason).toBe("failed");
+    expect(result.error?.message).toContain("checkpoint storage unavailable");
   });
 
   it("executes one tool call before final provider response", async () => {
@@ -165,6 +281,169 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  it("checkpoints tool calls before and after execution", async () => {
+    const toolCallId = createToolCallId();
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const provider = invokeProvider(async (req) =>
+      req.messages.length === 1
+        ? {
+            message: {
+              role: "assistant",
+              content: "",
+              toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+            },
+            stopReason: "tool_calls",
+          }
+        : {
+            message: { role: "assistant", content: "found docs" },
+            stopReason: "completed",
+          },
+    );
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        return { ok: true, result: "result:docs" };
+      },
+    });
+
+    await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
+      tools,
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    expect(checkpoints.map((checkpoint) => checkpoint.phase)).toEqual([
+      "awaiting_tools",
+      "tools_completed",
+      "final_response",
+    ]);
+    expect(checkpoints[0]).toMatchObject({
+      phase: "awaiting_tools",
+      iteration: 0,
+      newMessages: [
+        {
+          id: expect.any(String),
+          role: "assistant",
+          toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+        },
+      ],
+      pendingToolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    });
+    expect(checkpoints[1]).toMatchObject({
+      phase: "tools_completed",
+      iteration: 0,
+      newMessages: [
+        checkpoints[0]?.newMessages[0],
+        {
+          id: expect.any(String),
+          role: "tool",
+          toolCallId,
+          content: "result:docs",
+        },
+      ],
+      pendingToolCalls: [],
+    });
+    expect(checkpoints[2]).toMatchObject({
+      phase: "final_response",
+      iteration: 1,
+      newMessages: [
+        checkpoints[0]?.newMessages[0],
+        checkpoints[1]?.newMessages[1],
+        {
+          id: expect.any(String),
+          role: "assistant",
+          content: "found docs",
+        },
+      ],
+      pendingToolCalls: [],
+    });
+    expect(checkpoints[0]?.newMessages).not.toBe(checkpoints[1]?.newMessages);
+    expect(checkpoints[1]?.newMessages).not.toBe(checkpoints[2]?.newMessages);
+    for (const checkpoint of checkpoints) {
+      expect(JSON.parse(JSON.stringify(checkpoint))).toEqual(checkpoint);
+    }
+  });
+
+  it("accumulates checkpoint messages across tool iterations", async () => {
+    const firstToolCallId = createToolCallId();
+    const secondToolCallId = createToolCallId();
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const provider = invokeProvider(async (req) => {
+      if (req.messages.length === 1) {
+        return {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: firstToolCallId, name: "lookup", args: { query: "first" } }],
+          },
+          stopReason: "tool_calls",
+        };
+      }
+      if (req.messages.length === 3) {
+        return {
+          message: {
+            role: "assistant",
+            content: "",
+            toolCalls: [{ id: secondToolCallId, name: "lookup", args: { query: "second" } }],
+          },
+          stopReason: "tool_calls",
+        };
+      }
+      return {
+        message: { role: "assistant", content: "done" },
+        stopReason: "completed",
+      };
+    });
+    let execution = 0;
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        execution += 1;
+        return { ok: true, result: `result:${execution}` };
+      },
+    });
+
+    await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
+      tools,
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    expect(checkpoints.map((checkpoint) => checkpoint.phase)).toEqual([
+      "awaiting_tools",
+      "tools_completed",
+      "awaiting_tools",
+      "tools_completed",
+      "final_response",
+    ]);
+    expect(
+      checkpoints.map((checkpoint) => checkpoint.newMessages.map((message) => message.role)),
+    ).toEqual([
+      ["assistant"],
+      ["assistant", "tool"],
+      ["assistant", "tool", "assistant"],
+      ["assistant", "tool", "assistant", "tool"],
+      ["assistant", "tool", "assistant", "tool", "assistant"],
+    ]);
+    expect(checkpoints[2]?.newMessages.slice(0, 2)).toEqual(checkpoints[1]?.newMessages);
+    expect(checkpoints[3]?.newMessages).toMatchObject([
+      checkpoints[0]?.newMessages[0],
+      { role: "tool", toolCallId: firstToolCallId, content: "result:1" },
+      { role: "assistant", toolCalls: [{ id: secondToolCallId }] },
+      { role: "tool", toolCallId: secondToolCallId, content: "result:2" },
+    ]);
+  });
+
   it("synthesizes a tool message for provider argument parse errors", async () => {
     const inputMessages: Message[] = [
       { id: createMessageId(), role: "user", content: "find docs" },
@@ -235,6 +514,62 @@ describe("AgentRunner.run", () => {
     expect(toolMessage.content).toContain("{bad-json");
     expect(finalMessage).toMatchObject({ role: "assistant", content: "recovered" });
     expect(providerRequests[1]).toEqual([inputMessages[0], assistantMessage, toolMessage]);
+  });
+
+  it("checkpoints synthesized results for tool argument parse errors", async () => {
+    const toolCallId = createToolCallId();
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const provider = invokeProvider(async (req) =>
+      req.messages.length === 1
+        ? {
+            message: {
+              role: "assistant",
+              toolCalls: [
+                {
+                  id: toolCallId,
+                  name: "lookup",
+                  args: "{bad-json",
+                  argsParseError: "Unexpected token b in JSON",
+                },
+              ],
+            },
+            stopReason: "tool_calls",
+          }
+        : {
+            message: { role: "assistant", content: "recovered" },
+            stopReason: "completed",
+          },
+    );
+
+    await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
+      tools: new ToolRegistry(),
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    expect(checkpoints.map((checkpoint) => checkpoint.phase)).toEqual([
+      "awaiting_tools",
+      "tools_completed",
+      "final_response",
+    ]);
+    expect(checkpoints[1]).toMatchObject({
+      phase: "tools_completed",
+      newMessages: [
+        {
+          role: "assistant",
+          toolCalls: [{ id: toolCallId }],
+        },
+        {
+          role: "tool",
+          toolCallId,
+          content: expect.stringContaining("Unexpected token b in JSON") as string,
+        },
+      ],
+      pendingToolCalls: [],
+    });
   });
 
   it("executes a valid retry after a parse error repair message", async () => {
