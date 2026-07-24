@@ -9,9 +9,13 @@ import type {
   ToolMessage,
   TurnId,
 } from "@byte-mentor/core";
-import type { ModelProvider, ProviderResponse, ProviderStreamEvent } from "./provider.js";
-import type { RuntimeCheckpoint } from "./runtime-checkpoint.js";
-import type { ToolRegistry } from "./tool-registry.js";
+import type {
+  ModelProvider,
+  ProviderResponse,
+  ProviderStreamEvent,
+} from "../providers/provider.js";
+import type { RuntimeCheckpoint } from "../loop/runtime-checkpoint.js";
+import type { ToolRegistry } from "../tools/tool-registry.js";
 
 const DEFAULT_MAX_ITERATIONS = 10;
 const CHECKPOINT_PERSISTENCE_FAILURE_TOOL_ERROR =

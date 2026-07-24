@@ -9,15 +9,15 @@ import type {
   TurnId,
 } from "@byte-mentor/core";
 import type { Session, SessionMetadata, SessionStore } from "@byte-mentor/session";
-import type { AgentRunner, AgentRunnerResult } from "./agent-runner.js";
-import type { ContextBuilder } from "./context-builder.js";
-import type { ProviderStreamEvent } from "./provider.js";
+import type { AgentRunner, AgentRunnerResult } from "../runner/agent-runner.js";
+import type { ContextBuilder } from "../context/context-builder.js";
+import type { ProviderStreamEvent } from "../providers/provider.js";
 import {
   isRuntimeCheckpoint,
   RUNTIME_CHECKPOINT_KEY,
   type RuntimeCheckpoint,
 } from "./runtime-checkpoint.js";
-import { ToolRegistry } from "./tool-registry.js";
+import { ToolRegistry } from "../tools/tool-registry.js";
 import {
   AgentLoopStateError,
   nextTurnState,

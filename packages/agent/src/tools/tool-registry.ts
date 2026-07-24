@@ -1,5 +1,5 @@
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
-import type { AgentTool, ToolDefinition, ToolResult } from "./provider.js";
+import type { AgentTool, ToolDefinition, ToolResult } from "../providers/provider.js";
 
 const ajv = new Ajv({ allErrors: true });
 

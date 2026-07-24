@@ -5,7 +5,7 @@ type TurnStateEvent = "ok" | "dispatch" | "shortcut";
 type NextTurnState = (state: TurnState, event: TurnStateEvent) => TurnState;
 
 async function loadNextTurnState(): Promise<NextTurnState | undefined> {
-  const modulePath = "../../packages/agent/src/turn-state.ts";
+  const modulePath = "../../packages/agent/src/loop/turn-state.ts";
   try {
     const turnState = (await import(/* @vite-ignore */ modulePath)) as {
       nextTurnState?: NextTurnState;
