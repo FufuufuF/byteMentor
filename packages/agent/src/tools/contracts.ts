@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../providers/provider.js";
+import type { WorkspaceReader } from "./workspace/workspace-reader.js";
 
 export type JsonPrimitive = string | number | boolean | null;
 
@@ -31,9 +32,13 @@ export interface ToolExecutionOutput {
   content: string;
 }
 
+export interface ToolExecutionContext {
+  workspaceReader: WorkspaceReader;
+}
+
 export interface AgentTool extends ToolDefinition {
   concurrency?: "safe";
 
-  /** 使用模型提供的参数执行工具，并返回可安全序列化为 JSON 的结构化结果。 */
-  execute(args: unknown): Promise<ToolResult>;
+  /** 使用模型提供的参数和 Registry 注入的工作区环境执行工具，并返回可安全序列化的结构化结果。 */
+  execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult>;
 }

@@ -5,6 +5,7 @@ import type {
   ProviderStreamEvent,
   ToolDefinition,
   ToolError,
+  ToolExecutionContext,
   ToolResult,
 } from "@byte-mentor/agent";
 import type { AssistantMessage, Message, StopReason } from "@byte-mentor/core";
@@ -55,7 +56,7 @@ describe("agent tool type contracts", () => {
     expect(tool.name).toBe("ping");
     expect(tool.description).toBe("pong back");
     expect(tool.parametersJsonSchema).toBeUndefined();
-    const r = await tool.execute({});
+    const r = await tool.execute({}, { workspaceReader: {} as never });
     expect(r).toEqual({ ok: true, data: "pong" });
   });
 
@@ -84,6 +85,24 @@ describe("agent tool type contracts", () => {
     };
 
     expect(tool.concurrency).toBe("safe");
+  });
+
+  // Tool 不读取全局 cwd；这里验证执行契约显式接收由 Registry 持有的统一 Workspace 上下文。
+  it("AgentTool receives an explicit ToolExecutionContext", async () => {
+    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    let receivedContext: ToolExecutionContext | undefined;
+    const tool: AgentTool = {
+      name: "capture_context",
+      description: "captures context",
+      async execute(_args: unknown, executionContext: ToolExecutionContext) {
+        receivedContext = executionContext;
+        return { ok: true, data: null };
+      },
+    };
+
+    await tool.execute({}, context);
+
+    expect(receivedContext).toBe(context);
   });
 
   it("ToolDefinition exposes name, description, optional schema", () => {

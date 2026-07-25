@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 1 GREEN，等待 Review）
+- 状态：开发中（Batch 2 GREEN / 等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -86,7 +86,7 @@ class ToolRegistry {
 }
 ```
 
-- 保留无参构造以支持 AgentLoop 的空 Registry；执行已注册 Tool 时必须已经提供显式上下文。缺少上下文属于 Runtime 组装错误，归一化为 `execution_failed`。
+- 保留无参构造以支持 AgentLoop 的空 Registry。Batch 2 起 Registry 在配置了 context 时原样注入；Batch 8 完成 Loop/CLI 注入前，无 context Registry 仅用于空 Registry 或不读取 context 的兼容测试 Tool，不注册内置 Workspace Tool。
 - Batch 1 先建立不依赖 Workspace 具体类型的执行边界，采用过渡签名 `execute(args)`，且 `ToolRegistryOptions` 暂不包含 `context`；Batch 2 创建真实 WorkspaceReader 后一次性加入最终的第二参数和显式上下文，不创建空 Workspace 文件或占位类型。
 - Tool 名称必须匹配 `^[a-z][a-z0-9_]{0,63}$`；description trim 后不能为空。
 - 重名抛出 `DuplicateToolError`；非法名称、说明或 schema 抛出 `InvalidToolDefinitionError`。这些注册期错误不转换成 ToolResult。
@@ -105,6 +105,17 @@ interface ToolExecutionContext {
   workspaceReader: WorkspaceReader;
 }
 
+interface WorkspaceResolvedPath {
+  path: string;
+  type: "file" | "directory" | "other";
+  isSymbolicLink: boolean;
+}
+
+class WorkspaceError extends Error {
+  readonly code: ToolErrorCode;
+  readonly details?: JsonObject;
+}
+
 class WorkspaceAccessPolicy {
   constructor(overrides?: WorkspaceAccessPolicyOverrides);
   readonly deniedPaths: readonly string[];
@@ -121,15 +132,18 @@ class WorkspaceReader {
   });
   readonly workspaceRoot: string;
   readonly policy: WorkspaceAccessPolicy;
+  resolvePath(path: string): Promise<WorkspaceResolvedPath>;
 }
 ```
 
 - `workspaceRoot` 在构造时解析并固定；Reader 和 Tool 执行期间都不读取 `process.cwd()`。
 - `ToolExecutionContext` 使用必填 `workspaceReader` 字段，不做泛型化，也不新增第二套 Workspace 抽象接口。
 - WorkspaceReader 的路径解析、目录列举、遍历、窗口读取和文本搜索方法按对应 Batch 的最小行为逐步加入；这些方法返回内部结构化数据，并以一个 `WorkspaceError` 类表达设计中的预期错误码。
+- `resolvePath()` 只返回规范化的 `/` 分隔相对路径、真实目标类型和原路径是否为符号链接，不向 Tool 或测试暴露绝对路径。
 - 所有 WorkspaceReader 方法异步；禁止 `node:fs` 同步 API。
 - 路径输入先拒绝绝对路径和词法 `..` 越界，再用 canonical realpath 判断真实边界。不存在和断裂目标保留 `path_not_found`，工作区外或策略禁止目标返回 `access_denied`。
 - Policy overrides 对数组字段采用整体替换，对数值上限采用逐字段覆盖；所有上限在构造时校验为正整数。
+- Policy 路径规则使用受限内部模式：普通路径精确匹配，尾部 `/**` 同时匹配该路径本身和所有后代，单个 `*` 只匹配一个路径段内的任意字符；不把该语法暴露为模型 Tool 参数。
 - 内置 Tool 导出为无状态的 `AgentTool` 常量，通过 `execute(args, context)` 使用 Reader，不捕获 workspaceRoot 或 Policy。
 
 #### Runner、事件与 Loop 签名
@@ -264,6 +278,17 @@ Review 重点：
 - 工作区边界是否基于 canonical realpath，而非字符串前缀。
 - 安全策略是否集中在 Workspace 层，没有散落到各个内置 Tool。
 - 代码是否只使用 Node.js 异步文件 API。
+
+Batch 2 TDD 状态：
+
+- [x] 测试先行：新增 5 个 Policy 测试、6 个真实文件系统 Reader 测试、2 个 Registry context 测试和 1 个 AgentTool context 契约测试。
+- [x] RED 已验证：定向测试 12 failed、28 passed；失败原因是 WorkspaceAccessPolicy / WorkspaceReader 公共 API 尚不存在，以及 Registry 尚未注入 context。
+- [x] GREEN：实现 Policy、Reader、WorkspaceError、ToolExecutionContext 与 Registry context 注入，并通过全量验证。
+
+开发进度：
+
+- 2026-07-25：Batch 2 RED。测试使用真实临时目录、文件和符号链接，不 mock 文件系统；覆盖默认/覆盖 Policy、资源上限、普通路径、绝对路径、`..` 越界、不存在/断裂路径、工作区内外及 denied target 符号链接、canonical realpath 前缀绕过和 Registry 同一 context 注入。
+- 2026-07-25：Batch 2 GREEN。Policy 集中实现默认/覆盖规则和正整数资源上限；Reader 使用异步 lstat、realpath、stat 完成词法边界、canonical realpath 边界、敏感目标与符号链接校验；Registry 保存并原样注入显式 ToolExecutionContext，同时保留无上下文空 Registry 兼容路径。Batch 2 定向 40 个测试、全量 176 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 3: `list_directory` 纵向切片
 

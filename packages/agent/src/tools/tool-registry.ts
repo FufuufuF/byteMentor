@@ -1,12 +1,19 @@
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
 import type { ToolDefinition } from "../providers/provider.js";
-import type { AgentTool, JsonValue, ToolExecutionOutput, ToolResult } from "./contracts.js";
+import type {
+  AgentTool,
+  JsonValue,
+  ToolExecutionContext,
+  ToolExecutionOutput,
+  ToolResult,
+} from "./contracts.js";
 
 const ajv = new Ajv({ allErrors: true });
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
 const DEFAULT_MAX_SERIALIZED_TOOL_RESULT_CHARACTERS = 24_000;
 
 export interface ToolRegistryOptions {
+  context?: ToolExecutionContext;
   maxSerializedToolResultCharacters?: number;
 }
 
@@ -29,10 +36,12 @@ export class DuplicateToolError extends Error {
 export class ToolRegistry {
   private readonly tools = new Map<string, AgentTool>();
   private readonly validators = new WeakMap<AgentTool, ValidateFunction>();
+  private readonly context: ToolExecutionContext | undefined;
   private readonly maxSerializedToolResultCharacters: number;
 
-  // 固定 Registry 的最终序列化字符上限；调用方未配置时使用设计约定的 24,000 字符。
+  // 保存统一工具执行环境和最终序列化字符上限；无上下文构造仍支持空 Registry 与兼容工具。
   constructor(options: ToolRegistryOptions = {}) {
+    this.context = options.context;
     this.maxSerializedToolResultCharacters =
       options.maxSerializedToolResultCharacters ?? DEFAULT_MAX_SERIALIZED_TOOL_RESULT_CHARACTERS;
   }
@@ -101,7 +110,10 @@ export class ToolRegistry {
       );
     }
     try {
-      return toExecutionOutput(await tool.execute(args), this.maxSerializedToolResultCharacters);
+      return toExecutionOutput(
+        await tool.execute(args, this.context as ToolExecutionContext),
+        this.maxSerializedToolResultCharacters,
+      );
     } catch (e) {
       return toExecutionOutput(
         {

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ToolRegistry } from "@byte-mentor/agent";
+import type { ToolExecutionContext } from "@byte-mentor/agent";
 
 describe("ToolRegistry.execute known tool", () => {
   // 工具执行成功后，Registry 需要同时提供两种表示：result 保留对象，方便运行时代码读取字段；
@@ -41,6 +42,37 @@ describe("ToolRegistry.execute known tool", () => {
     });
     await registry.execute("capture", { x: 1, y: [2, 3] });
     expect(captured).toEqual({ x: 1, y: [2, 3] });
+  });
+});
+
+describe("ToolRegistry execution context", () => {
+  // Registry 负责持有统一运行环境；这里使用完整的 context 形状作为不透明值，验证同一对象原样传给 Tool。
+  it("injects the configured context into tool execution", async () => {
+    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    const registry = new ToolRegistry({ context });
+    let receivedContext: ToolExecutionContext | undefined;
+    registry.register({
+      name: "capture_context",
+      description: "captures the execution context",
+      async execute(_args: unknown, executionContext: ToolExecutionContext) {
+        receivedContext = executionContext;
+        return { ok: true, data: "captured" };
+      },
+    });
+
+    await registry.execute("capture_context", {});
+
+    expect(receivedContext).toBe(context);
+  });
+
+  // AgentLoop 缺省使用无上下文的空 Registry；这里验证它仍能安全列举并归一化未知工具调用。
+  it("keeps an empty context-free registry safe", async () => {
+    const registry = new ToolRegistry();
+
+    expect(registry.list()).toEqual([]);
+    await expect(registry.execute("missing", {})).resolves.toMatchObject({
+      result: { ok: false, error: { code: "unknown_tool" } },
+    });
   });
 });
 
