@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 3 GREEN / 等待 Review）
+- 状态：开发中（Batch 4 GREEN / 等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -371,6 +371,28 @@ Review 重点：
 - 遍历是否保持稳定顺序，且每个真实目录每次调用最多访问一次。
 - `find_files` 是否只查找文件路径，没有渗入内容搜索语义。
 - 达到硬资源上限时是否返回 `resource_limit`，而不是伪装成完整结果。
+
+Batch 4 实施契约：
+
+- 公共入口导出无状态常量 `findFilesTool`，声明 `concurrency: "safe"`，通过 `ToolExecutionContext.workspaceReader` 访问工作区。
+- `WorkspaceReader.walkFiles(path)` 返回规范化起点和全部可搜索文件；Reader 负责异步确定性遍历、denied/searchExcludes、canonical 目录 visited set、符号链接目标安全、稳定路径排序和 `maxTraversalEntries`，Tool 不复制这些文件系统规则。
+- 遍历按每层名称的 Unicode 字符串顺序深度优先；第一次到达一个 canonical 真实目录的相对别名获胜，后续目录别名和循环不再进入。visited set 只去重目录，多个安全文件链接仍作为各自可见路径返回。
+- 每个从目录中取得的直接子项计入 traversal entry；尝试访问第 `maxTraversalEntries + 1` 项时抛出 `resource_limit`，不返回部分成功。
+- 普通文件使用自身字节数；指向工作区内普通文件的链接返回 `type: "symbolic_link"`、目标文件 `sizeBytes` 和 `targetType: "file"`。外部、denied、search-excluded、断裂或非文件目标链接不进入文件结果。
+- Tool 对文件名或完整工作区相对路径做字面量 substring 匹配；`caseSensitive: false` 使用确定性的字符串小写比较，不读取文件内容。匹配完成后按完整相对路径排序。
+- Tool 负责 `path = "."`、`caseSensitive = false`、`offset = 0`、Policy 默认 limit、Policy max limit、无 `total` 分页和完整成功 envelope 输出预算；单条匹配无法容纳时返回 `resource_limit`。
+- Tool 只把预期 `WorkspaceError` 转为同码 ToolResult；未预期异常交由 Registry 归一化。
+
+Batch 4 TDD 状态：
+
+- [x] Batch 3 已以 `b2637fb feat(agent): add directory listing tool` 提交。
+- [x] RED：一次性完成字面量匹配、内容隔离、排除规则、链接/循环/去重、边界、分页、输出预算、遍历上限、参数和模型说明测试。
+- [x] GREEN：实现可复用 Workspace 文件遍历与 `findFilesTool`，并通过全量验证。
+
+开发进度：
+
+- 2026-07-25：Batch 4 RED。新增 13 个真实文件系统与 Registry 纵向测试；覆盖文件名/完整相对路径字面量匹配、大小写、正文隔离、默认 denied/searchExcludes 及 canonical 目标绕过、内部文件链接、外部/断裂链接、目录别名/循环/去重、真实工作区越界、稳定无总数分页、成功 envelope 输出预算、traversal hard limit、wrong_path_type、schema/Policy limit 和四段模型说明。定向测试 13 failed，全部按预期失败于公共入口尚未导出 `findFilesTool`；typecheck、lint 与 format check 通过，未写 Batch 4 生产代码。
+- 2026-07-25：Batch 4 GREEN。WorkspaceReader 新增异步确定性文件遍历，按目录项计数资源、应用可见路径与 canonical 目标策略、用真实目录 visited set 阻止循环和重复扫描，并返回普通文件及安全文件链接；无状态 `findFilesTool` 完成字面量名称/路径匹配、大小写选项、无总数分页、完整成功 envelope 输出预算、schema/说明和 WorkspaceError 映射。Batch 4 定向 13 个测试、全量 201 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 5: `read_file` 纵向切片
 

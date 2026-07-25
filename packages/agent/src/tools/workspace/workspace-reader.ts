@@ -24,6 +24,31 @@ export interface WorkspaceDirectoryListing {
   entries: WorkspaceDirectoryEntry[];
 }
 
+export interface WorkspaceFileEntry {
+  name: string;
+  path: string;
+  type: "file" | "symbolic_link";
+  sizeBytes: number;
+  targetType?: "file";
+}
+
+export interface WorkspaceFileTraversal {
+  path: string;
+  files: WorkspaceFileEntry[];
+}
+
+interface FileTraversalState {
+  visitedDirectories: Set<string>;
+  visitedEntries: number;
+  files: WorkspaceFileEntry[];
+}
+
+interface TraversalTarget {
+  canonicalPath: string;
+  canonicalRelativePath: string;
+  metadata: Stats;
+}
+
 export class WorkspaceError extends Error {
   readonly code: ToolErrorCode;
   readonly details?: JsonObject;
@@ -121,6 +146,36 @@ export class WorkspaceReader {
     return { path: resolvedDirectory.path, entries };
   }
 
+  // 递归收集允许搜索的文件，并用 canonical 目录去重和遍历计数保证循环安全与资源有界。
+  async walkFiles(path: string): Promise<WorkspaceFileTraversal> {
+    const resolvedDirectory = await this.resolvePath(path);
+    if (resolvedDirectory.type !== "directory") {
+      throw new WorkspaceError(
+        "wrong_path_type",
+        `workspace path is not a directory: ${resolvedDirectory.path}`,
+      );
+    }
+
+    const absoluteDirectory = resolve(this.workspaceRoot, resolvedDirectory.path);
+    const startingTarget = await this.resolveTraversalTarget(absoluteDirectory);
+    if (
+      startingTarget === undefined ||
+      this.policy.isSearchExcluded(resolvedDirectory.path) ||
+      this.policy.isSearchExcluded(startingTarget.canonicalRelativePath)
+    ) {
+      return { path: resolvedDirectory.path, files: [] };
+    }
+
+    const state: FileTraversalState = {
+      visitedDirectories: new Set([startingTarget.canonicalPath]),
+      visitedEntries: 0,
+      files: [],
+    };
+    await this.walkDirectory(resolvedDirectory.path, absoluteDirectory, state);
+    state.files.sort(compareWorkspaceFiles);
+    return { path: resolvedDirectory.path, files: state.files };
+  }
+
   // 拒绝绝对路径和词法越界，再生成位于工作区根目录内的绝对访问目标与规范相对路径。
   private resolveLexicalPath(path: string): { absolutePath: string; relativePath: string } {
     if (isAbsolute(path)) {
@@ -176,6 +231,85 @@ export class WorkspaceReader {
       throw error;
     }
   }
+
+  // 按名称顺序深度优先访问一个目录，将安全文件加入结果并在进入目录前执行策略与 canonical 去重。
+  private async walkDirectory(
+    directoryPath: string,
+    absoluteDirectory: string,
+    state: FileTraversalState,
+  ): Promise<void> {
+    const names = await readdir(absoluteDirectory);
+    names.sort(compareStrings);
+
+    for (const name of names) {
+      state.visitedEntries += 1;
+      if (state.visitedEntries > this.policy.limits.maxTraversalEntries) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `workspace traversal exceeds ${this.policy.limits.maxTraversalEntries} entries`,
+        );
+      }
+
+      const path = directoryPath === "." ? name : `${directoryPath}/${name}`;
+      if (this.policy.isSearchExcluded(path)) {
+        continue;
+      }
+
+      const absolutePath = resolve(this.workspaceRoot, path);
+      const linkMetadata = await lstat(absolutePath);
+      const target = await this.resolveTraversalTarget(absolutePath);
+      if (target === undefined || this.policy.isSearchExcluded(target.canonicalRelativePath)) {
+        continue;
+      }
+
+      if (target.metadata.isDirectory()) {
+        if (state.visitedDirectories.has(target.canonicalPath)) {
+          continue;
+        }
+        state.visitedDirectories.add(target.canonicalPath);
+        await this.walkDirectory(path, absolutePath, state);
+        continue;
+      }
+
+      if (target.metadata.isFile()) {
+        state.files.push({
+          name,
+          path,
+          type: linkMetadata.isSymbolicLink() ? "symbolic_link" : "file",
+          sizeBytes: target.metadata.size,
+          ...(linkMetadata.isSymbolicLink() ? { targetType: "file" as const } : {}),
+        });
+      }
+    }
+  }
+
+  // 将遍历候选解析为工作区内允许搜索的 canonical 目标；外部、敏感、断裂和循环链接统一跳过。
+  private async resolveTraversalTarget(absolutePath: string): Promise<TraversalTarget | undefined> {
+    let canonicalPath: string;
+    try {
+      canonicalPath = await realpath(absolutePath);
+    } catch (error) {
+      if (isMissingPathError(error) || isSymbolicLinkLoopError(error)) {
+        return undefined;
+      }
+      throw error;
+    }
+
+    const canonicalRoot = await this.canonicalWorkspaceRoot;
+    const targetRelativePath = relative(canonicalRoot, canonicalPath);
+    if (isOutsideRoot(targetRelativePath)) {
+      return undefined;
+    }
+    const canonicalRelativePath = toWorkspacePath(targetRelativePath);
+    if (this.policy.isSearchExcluded(canonicalRelativePath)) {
+      return undefined;
+    }
+    return {
+      canonicalPath,
+      canonicalRelativePath,
+      metadata: await stat(canonicalPath),
+    };
+  }
 }
 
 // 将 lstat 元数据归一化为模型可见的目录项类型，并保留符号链接自身而不是目标类型。
@@ -200,6 +334,16 @@ function compareDirectoryEntries(
   return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
 }
 
+// 按完整工作区相对路径稳定排序文件结果，使分页不受目录读取顺序影响。
+function compareWorkspaceFiles(left: WorkspaceFileEntry, right: WorkspaceFileEntry): number {
+  return compareStrings(left.path, right.path);
+}
+
+// 使用 JavaScript Unicode 字符串顺序比较文本，避免依赖平台或进程 locale。
+function compareStrings(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 // 判断 path.relative 的结果是否位于基准目录之外，并避免字符串前缀碰撞。
 function isOutsideRoot(relativePath: string): boolean {
   return relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath);
@@ -216,4 +360,9 @@ function isMissingPathError(error: unknown): boolean {
     return false;
   }
   return error.code === "ENOENT" || error.code === "ENOTDIR";
+}
+
+// 识别符号链接循环错误，使递归搜索跳过该入口而不是暴露底层 ELOOP。
+function isSymbolicLinkLoopError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ELOOP";
 }
