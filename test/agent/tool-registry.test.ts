@@ -2,12 +2,13 @@ import { describe, expect, it } from "vitest";
 import { ToolRegistry } from "@byte-mentor/agent";
 import type { AgentTool } from "@byte-mentor/agent";
 
+// 创建只返回自身名称的最小工具，供 Registry 注册和排序测试复用。
 function makeTool(name: string): AgentTool {
   return {
     name,
     description: `${name} tool`,
     async execute() {
-      return { ok: true, result: name };
+      return { ok: true, data: name };
     },
   };
 }

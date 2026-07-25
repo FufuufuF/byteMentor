@@ -1,5 +1,6 @@
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
-import type { AgentTool, ToolDefinition, ToolResult } from "../providers/provider.js";
+import type { ToolDefinition } from "../providers/provider.js";
+import type { AgentTool, ToolExecutionOutput, ToolResult } from "./contracts.js";
 
 const ajv = new Ajv({ allErrors: true });
 
@@ -23,31 +24,32 @@ export class ToolRegistry {
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
-  async execute(name: string, args: unknown): Promise<ToolResult> {
+  // 执行一个已注册工具，同时返回供 Runtime 判断状态的对象结果和供 ToolMessage 使用的 JSON 字符串。
+  async execute(name: string, args: unknown): Promise<ToolExecutionOutput> {
     const tool = this.tools.get(name);
     if (tool === undefined) {
-      return {
+      return toExecutionOutput({
         ok: false,
         error: { kind: "unknown_tool", message: `tool not registered: ${name}` },
-      };
+      });
     }
     const invalidArgsMessage = this.validateArgs(tool, args);
     if (invalidArgsMessage !== undefined) {
-      return {
+      return toExecutionOutput({
         ok: false,
         error: { kind: "invalid_args", message: invalidArgsMessage },
-      };
+      });
     }
     try {
-      return await tool.execute(args);
+      return toExecutionOutput(await tool.execute(args));
     } catch (e) {
-      return {
+      return toExecutionOutput({
         ok: false,
         error: {
           kind: "execution_failed",
           message: e instanceof Error ? e.message : String(e),
         },
-      };
+      });
     }
   }
 
@@ -80,6 +82,14 @@ export class ToolRegistry {
     this.validators.set(tool, validate);
     return validate;
   }
+}
+
+// 把归一化结果统一序列化一次，确保 Runtime 读取的对象与 ToolMessage 携带的字符串表达同一份数据。
+function toExecutionOutput(result: ToolResult): ToolExecutionOutput {
+  return {
+    result,
+    content: JSON.stringify(result),
+  };
 }
 
 function isObjectArgs(args: unknown): args is Record<string, unknown> {

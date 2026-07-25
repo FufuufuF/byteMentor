@@ -4,6 +4,7 @@ export * from "./context/context-builder.js";
 export * from "./providers/openai-chat-provider.js";
 export * from "./providers/provider.js";
 export type { RuntimeCheckpoint } from "./loop/runtime-checkpoint.js";
+export * from "./tools/contracts.js";
 export * from "./tools/tool-registry.js";
 export { AgentLoopStateError } from "./loop/turn-state.js";
 export type { StateTraceEntry, TurnState, TurnStateEvent } from "./loop/turn-state.js";

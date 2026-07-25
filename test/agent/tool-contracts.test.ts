@@ -26,10 +26,11 @@ describe("agent tool type contracts", () => {
     expect(err.kind).toBe("execution_failed");
   });
 
-  it("ToolResult success variant carries result string", () => {
-    const r: ToolResult = { ok: true, result: "42" };
+  // 验证成功结果把可序列化的数据放在 data 字段，供 Registry 统一包装和序列化。
+  it("ToolResult success variant carries JSON-compatible data", () => {
+    const r: ToolResult = { ok: true, data: "42" };
     expect(r.ok).toBe(true);
-    expect(r.result).toBe("42");
+    expect(r.data).toBe("42");
   });
 
   it("ToolResult failure variant carries ToolError", () => {
@@ -38,28 +39,30 @@ describe("agent tool type contracts", () => {
     expect(r.error.kind).toBe("unknown_tool");
   });
 
+  // 验证 AgentTool 同时提供模型可见定义和返回结构化 ToolResult 的执行函数。
   it("AgentTool shape: name, description, optional schema, execute(args) -> Promise<ToolResult>", async () => {
     const tool: AgentTool = {
       name: "ping",
       description: "pong back",
       async execute(_args: unknown) {
-        return { ok: true, result: "pong" };
+        return { ok: true, data: "pong" };
       },
     };
     expect(tool.name).toBe("ping");
     expect(tool.description).toBe("pong back");
     expect(tool.parametersJsonSchema).toBeUndefined();
     const r = await tool.execute({});
-    expect(r).toEqual({ ok: true, result: "pong" });
+    expect(r).toEqual({ ok: true, data: "pong" });
   });
 
+  // 验证 AgentTool 可以携带由 Registry 编译、Provider 原样映射的参数 schema。
   it("AgentTool can carry parametersJsonSchema as unknown", () => {
     const tool: AgentTool = {
       name: "calc",
       description: "calc",
       parametersJsonSchema: { type: "object", properties: { x: { type: "number" } } },
       async execute() {
-        return { ok: true, result: "" };
+        return { ok: true, data: "" };
       },
     };
     expect(tool.parametersJsonSchema).toBeDefined();

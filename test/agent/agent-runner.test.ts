@@ -49,6 +49,7 @@ function invokeProvider(
   });
 }
 
+// 构造 awaiting_tools checkpoint 持久化失败场景，并返回工具是否被执行及 Runner 的失败结果。
 async function runAwaitingToolsCheckpointFailure() {
   const firstToolCallId = createToolCallId();
   const secondToolCallId = createToolCallId();
@@ -70,7 +71,7 @@ async function runAwaitingToolsCheckpointFailure() {
     description: "lookup docs",
     async execute() {
       toolExecutions.push("lookup");
-      return { ok: true, result: "lookup result" };
+      return { ok: true, data: "lookup result" };
     },
   });
   tools.register({
@@ -78,7 +79,7 @@ async function runAwaitingToolsCheckpointFailure() {
     description: "summarize docs",
     async execute() {
       toolExecutions.push("summarize");
-      return { ok: true, result: "summary" };
+      return { ok: true, data: "summary" };
     },
   });
 
@@ -210,6 +211,7 @@ describe("AgentRunner.run", () => {
     expect(result.error?.message).toContain("checkpoint storage unavailable");
   });
 
+  // 验证模型请求工具后，Runner 把工具的 JSON 结果加入消息，再请求并返回最终回答。
   it("executes one tool call before final provider response", async () => {
     const inputMessages: Message[] = [
       { id: createMessageId(), role: "user", content: "find docs" },
@@ -244,7 +246,7 @@ describe("AgentRunner.run", () => {
       },
       async execute(args: unknown) {
         const a = args as { query: string };
-        return { ok: true, result: `result:${a.query}` };
+        return { ok: true, data: `result:${a.query}` };
       },
     });
 
@@ -273,7 +275,7 @@ describe("AgentRunner.run", () => {
     expect(toolResultMessage).toMatchObject({
       role: "tool",
       toolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     });
     expect(finalMessage).toMatchObject({
       role: "assistant",
@@ -281,6 +283,7 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  // 验证工具执行前后的 checkpoint 分别记录待执行调用和已经序列化的工具结果。
   it("checkpoints tool calls before and after execution", async () => {
     const toolCallId = createToolCallId();
     const checkpoints: RuntimeCheckpoint[] = [];
@@ -304,7 +307,7 @@ describe("AgentRunner.run", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 
@@ -343,7 +346,7 @@ describe("AgentRunner.run", () => {
           id: expect.any(String),
           role: "tool",
           toolCallId,
-          content: "result:docs",
+          content: '{"ok":true,"data":"result:docs"}',
         },
       ],
       pendingToolCalls: [],
@@ -369,6 +372,7 @@ describe("AgentRunner.run", () => {
     }
   });
 
+  // 验证多轮工具调用的 checkpoint 累积完整消息轨迹，不覆盖前一轮结果。
   it("accumulates checkpoint messages across tool iterations", async () => {
     const firstToolCallId = createToolCallId();
     const secondToolCallId = createToolCallId();
@@ -406,7 +410,7 @@ describe("AgentRunner.run", () => {
       description: "lookup docs",
       async execute() {
         execution += 1;
-        return { ok: true, result: `result:${execution}` };
+        return { ok: true, data: `result:${execution}` };
       },
     });
 
@@ -438,12 +442,21 @@ describe("AgentRunner.run", () => {
     expect(checkpoints[2]?.newMessages.slice(0, 2)).toEqual(checkpoints[1]?.newMessages);
     expect(checkpoints[3]?.newMessages).toMatchObject([
       checkpoints[0]?.newMessages[0],
-      { role: "tool", toolCallId: firstToolCallId, content: "result:1" },
+      {
+        role: "tool",
+        toolCallId: firstToolCallId,
+        content: '{"ok":true,"data":"result:1"}',
+      },
       { role: "assistant", toolCalls: [{ id: secondToolCallId }] },
-      { role: "tool", toolCallId: secondToolCallId, content: "result:2" },
+      {
+        role: "tool",
+        toolCallId: secondToolCallId,
+        content: '{"ok":true,"data":"result:2"}',
+      },
     ]);
   });
 
+  // 验证 Provider 参数解析失败时生成修复提示，并且不会执行对应工具。
   it("synthesizes a tool message for provider argument parse errors", async () => {
     const inputMessages: Message[] = [
       { id: createMessageId(), role: "user", content: "find docs" },
@@ -480,7 +493,7 @@ describe("AgentRunner.run", () => {
       description: "lookup docs",
       async execute() {
         toolExecuted = true;
-        return { ok: true, result: "should not run" };
+        return { ok: true, data: "should not run" };
       },
     });
 
@@ -572,6 +585,7 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  // 验证模型看到参数修复提示后可以重试，且合法参数只执行一次并产生 JSON 工具结果。
   it("executes a valid retry after a parse error repair message", async () => {
     const inputMessages: Message[] = [
       { id: createMessageId(), role: "user", content: "find docs" },
@@ -622,7 +636,7 @@ describe("AgentRunner.run", () => {
       description: "lookup docs",
       async execute(args) {
         executedArgs.push(args);
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 
@@ -649,10 +663,11 @@ describe("AgentRunner.run", () => {
     expect(result.newMessages[3]).toMatchObject({
       role: "tool",
       toolCallId: validToolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     });
   });
 
+  // 验证一次工具轮次按顺序记录模型请求、模型响应、工具开始和工具完成事件。
   it("records model and tool runtime events", async () => {
     const turnId = createTurnId();
     const toolCallId = createToolCallId();
@@ -677,7 +692,7 @@ describe("AgentRunner.run", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 
@@ -715,7 +730,7 @@ describe("AgentRunner.run", () => {
     expect(result.events[3]).toMatchObject({
       type: "tool.completed",
       toolCallId,
-      result: "result:docs",
+      result: '{"ok":true,"data":"result:docs"}',
     });
     expect(result.events[4]).toMatchObject({
       type: "model.requested",
@@ -729,6 +744,7 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  // 验证模型持续请求工具时，Runner 达到迭代上限便停止，同时保留已经产生的工具消息。
   it("stops with max_iterations when provider keeps requesting tools", async () => {
     const toolCallId = createToolCallId();
     let providerCallCount = 0;
@@ -748,7 +764,7 @@ describe("AgentRunner.run", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "still needs more" };
+        return { ok: true, data: "still needs more" };
       },
     });
 
@@ -769,7 +785,7 @@ describe("AgentRunner.run", () => {
     expect(result.newMessages[1]).toMatchObject({
       role: "tool",
       toolCallId,
-      content: "still needs more",
+      content: '{"ok":true,"data":"still needs more"}',
     });
   });
 
@@ -800,6 +816,7 @@ describe("AgentRunner.run", () => {
     expect(deltas).toEqual(["hello ", "world"]);
   });
 
+  // 验证中间工具调用响应的文本增量不会展示给用户，只有最终回答的增量会被转发。
   it("does not forward content deltas from intermediate tool-call streams", async () => {
     const toolCallId = createToolCallId();
     const deltas: string[] = [];
@@ -830,7 +847,7 @@ describe("AgentRunner.run", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 

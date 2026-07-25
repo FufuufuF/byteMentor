@@ -40,6 +40,7 @@ export interface AgentRunnerResult {
 export class AgentRunner {
   constructor(private readonly provider: ModelProvider) {}
 
+  // 执行当前 turn 的模型与工具循环，记录运行事件，并返回本轮新产生的消息。
   async run(input: AgentRunnerInput): Promise<AgentRunnerResult> {
     const workingMessages = [...input.messages];
     const newMessages: Message[] = [];
@@ -142,29 +143,29 @@ export class AgentRunner {
           toolCallId: toolCall.id,
           toolName: toolCall.name,
         });
-        const toolResult = await input.tools.execute(toolCall.name, toolCall.args);
+        const toolOutput = await input.tools.execute(toolCall.name, toolCall.args);
         events.push(
-          toolResult.ok
+          toolOutput.result.ok
             ? {
                 type: "tool.completed",
                 turnId: input.turnId,
                 ts: Date.now(),
                 toolCallId: toolCall.id,
-                result: toolResult.result,
+                result: toolOutput.content,
               }
             : {
                 type: "tool.failed",
                 turnId: input.turnId,
                 ts: Date.now(),
                 toolCallId: toolCall.id,
-                message: toolResult.error.message,
+                message: toolOutput.result.error.message,
               },
         );
         const toolMessage: ToolMessage = {
           id: createMessageId(),
           role: "tool",
           toolCallId: toolCall.id,
-          content: toolResult.ok ? toolResult.result : toolResult.error.message,
+          content: toolOutput.content,
         };
         workingMessages.push(toolMessage);
         newMessages.push(toolMessage);

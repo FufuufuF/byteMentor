@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：待审阅
+- 状态：开发中（Batch 1 / TDD 小步 1 已完成）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -16,6 +16,157 @@
 - Batch 以完整的行为边界拆分，不为了追求小行数而把同一能力的契约、测试和实现拆到多个 commit。
 - 每个 Batch 完成后先停下等待 Review，不自动进入下一批。
 - 不引入新的运行时依赖；文件系统能力使用 Node.js 异步 API，schema 校验继续使用现有 Ajv。
+
+### 2.1 实施契约与行为决策
+
+本节补齐 Design 已确定方向、但原计划没有落到具体代码签名的决策。实施时直接以本节为准；若 Review 需要调整，先修改本节，再修改代码。
+
+#### 类型与 Provider 边界
+
+```ts
+type JsonPrimitive = string | number | boolean | null;
+type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
+interface JsonObject {
+  [key: string]: JsonValue;
+}
+
+type ToolErrorCode =
+  | "unknown_tool"
+  | "invalid_arguments"
+  | "path_not_found"
+  | "access_denied"
+  | "wrong_path_type"
+  | "unsupported_content"
+  | "resource_limit"
+  | "execution_failed";
+
+interface ToolError {
+  code: ToolErrorCode;
+  message: string;
+  details?: JsonObject;
+}
+
+type ToolResult =
+  | { ok: true; data: JsonValue }
+  | { ok: false; error: ToolError };
+
+interface ToolExecutionOutput {
+  result: ToolResult;
+  content: string;
+}
+
+interface AgentTool extends ToolDefinition {
+  concurrency?: "safe";
+  execute(args: unknown, context: ToolExecutionContext): Promise<ToolResult>;
+}
+```
+
+- `ToolRegistry.execute()` 返回 `{ result, content }`。`content` 是 `result` 的紧凑 JSON 序列化，Runner 直接写入 `ToolMessage.content`；RuntimeEvent 从 `result` 读取结构化观测字段。
+- `concurrency?: "safe"` 是 Runtime 内部执行属性；未声明即按串行处理。`ToolRegistry.list()` 不暴露该字段。
+- `ToolDefinition` 继续只包含 `name`、`description` 和可选 `parametersJsonSchema`；Provider、Message、Session 协议不引入 Tool 执行语义或对象 payload。
+- `ModelProvider`、`ProviderRequest`、`ProviderResponse` 和流式事件签名保持现状。
+- `SessionStore`、Message 判别联合、branded ID、`StopReason` 和 `ContextBuilder` 签名保持现状。
+
+#### Registry 签名与归一化
+
+```ts
+interface ToolRegistryOptions {
+  context?: ToolExecutionContext;
+  maxSerializedToolResultCharacters?: number;
+}
+
+class ToolRegistry {
+  constructor(options?: ToolRegistryOptions);
+  register(tool: AgentTool): void;
+  list(): ToolDefinition[];
+  getConcurrency(name: string): "safe" | "serial";
+  execute(name: string, args: unknown): Promise<ToolExecutionOutput>;
+}
+```
+
+- 保留无参构造以支持 AgentLoop 的空 Registry；执行已注册 Tool 时必须已经提供显式上下文。缺少上下文属于 Runtime 组装错误，归一化为 `execution_failed`。
+- Batch 1 先建立不依赖 Workspace 具体类型的执行边界，采用过渡签名 `execute(args)`，且 `ToolRegistryOptions` 暂不包含 `context`；Batch 2 创建真实 WorkspaceReader 后一次性加入最终的第二参数和显式上下文，不创建空 Workspace 文件或占位类型。
+- Tool 名称必须匹配 `^[a-z][a-z0-9_]{0,63}$`；description trim 后不能为空。
+- 重名抛出 `DuplicateToolError`；非法名称、说明或 schema 抛出 `InvalidToolDefinitionError`。这些注册期错误不转换成 ToolResult。
+- schema 在 `register()` 中由 Ajv 编译。没有 schema 时，参数仍必须是非 null、非数组的 JSON object；无参数 Tool 使用 `{}`。
+- schema 校验失败返回 `invalid_arguments`；未知名称返回 `unknown_tool`；Tool 抛出的任意值统一返回 `execution_failed`。
+- 可预期的 Workspace 失败由内置 Tool 转成对应 `ToolResult` 后返回，不通过 throw 传递。
+- Registry 对 Tool 返回值做 JSON 值运行时检查，拒绝 `undefined`、函数、symbol、bigint、非有限数字、稀疏数组、循环引用和非普通对象；违规结果归一化为 `execution_failed`。
+- Registry 使用 `JSON.stringify(result)` 生成紧凑 JSON。若超过硬上限，改为完整的 `resource_limit` 失败 envelope，不截断 JSON 字符串。
+- 默认 Registry 序列化硬上限为 24,000 字符；CLI 组装时使用 Workspace Policy 中的对应值显式配置。
+- `getConcurrency()` 对未知或未声明 Tool 返回 `"serial"`，仅用于 Runner 调度，不进入 Provider schema。
+
+#### Workspace 公共签名
+
+```ts
+interface ToolExecutionContext {
+  workspaceReader: WorkspaceReader;
+}
+
+class WorkspaceAccessPolicy {
+  constructor(overrides?: WorkspaceAccessPolicyOverrides);
+  readonly deniedPaths: readonly string[];
+  readonly searchExcludes: readonly string[];
+  readonly limits: Readonly<WorkspaceResourceLimits>;
+  isDenied(relativePath: string): boolean;
+  isSearchExcluded(relativePath: string): boolean;
+}
+
+class WorkspaceReader {
+  constructor(input: {
+    workspaceRoot: string;
+    policy: WorkspaceAccessPolicy;
+  });
+  readonly workspaceRoot: string;
+  readonly policy: WorkspaceAccessPolicy;
+}
+```
+
+- `workspaceRoot` 在构造时解析并固定；Reader 和 Tool 执行期间都不读取 `process.cwd()`。
+- `ToolExecutionContext` 使用必填 `workspaceReader` 字段，不做泛型化，也不新增第二套 Workspace 抽象接口。
+- WorkspaceReader 的路径解析、目录列举、遍历、窗口读取和文本搜索方法按对应 Batch 的最小行为逐步加入；这些方法返回内部结构化数据，并以一个 `WorkspaceError` 类表达设计中的预期错误码。
+- 所有 WorkspaceReader 方法异步；禁止 `node:fs` 同步 API。
+- 路径输入先拒绝绝对路径和词法 `..` 越界，再用 canonical realpath 判断真实边界。不存在和断裂目标保留 `path_not_found`，工作区外或策略禁止目标返回 `access_denied`。
+- Policy overrides 对数组字段采用整体替换，对数值上限采用逐字段覆盖；所有上限在构造时校验为正整数。
+- 内置 Tool 导出为无状态的 `AgentTool` 常量，通过 `execute(args, context)` 使用 Reader，不捕获 workspaceRoot 或 Policy。
+
+#### Runner、事件与 Loop 签名
+
+```ts
+interface AgentRunnerOptions {
+  maxConcurrentToolCalls?: number;
+}
+
+class AgentRunner {
+  constructor(provider: ModelProvider, options?: AgentRunnerOptions);
+}
+
+interface AgentLoopInput {
+  sessionStore: SessionStore;
+  contextBuilder: ContextBuilder;
+  runner: Pick<AgentRunner, "run">;
+  tools?: ToolRegistry;
+}
+```
+
+- `maxConcurrentToolCalls` 默认 4，必须是正整数；它是 Runtime 配置，不进入 Tool 参数或 Provider 请求。
+- AgentRunner 的 `run()`、`AgentRunnerInput`、`AgentRunnerResult`、HeadlessTurn 输入/结果和 checkpoint 签名保持现状。
+- Batch 1 中 ToolMessage 一律使用 `ToolExecutionOutput.content`；成功和失败都是可解析的完整 JSON envelope。
+- Batch 7 中只有整批 Tool Call 都解析成功且 Registry 报告为 `safe` 时才并发；存在参数解析失败、未知 Tool 或任一串行 Tool 时整批按原顺序串行。
+- 并发限制覆盖从 Registry execute 开始到结果完成的整个生命周期；不预先启动超出上限的 Promise。
+- 并发结果、ToolMessage、working messages 和 checkpoint 始终按原始 Tool Call 顺序组装；单个失败不取消同批其他调用。
+- `tool.completed` 使用 Design 中的 `toolName`、`durationMs`、`outputCharacters`、`resultPreview`、`resultPreviewTruncated`；preview 按 Unicode code point 截取前 500 个字符。
+- `tool.failed` 使用 Design 中的 `toolName`、`durationMs`、`errorCode`、`message`；完整失败 envelope 只进入 ToolMessage。
+- AgentLoop 缺省 `tools` 时创建空 Registry；传入时保留同一实例，不复制注册项。
+
+#### 持久化、边界与工程约定
+
+- 用户消息、AssistantMessage、ToolMessage、final assistant 的持久化时机、maxIterations 计数和 Provider 空响应行为保持现有实现，不在本计划中改变。
+- 四个内置 Tool 的参数、成功 payload、分页、字符位置、跳过详情和错误语义完全采用 Design 第 7～13 节，不增加字段。
+- 文件名使用 kebab-case；测试放在根 `test/agent`、`test/core`、`test/cli`，通过 `@byte-mentor/*` public API 导入。
+- `packages/agent/src/index.ts` 只导出 CLI 组装、测试和调用方需要的公共类型、类与内置 Tool；Workspace 内部遍历 helper 不导出。
+- CLI 的 `CliConfig` 增加必填 `workspaceRoot: string`，值为 `loadCliConfig()` 收到的启动 `cwd`；`createRuntime()` 不再次读取全局 cwd。
+- 不增加运行时依赖，不创建新 workspace package，不修改通用 Message 为对象 payload，不引入写入、Shell、MCP、glob、正则或多 workspace roots。
 
 ## 3. 实现顺序
 
@@ -53,6 +204,22 @@ Review 重点：
 - Provider 适配契约与 Tool 运行时契约是否真正分离。
 - Registry 是否是唯一的 schema 校验、异常归一化和序列化边界。
 - 契约迁移是否没有把对象 payload 扩散到通用 Message 或 Provider 协议。
+
+TDD 小步：
+
+1. [x] `serializes a successful structured tool result`：迁移 JsonValue、ToolResult、AgentTool 与 ToolExecutionOutput 契约，并验证成功 envelope 的紧凑 JSON；实际新增 1 个目标测试，并迁移受契约影响的现有测试。
+2. [ ] `rejects invalid tool definitions during registration`：覆盖非法名称、空说明、无效 schema 和重名；预计 100～180 行。
+3. [ ] `normalizes registry execution boundary failures`：覆盖 unknown_tool、invalid_arguments 和 execute throw；预计 100～180 行。
+4. [ ] `rejects non-JSON tool payloads`：覆盖非有限数、bigint、循环引用和非普通对象；预计 80～150 行。
+5. [ ] `returns resource_limit when serialized output exceeds the hard limit`：验证超限后仍返回完整合法 JSON；预计 50～100 行。
+6. [ ] `projects only model-visible fields from registered tools`：验证稳定排序且不泄露 execute、concurrency 或 Runtime 属性；预计 50～100 行。
+7. [ ] `writes serialized tool envelopes into ToolMessage`：验证 Runner、Provider、checkpoint 和消息顺序在新契约下不回归；预计 100～180 行。
+
+开发进度：
+
+- 2026-07-25：Batch 1 / 小步 1 GREEN。Registry 返回结构化 `result` 与等价 JSON `content`；Runner 使用前者判断状态、后者写入 ToolMessage。全量 151 个测试、typecheck、lint、format check 通过。
+
+Batch 1 完成定义：以上小步全部 GREEN，受影响测试、全量测试、typecheck、lint 与 format check 通过；随后停下等待 Review，不自动进入 Batch 2。
 
 ### Batch 2: Workspace Policy、真实路径边界与执行上下文
 

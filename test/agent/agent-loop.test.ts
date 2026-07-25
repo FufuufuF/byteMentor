@@ -611,7 +611,7 @@ describe("AgentLoop.runTurn", () => {
       id: createMessageId(),
       role: "tool" as const,
       toolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     };
     await sessionStore.appendMessages(session.id, [previousUserMessage, storedAssistant]);
     await sessionStore.updateMetadata(session.id, () => ({
@@ -698,6 +698,7 @@ describe("AgentLoop.runTurn", () => {
     });
   });
 
+  // 验证 Loop 保存 Runner 产生的 assistant 调用、JSON 工具结果和最终回答完整轨迹。
   it("persists tool-call trace from runner", async () => {
     const toolCallId = createToolCallId();
     const provider = invokeProvider(async (req) => {
@@ -732,7 +733,7 @@ describe("AgentLoop.runTurn", () => {
       },
       async execute(args: unknown) {
         const a = args as { query: string };
-        return { ok: true, result: `result:${a.query}` };
+        return { ok: true, data: `result:${a.query}` };
       },
     });
 
@@ -755,12 +756,13 @@ describe("AgentLoop.runTurn", () => {
     expect(history[2]).toMatchObject({
       role: "tool",
       toolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     });
     expect(history[3]).toMatchObject({ role: "assistant", content: "found docs" });
     expect(result.finalMessage).toBe(history[3]);
   });
 
+  // 验证一次工具 turn 的 Loop 事件包含上下文、模型和工具阶段，并保持发生顺序。
   it("emits runtime event sequence for a tool turn", async () => {
     const toolCallId = createToolCallId();
     const provider = invokeProvider(async (req) => {
@@ -789,7 +791,7 @@ describe("AgentLoop.runTurn", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 
@@ -828,7 +830,7 @@ describe("AgentLoop.runTurn", () => {
     expect(result.events[5]).toMatchObject({
       type: "tool.completed",
       toolCallId,
-      result: "result:docs",
+      result: '{"ok":true,"data":"result:docs"}',
     });
     expect(result.events[8]).toMatchObject({
       type: "turn.completed",

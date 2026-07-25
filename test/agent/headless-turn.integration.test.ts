@@ -36,6 +36,7 @@ function invokeProvider(
 }
 
 describe("headless turn public API integration", () => {
+  // 验证外部调用方只通过包公开 API 即可完成模型请求、工具执行、JSON 回传和会话持久化。
   it("runs a tool-using headless turn through public package exports", async () => {
     const toolCallId = createToolCallId();
     const providerRequests: unknown[] = [];
@@ -78,7 +79,7 @@ describe("headless turn public API integration", () => {
       },
       async execute(args) {
         const a = args as { query: string };
-        return { ok: true, result: `docs:${a.query}` };
+        return { ok: true, data: `docs:${a.query}` };
       },
     };
     const sessionStore = new InMemorySessionStore();
@@ -115,7 +116,7 @@ describe("headless turn public API integration", () => {
     expect(history[2]).toMatchObject({
       role: "tool",
       toolCallId,
-      content: "docs:public api",
+      content: '{"ok":true,"data":"docs:public api"}',
     });
     expect(result.events.map((event) => event.type)).toEqual([
       "turn.started",
