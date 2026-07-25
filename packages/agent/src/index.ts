@@ -9,6 +9,7 @@ export * from "./tools/tool-registry.js";
 export * from "./tools/builtins/find-files.js";
 export * from "./tools/builtins/list-directory.js";
 export * from "./tools/builtins/read-file.js";
+export * from "./tools/builtins/search-text.js";
 export * from "./tools/workspace/workspace-policy.js";
 export * from "./tools/workspace/workspace-reader.js";
 export { AgentLoopStateError } from "./loop/turn-state.js";

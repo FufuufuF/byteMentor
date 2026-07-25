@@ -1,5 +1,5 @@
 import type { Stats } from "node:fs";
-import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, open, readFile, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { JsonObject, ToolErrorCode } from "../contracts.js";
 import type { WorkspaceAccessPolicy } from "./workspace-policy.js";
@@ -61,11 +61,44 @@ export interface WorkspaceTextWindow {
   nextPosition?: WorkspaceTextPosition;
 }
 
+export interface WorkspaceTextSearchMatch {
+  path: string;
+  line: number;
+  firstMatchColumn: number;
+  occurrenceCount: number;
+  preview: string;
+  previewRange: {
+    startColumn: number;
+    endColumn: number;
+  };
+  previewTruncated: boolean;
+}
+
+export type WorkspaceSkippedFileReason =
+  "binary" | "invalid_utf8" | "file_too_large" | "unreadable";
+
+export interface WorkspaceSkippedFile {
+  path: string;
+  reason: WorkspaceSkippedFileReason;
+}
+
+export interface WorkspaceTextSearch {
+  path: string;
+  matches: WorkspaceTextSearchMatch[];
+  skippedFileCount: number;
+  skippedFiles: WorkspaceSkippedFile[];
+}
+
 interface ReadTextWindowOptions {
   startLine: number;
   startColumn: number;
   lineLimit: number;
   maxCharacters: number;
+}
+
+interface SearchTextOptions {
+  query: string;
+  caseSensitive: boolean;
 }
 
 interface FileTraversalState {
@@ -248,6 +281,62 @@ export class WorkspaceReader {
     };
   }
 
+  // 在单文件或允许递归的目录内顺序搜索文本，并集中执行编码、跳过详情和扫描资源策略。
+  async searchText(path: string, options: SearchTextOptions): Promise<WorkspaceTextSearch> {
+    const resolvedPath = await this.resolvePath(path);
+    if (resolvedPath.type === "file") {
+      const matchResult = await this.searchSingleFile(resolvedPath.path, options, true);
+      return {
+        path: resolvedPath.path,
+        matches: matchResult.matches,
+        skippedFileCount: 0,
+        skippedFiles: [],
+      };
+    }
+    if (resolvedPath.type !== "directory") {
+      throw new WorkspaceError(
+        "wrong_path_type",
+        `workspace path is not a file or directory: ${resolvedPath.path}`,
+      );
+    }
+
+    const traversal = await this.walkFiles(resolvedPath.path);
+    const matches: WorkspaceTextSearchMatch[] = [];
+    const skippedFiles: WorkspaceSkippedFile[] = [];
+    let skippedFileCount = 0;
+    let scannedBytes = 0;
+    for (const file of traversal.files) {
+      if (file.sizeBytes > this.policy.limits.maxSearchFileBytes) {
+        skippedFileCount += 1;
+        appendSkippedFile(skippedFiles, file.path, "file_too_large", this.policy);
+        continue;
+      }
+      if (scannedBytes + file.sizeBytes > this.policy.limits.maxSearchTotalBytes) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `text search exceeds ${this.policy.limits.maxSearchTotalBytes} scanned bytes`,
+        );
+      }
+
+      const result = await this.searchSingleFile(file.path, options, false);
+      scannedBytes += result.scannedBytes;
+      if (scannedBytes > this.policy.limits.maxSearchTotalBytes) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `text search exceeds ${this.policy.limits.maxSearchTotalBytes} scanned bytes`,
+        );
+      }
+      if (result.skippedReason !== undefined) {
+        skippedFileCount += 1;
+        appendSkippedFile(skippedFiles, file.path, result.skippedReason, this.policy);
+        continue;
+      }
+      matches.push(...result.matches);
+    }
+    matches.sort(compareTextSearchMatches);
+    return { path: resolvedPath.path, matches, skippedFileCount, skippedFiles };
+  }
+
   // 拒绝绝对路径和词法越界，再生成位于工作区根目录内的绝对访问目标与规范相对路径。
   private resolveLexicalPath(path: string): { absolutePath: string; relativePath: string } {
     if (isAbsolute(path)) {
@@ -382,6 +471,175 @@ export class WorkspaceReader {
       metadata: await stat(canonicalPath),
     };
   }
+
+  // 读取并严格分类一个搜索候选；单文件调用把跳过原因提升为结构化错误，目录调用返回跳过状态。
+  private async searchSingleFile(
+    path: string,
+    options: SearchTextOptions,
+    failOnUnsupported: boolean,
+  ): Promise<{
+    matches: WorkspaceTextSearchMatch[];
+    scannedBytes: number;
+    skippedReason?: WorkspaceSkippedFileReason;
+  }> {
+    const absolutePath = resolve(this.workspaceRoot, path);
+    const metadata = await stat(absolutePath);
+    if (metadata.size > this.policy.limits.maxSearchFileBytes) {
+      if (failOnUnsupported) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `file exceeds ${this.policy.limits.maxSearchFileBytes} search bytes: ${path}`,
+        );
+      }
+      return { matches: [], scannedBytes: 0, skippedReason: "file_too_large" };
+    }
+    if (metadata.size > this.policy.limits.maxSearchTotalBytes) {
+      throw new WorkspaceError(
+        "resource_limit",
+        `text search exceeds ${this.policy.limits.maxSearchTotalBytes} scanned bytes`,
+      );
+    }
+
+    let bytes: Buffer;
+    try {
+      bytes = await readFile(absolutePath);
+    } catch (error) {
+      if (isPermissionError(error)) {
+        if (failOnUnsupported) {
+          throw new WorkspaceError("access_denied", `workspace file is unreadable: ${path}`);
+        }
+        return { matches: [], scannedBytes: 0, skippedReason: "unreadable" };
+      }
+      throw error;
+    }
+    if (bytes.length > this.policy.limits.maxSearchFileBytes) {
+      if (failOnUnsupported) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `file exceeds ${this.policy.limits.maxSearchFileBytes} search bytes: ${path}`,
+        );
+      }
+      return { matches: [], scannedBytes: bytes.length, skippedReason: "file_too_large" };
+    }
+
+    const decoded = decodeSearchText(bytes);
+    if (decoded.reason !== undefined) {
+      if (failOnUnsupported) {
+        throw new WorkspaceError(
+          "unsupported_content",
+          `workspace file is not supported UTF-8 text: ${path}`,
+        );
+      }
+      return { matches: [], scannedBytes: bytes.length, skippedReason: decoded.reason };
+    }
+    return {
+      matches: findTextMatches(path, decoded.text, options),
+      scannedBytes: bytes.length,
+    };
+  }
+}
+
+// 将目录搜索的跳过文件计入完整总数，并只保存 Policy 允许数量的稳定详情。
+function appendSkippedFile(
+  skippedFiles: WorkspaceSkippedFile[],
+  path: string,
+  reason: WorkspaceSkippedFileReason,
+  policy: WorkspaceAccessPolicy,
+): void {
+  if (skippedFiles.length < policy.limits.maxSkippedFileDetails) {
+    skippedFiles.push({ path, reason });
+  }
+}
+
+// 严格解码一个受单文件上限约束的 Buffer，并区分二进制 NUL 与非法 UTF-8。
+function decodeSearchText(
+  bytes: Buffer,
+): { text: string; reason?: undefined } | { text?: undefined; reason: "binary" | "invalid_utf8" } {
+  if (bytes.includes(0)) {
+    return { reason: "binary" };
+  }
+  const content =
+    bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf
+      ? bytes.subarray(3)
+      : bytes;
+  try {
+    return { text: new TextDecoder("utf-8", { fatal: true }).decode(content) };
+  } catch {
+    return { reason: "invalid_utf8" };
+  }
+}
+
+// 按逻辑行查找非重叠字面量，并为每条命中行生成一次有界预览。
+function findTextMatches(
+  path: string,
+  text: string,
+  options: SearchTextOptions,
+): WorkspaceTextSearchMatch[] {
+  const matches: WorkspaceTextSearchMatch[] = [];
+  const lines = parseTextLines(text, true);
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const occurrences = findLiteralOccurrences(line.body, options.query, options.caseSensitive);
+    if (occurrences.length === 0) {
+      continue;
+    }
+    const firstMatchIndex = occurrences[0]!;
+    const preview = createSearchPreview(line.body, firstMatchIndex);
+    matches.push({
+      path,
+      line: index + 1,
+      firstMatchColumn: firstMatchIndex + 1,
+      occurrenceCount: occurrences.length,
+      ...preview,
+    });
+  }
+  return matches;
+}
+
+// 在 code point 数组中执行可选大小写折叠的非重叠字面量匹配，保持原始列坐标稳定。
+function findLiteralOccurrences(line: string[], query: string, caseSensitive: boolean): number[] {
+  const queryCharacters = Array.from(query);
+  const normalizedQuery = queryCharacters.map((character) =>
+    caseSensitive ? character : character.toLowerCase(),
+  );
+  const occurrences: number[] = [];
+  for (let index = 0; index <= line.length - queryCharacters.length;) {
+    const matches = normalizedQuery.every((character, queryIndex) => {
+      const candidate = line[index + queryIndex]!;
+      return (caseSensitive ? candidate : candidate.toLowerCase()) === character;
+    });
+    if (matches) {
+      occurrences.push(index);
+      index += queryCharacters.length;
+    } else {
+      index += 1;
+    }
+  }
+  return occurrences;
+}
+
+// 以首次匹配前最多 150 个 code point 为锚点生成 300 字符预览，并在行尾附近向前补足窗口。
+function createSearchPreview(
+  line: string[],
+  firstMatchIndex: number,
+): Pick<WorkspaceTextSearchMatch, "preview" | "previewRange" | "previewTruncated"> {
+  let start = Math.max(0, firstMatchIndex - 150);
+  const end = Math.min(line.length, start + 300);
+  start = Math.max(0, end - 300);
+  return {
+    preview: line.slice(start, end).join(""),
+    previewRange: { startColumn: start + 1, endColumn: end },
+    previewTruncated: start > 0 || end < line.length,
+  };
+}
+
+// 按完整相对路径和行号排序匹配，使分页不依赖文件系统或读取完成顺序。
+function compareTextSearchMatches(
+  left: WorkspaceTextSearchMatch,
+  right: WorkspaceTextSearchMatch,
+): number {
+  const pathOrder = compareStrings(left.path, right.path);
+  return pathOrder === 0 ? left.line - right.line : pathOrder;
 }
 
 // 按递增块大小扫描文件，严格解码 UTF-8，并在窗口已确定时立即停止后续 I/O。
@@ -695,6 +953,16 @@ function isMissingPathError(error: unknown): boolean {
     return false;
   }
   return error.code === "ENOENT" || error.code === "ENOTDIR";
+}
+
+// 识别文件系统拒绝读取的错误，使单文件失败和目录跳过使用稳定语义。
+function isPermissionError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "EACCES" || error.code === "EPERM")
+  );
 }
 
 // 识别符号链接循环错误，使递归搜索跳过该入口而不是暴露底层 ELOOP。

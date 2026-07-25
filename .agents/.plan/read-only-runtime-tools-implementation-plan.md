@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 5 GREEN / 连续推进 Batch 6）
+- 状态：开发中（Batch 6 GREEN / 等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -479,6 +479,29 @@ Review 重点：
 - 搜索是否复用 Workspace 路径、遍历和编码能力，而非在 Tool 中建立第二套安全规则。
 - 一条结果是否代表一条匹配行，不是每次 substring 出现。
 - 总扫描或遍历硬上限是否中止为 `resource_limit`，没有返回易被误解为完整的部分成功。
+
+Batch 6 实施契约：
+
+- 公共入口导出无状态常量 `searchTextTool`，声明 `concurrency: "safe"`，通过 `ToolExecutionContext.workspaceReader` 搜索单文件或目录。
+- `WorkspaceReader.searchText(path, options)` 复用 `resolvePath()` 与 `walkFiles()`；Reader 负责严格 UTF-8/NUL 分类、顺序文件读取、总扫描计数、逐行字面量匹配、跳过详情和稳定排序，Tool 不复制路径或编码规则。
+- 单文件大于 `maxSearchFileBytes` 返回 `resource_limit`，二进制/非法 UTF-8 返回 `unsupported_content`，不可读返回 `access_denied`；目录搜索分别记录 `file_too_large`、`binary`、`invalid_utf8`、`unreadable`，并保留完整 `skippedFileCount` 与至多 `maxSkippedFileDetails` 条稳定详情。
+- 总扫描字节在启动下一文件前按已知大小检查，并在真实读取后再次校验；超过 `maxSearchTotalBytes` 返回 `resource_limit`，不交付部分匹配。目录遍历上限继续由 `walkFiles()` 统一执行。
+- 匹配只发生在单个逻辑行的 Unicode code point 数组内；大小写不敏感时逐 code point 折叠，同一行使用非重叠出现次数，首次位置和预览范围均为原始文本 1-based code point 列。
+- 预览最多 300 个 code point，以首次匹配前最多 150 个字符为锚点，靠近行尾时向前补足；行尾不进入预览。
+- Tool 负责 `offset + limit`、无总数分页和完整成功 envelope 输出预算；无法容纳下一条完整匹配时返回 `resource_limit`。
+
+Batch 6 TDD 状态：
+
+- [x] Batch 5 已以 `d9abe96 feat(agent): add windowed text file reader` 提交。
+- [x] RED：一次性完成单文件/目录匹配、Unicode 列与同行计数、预览、跳过详情、分页/输出预算、文件/总扫描/遍历上限、schema 和模型说明测试。
+- [x] 补充 RED：撤去不可读文件归一化后，真实权限测试按预期失败；恢复最小分支后 GREEN。
+- [x] GREEN：实现 Workspace 文本搜索与 `searchTextTool`，并通过全量验证。
+
+开发进度：
+
+- 2026-07-25：Batch 6 RED。新增 13 个真实文件系统与 Registry 纵向测试；覆盖单文件/目录字面量搜索、大小写、同行多次出现、Unicode 列、跨行隔离、300 字符预览、binary/invalid UTF-8/过大文件跳过及单文件失败、稳定分页、输出预算、总扫描/遍历上限、schema/Policy limit 与四段模型说明。定向测试 13 failed，全部按预期失败于公共入口尚未导出 `searchTextTool`。
+- 2026-07-25：Batch 6 补充 RED/GREEN。新增真实不可读文件测试，验证目录搜索返回受限 `unreadable` 详情、显式单文件搜索返回 `access_denied`；撤去实现时 1 failed、13 passed，恢复最小错误映射后 14 passed。
+- 2026-07-25：Batch 6 GREEN。WorkspaceReader 新增复用安全遍历的顺序内容搜索、严格内容分类、单文件与总扫描预算、Unicode 行匹配与预览；无状态 `searchTextTool` 完成默认值、无总数分页、输出预算、schema/说明和 WorkspaceError 映射。Batch 6 定向 14 个测试、全量 229 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 7: 只读 Tool Call 有界并发与 RuntimeEvent 收敛
 
