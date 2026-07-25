@@ -1,4 +1,5 @@
-import { lstat, realpath, stat } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { JsonObject, ToolErrorCode } from "../contracts.js";
 import type { WorkspaceAccessPolicy } from "./workspace-policy.js";
@@ -7,6 +8,20 @@ export interface WorkspaceResolvedPath {
   path: string;
   type: "file" | "directory" | "other";
   isSymbolicLink: boolean;
+}
+
+export interface WorkspaceDirectoryEntry {
+  name: string;
+  path: string;
+  type: "file" | "directory" | "symbolic_link" | "other";
+  access: "allowed" | "denied";
+  sizeBytes?: number;
+  targetType?: "file" | "directory" | "other" | "missing";
+}
+
+export interface WorkspaceDirectoryListing {
+  path: string;
+  entries: WorkspaceDirectoryEntry[];
 }
 
 export class WorkspaceError extends Error {
@@ -86,6 +101,26 @@ export class WorkspaceReader {
     };
   }
 
+  // 列举一个允许访问目录的直接子项，并集中处理稳定排序、链接目标和 denied 最小元数据。
+  async listDirectory(path: string): Promise<WorkspaceDirectoryListing> {
+    const resolvedDirectory = await this.resolvePath(path);
+    if (resolvedDirectory.type !== "directory") {
+      throw new WorkspaceError(
+        "wrong_path_type",
+        `workspace path is not a directory: ${resolvedDirectory.path}`,
+      );
+    }
+
+    const absoluteDirectory = resolve(this.workspaceRoot, resolvedDirectory.path);
+    const directoryEntries = await readdir(absoluteDirectory);
+    const entries: WorkspaceDirectoryEntry[] = [];
+    for (const name of directoryEntries) {
+      entries.push(await this.describeDirectoryEntry(resolvedDirectory.path, name));
+    }
+    entries.sort(compareDirectoryEntries);
+    return { path: resolvedDirectory.path, entries };
+  }
+
   // 拒绝绝对路径和词法越界，再生成位于工作区根目录内的绝对访问目标与规范相对路径。
   private resolveLexicalPath(path: string): { absolutePath: string; relativePath: string } {
     if (isAbsolute(path)) {
@@ -99,6 +134,70 @@ export class WorkspaceReader {
     }
     return { absolutePath, relativePath: toWorkspacePath(relativePath) };
   }
+
+  // 读取单个直接子项的安全元数据；被拒绝的路径仅保留名称、路径、类型和访问状态。
+  private async describeDirectoryEntry(
+    directoryPath: string,
+    name: string,
+  ): Promise<WorkspaceDirectoryEntry> {
+    const path = directoryPath === "." ? name : `${directoryPath}/${name}`;
+    const metadata = await lstat(resolve(this.workspaceRoot, path));
+    const type = toDirectoryEntryType(metadata);
+
+    try {
+      const resolvedEntry = await this.resolvePath(path);
+      if (type === "symbolic_link") {
+        return {
+          name,
+          path,
+          type,
+          access: "allowed",
+          targetType: resolvedEntry.type,
+        };
+      }
+      return {
+        name,
+        path,
+        type,
+        access: "allowed",
+        ...(type === "file" ? { sizeBytes: metadata.size } : {}),
+      };
+    } catch (error) {
+      if (error instanceof WorkspaceError && error.code === "access_denied") {
+        return { name, path, type, access: "denied" };
+      }
+      if (
+        type === "symbolic_link" &&
+        error instanceof WorkspaceError &&
+        error.code === "path_not_found"
+      ) {
+        return { name, path, type, access: "allowed", targetType: "missing" };
+      }
+      throw error;
+    }
+  }
+}
+
+// 将 lstat 元数据归一化为模型可见的目录项类型，并保留符号链接自身而不是目标类型。
+function toDirectoryEntryType(metadata: Stats): WorkspaceDirectoryEntry["type"] {
+  if (metadata.isSymbolicLink()) {
+    return "symbolic_link";
+  }
+  if (metadata.isFile()) {
+    return "file";
+  }
+  if (metadata.isDirectory()) {
+    return "directory";
+  }
+  return "other";
+}
+
+// 使用 JavaScript Unicode 字符串顺序比较名称，避免依赖平台或进程 locale 的排序差异。
+function compareDirectoryEntries(
+  left: WorkspaceDirectoryEntry,
+  right: WorkspaceDirectoryEntry,
+): number {
+  return left.name < right.name ? -1 : left.name > right.name ? 1 : 0;
 }
 
 // 判断 path.relative 的结果是否位于基准目录之外，并避免字符串前缀碰撞。

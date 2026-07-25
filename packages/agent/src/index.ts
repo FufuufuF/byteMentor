@@ -6,6 +6,7 @@ export * from "./providers/provider.js";
 export type { RuntimeCheckpoint } from "./loop/runtime-checkpoint.js";
 export * from "./tools/contracts.js";
 export * from "./tools/tool-registry.js";
+export * from "./tools/builtins/list-directory.js";
 export * from "./tools/workspace/workspace-policy.js";
 export * from "./tools/workspace/workspace-reader.js";
 export { AgentLoopStateError } from "./loop/turn-state.js";

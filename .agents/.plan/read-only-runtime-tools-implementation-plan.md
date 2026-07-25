@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 2 GREEN / 等待 Review）
+- 状态：开发中（Batch 3 GREEN / 等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -320,6 +320,25 @@ Review 重点：
 - 禁止项是否只返回设计允许的最小信息。
 - Tool 是否只是 WorkspaceReader 的模型面向映射，没有复制路径安全逻辑。
 - 分页与输出预算是否同时生效且返回合法 JSON。
+
+Batch 3 实施契约：
+
+- 公共入口导出无状态常量 `listDirectoryTool`；它声明 `concurrency: "safe"`，并通过 `ToolExecutionContext.workspaceReader` 访问工作区。
+- `WorkspaceReader.listDirectory(path)` 返回规范化目录路径和完整的直接子项集合；Reader 负责路径/符号链接安全、最小 denied 元数据和平台无关稳定排序，不负责模型参数默认值或分页。
+- Tool 负责 `path = "."`、`offset = 0` 和 Policy `defaultResultLimit` 默认值，校验 Policy `maxResultLimit`，再执行无状态 `offset + limit` 分页。
+- 输出预算按 Registry 最终生成的完整 `{ ok: true, data }` 紧凑 JSON envelope 计算。若加入下一条会超限，当前页返回 `truncatedBy: "output_limit"`、`hasMore: true` 和 `nextOffset = offset + returned`；若连当前 offset 的单个条目都无法容纳，则返回 `resource_limit`，避免返回无法前进的相同 offset。
+- Tool 只把预期 `WorkspaceError` 转成同码失败 ToolResult；未预期异常继续抛出，由 Registry 统一归一化为 `execution_failed`。
+
+Batch 3 TDD 状态：
+
+- [x] Batch 2 已以 `cef0d78 feat(agent): enforce workspace read boundaries` 提交。
+- [x] RED：一次性完成 `list_directory` 的条目、符号链接、denied 最小暴露、分页、参数、错误、输出预算和模型说明测试。
+- [x] GREEN：实现 WorkspaceReader 目录列举与 `listDirectoryTool`，并通过全量验证。
+
+开发进度：
+
+- 2026-07-25：Batch 3 RED。新增 12 个真实文件系统与 Registry 纵向测试；覆盖普通条目稳定排序和元数据、工作区内/断裂/敏感/外部符号链接、denied 最小暴露和禁止进入、真实 `..` 工作区越界与外部目录链接的直接列举拒绝、默认值、分页空页、schema 与 Policy limit、wrong_path_type、完整成功 envelope 输出预算以及四段模型说明。定向测试 12 failed，全部按预期失败于公共入口尚未导出 `listDirectoryTool`；typecheck、lint 和 format check 通过，未写 Batch 3 生产代码。
+- 2026-07-25：Batch 3 GREEN。WorkspaceReader 异步列举直接子项并集中完成稳定排序、文件大小、链接目标分类及 denied 最小元数据；无状态 `listDirectoryTool` 提供完整模型说明/schema、Policy 默认值与上限、offset 分页、精确成功 envelope 输出预算和 WorkspaceError 映射。Batch 3 定向 12 个测试、全量 188 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 4: `find_files` 纵向切片
 
