@@ -13,6 +13,18 @@ function makeTool(name: string): AgentTool {
   };
 }
 
+// 执行一次注册并确认它抛出指定类型的配置错误；如果没有抛错，本身就构成测试失败。
+function expectRegistrationError(register: () => void, expectedErrorName: string): void {
+  let thrown: unknown;
+  try {
+    register();
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown).toBeInstanceOf(Error);
+  expect(thrown).toMatchObject({ name: expectedErrorName });
+}
+
 describe("ToolRegistry.register", () => {
   it("register makes a tool available via list", () => {
     const registry = new ToolRegistry();
@@ -38,6 +50,46 @@ describe("ToolRegistry.register", () => {
     registry.register(makeTool("beta"));
     registry.register(makeTool("gamma"));
     expect(registry.list().length).toBe(3);
+  });
+
+  // 工具名称会进入模型调用协议；这里验证大写开头、非法分隔符、非法首字符和超长名称都会在启动期被拒绝。
+  it("rejects tool names outside the runtime naming contract", () => {
+    for (const name of ["Search", "search-tool", "_search", "a".repeat(65)]) {
+      const registry = new ToolRegistry();
+      expectRegistrationError(
+        () => registry.register(makeTool(name)),
+        "InvalidToolDefinitionError",
+      );
+    }
+  });
+
+  // 空白说明无法帮助模型选择工具；这里验证 Registry 在注册时拒绝 trim 后为空的 description。
+  it("rejects an empty tool description", () => {
+    const registry = new ToolRegistry();
+    expectRegistrationError(
+      () => registry.register({ ...makeTool("search"), description: "   " }),
+      "InvalidToolDefinitionError",
+    );
+  });
+
+  // 参数 schema 属于开发期配置；这里验证无法被 Ajv 编译的 schema 在注册时立即暴露，而不是延迟到模型调用后。
+  it("rejects an invalid parameters schema during registration", () => {
+    const registry = new ToolRegistry();
+    expectRegistrationError(
+      () =>
+        registry.register({
+          ...makeTool("search"),
+          parametersJsonSchema: "not-a-schema",
+        }),
+      "InvalidToolDefinitionError",
+    );
+  });
+
+  // 同名工具会让实际执行目标不明确；这里验证第二次注册不会静默覆盖第一次注册。
+  it("rejects a duplicate tool name", () => {
+    const registry = new ToolRegistry();
+    registry.register(makeTool("search"));
+    expectRegistrationError(() => registry.register(makeTool("search")), "DuplicateToolError");
   });
 });
 

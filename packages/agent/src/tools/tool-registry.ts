@@ -3,12 +3,49 @@ import type { ToolDefinition } from "../providers/provider.js";
 import type { AgentTool, ToolExecutionOutput, ToolResult } from "./contracts.js";
 
 const ajv = new Ajv({ allErrors: true });
+const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+
+export class InvalidToolDefinitionError extends Error {
+  // 创建一个启动期配置错误，指出工具定义中无法注册的字段或 schema。
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidToolDefinitionError";
+  }
+}
+
+export class DuplicateToolError extends Error {
+  // 创建一个重名错误，阻止后注册的工具静默替换已有执行目标。
+  constructor(toolName: string) {
+    super(`tool already registered: ${toolName}`);
+    this.name = "DuplicateToolError";
+  }
+}
 
 export class ToolRegistry {
   private readonly tools = new Map<string, AgentTool>();
   private readonly validators = new WeakMap<AgentTool, ValidateFunction>();
 
+  // 在保存工具前校验模型可见元数据、重名和参数 schema，确保配置错误在启动期暴露。
   register(tool: AgentTool): void {
+    if (!TOOL_NAME_PATTERN.test(tool.name)) {
+      throw new InvalidToolDefinitionError(`invalid tool name: ${tool.name}`);
+    }
+    if (tool.description.trim().length === 0) {
+      throw new InvalidToolDefinitionError(`tool description must not be empty: ${tool.name}`);
+    }
+    if (this.tools.has(tool.name)) {
+      throw new DuplicateToolError(tool.name);
+    }
+    if (tool.parametersJsonSchema !== undefined) {
+      try {
+        this.getValidator(tool);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new InvalidToolDefinitionError(
+          `invalid parametersJsonSchema for ${tool.name}: ${message}`,
+        );
+      }
+    }
     this.tools.set(tool.name, tool);
   }
 

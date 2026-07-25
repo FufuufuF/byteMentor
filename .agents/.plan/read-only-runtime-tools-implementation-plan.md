@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 1 / TDD 小步 1 已完成）
+- 状态：开发中（Batch 1 / TDD 小步 2 GREEN）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -208,7 +208,7 @@ Review 重点：
 TDD 小步：
 
 1. [x] `serializes a successful structured tool result`：迁移 JsonValue、ToolResult、AgentTool 与 ToolExecutionOutput 契约，并验证成功 envelope 的紧凑 JSON；实际新增 1 个目标测试，并迁移受契约影响的现有测试。
-2. [ ] `rejects invalid tool definitions during registration`：覆盖非法名称、空说明、无效 schema 和重名；预计 100～180 行。
+2. [x] `rejects invalid tool definitions during registration`：覆盖非法名称、空说明、无效 schema 和重名；注册期快速失败已实现。
 3. [ ] `normalizes registry execution boundary failures`：覆盖 unknown_tool、invalid_arguments 和 execute throw；预计 100～180 行。
 4. [ ] `rejects non-JSON tool payloads`：覆盖非有限数、bigint、循环引用和非普通对象；预计 80～150 行。
 5. [ ] `returns resource_limit when serialized output exceeds the hard limit`：验证超限后仍返回完整合法 JSON；预计 50～100 行。
@@ -218,6 +218,8 @@ TDD 小步：
 开发进度：
 
 - 2026-07-25：Batch 1 / 小步 1 GREEN。Registry 返回结构化 `result` 与等价 JSON `content`；Runner 使用前者判断状态、后者写入 ToolMessage。全量 151 个测试、typecheck、lint、format check 通过。
+- 2026-07-25：Batch 1 / 小步 2 RED。新增 4 个注册期完整性测试；当前 Registry 对非法名称、空说明、无效 schema 和重名均未抛错，目标测试按预期失败（4 failed、6 passed）。
+- 2026-07-25：Batch 1 / 小步 2 GREEN。新增 `InvalidToolDefinitionError`、`DuplicateToolError` 和注册期名称、说明、schema、重名校验；移除无效 schema 延迟到 execute 的旧测试。全量 154 个测试、typecheck、lint、format check 通过。
 
 Batch 1 完成定义：以上小步全部 GREEN，受影响测试、全量测试、typecheck、lint 与 format check 通过；随后停下等待 Review，不自动进入 Batch 2。
 

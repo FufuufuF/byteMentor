@@ -172,27 +172,6 @@ describe("ToolRegistry.execute invalid args", () => {
       expect(r.error.kind).toBe("invalid_args");
     }
   });
-
-  // 验证当前兼容行为：无效 schema 在执行时被归一化为 invalid_args，而不是让 Promise reject。
-  it("returns invalid_args instead of rejecting when parametersJsonSchema is invalid", async () => {
-    const registry = new ToolRegistry();
-    registry.register({
-      name: "bad-schema",
-      description: "bad schema",
-      parametersJsonSchema: "not-an-object",
-      async execute() {
-        return { ok: true, data: "should not run" };
-      },
-    });
-
-    const r = (await registry.execute("bad-schema", {})).result;
-
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
-      expect(r.error.message).toContain("invalid parametersJsonSchema");
-    }
-  });
 });
 
 describe("ToolRegistry.execute tool throws", () => {
