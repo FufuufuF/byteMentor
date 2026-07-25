@@ -72,6 +72,20 @@ describe("agent tool type contracts", () => {
     expect(tool.parametersJsonSchema).toBeDefined();
   });
 
+  // 并发资格只描述 Runtime 调度能力；这里验证 AgentTool 可以显式声明 safe，供 Registry 查询。
+  it("AgentTool can declare runtime-only safe concurrency", () => {
+    const tool: AgentTool = {
+      name: "lookup",
+      description: "lookup docs",
+      concurrency: "safe",
+      async execute() {
+        return { ok: true, data: [] };
+      },
+    };
+
+    expect(tool.concurrency).toBe("safe");
+  });
+
   it("ToolDefinition exposes name, description, optional schema", () => {
     const def: ToolDefinition = {
       name: "search",

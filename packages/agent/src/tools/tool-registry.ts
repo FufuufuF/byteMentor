@@ -4,6 +4,11 @@ import type { AgentTool, JsonValue, ToolExecutionOutput, ToolResult } from "./co
 
 const ajv = new Ajv({ allErrors: true });
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
+const DEFAULT_MAX_SERIALIZED_TOOL_RESULT_CHARACTERS = 24_000;
+
+export interface ToolRegistryOptions {
+  maxSerializedToolResultCharacters?: number;
+}
 
 export class InvalidToolDefinitionError extends Error {
   // 创建一个启动期配置错误，指出工具定义中无法注册的字段或 schema。
@@ -24,6 +29,13 @@ export class DuplicateToolError extends Error {
 export class ToolRegistry {
   private readonly tools = new Map<string, AgentTool>();
   private readonly validators = new WeakMap<AgentTool, ValidateFunction>();
+  private readonly maxSerializedToolResultCharacters: number;
+
+  // 固定 Registry 的最终序列化字符上限；调用方未配置时使用设计约定的 24,000 字符。
+  constructor(options: ToolRegistryOptions = {}) {
+    this.maxSerializedToolResultCharacters =
+      options.maxSerializedToolResultCharacters ?? DEFAULT_MAX_SERIALIZED_TOOL_RESULT_CHARACTERS;
+  }
 
   // 在保存工具前校验模型可见元数据、重名和参数 schema，确保配置错误在启动期暴露。
   register(tool: AgentTool): void {
@@ -61,32 +73,46 @@ export class ToolRegistry {
       .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   }
 
+  // 返回指定工具的 Runtime 调度资格；未知或未声明 safe 的工具一律采用保守串行策略。
+  getConcurrency(name: string): "safe" | "serial" {
+    return this.tools.get(name)?.concurrency === "safe" ? "safe" : "serial";
+  }
+
   // 执行一个已注册工具，同时返回供 Runtime 判断状态的对象结果和供 ToolMessage 使用的 JSON 字符串。
   async execute(name: string, args: unknown): Promise<ToolExecutionOutput> {
     const tool = this.tools.get(name);
     if (tool === undefined) {
-      return toExecutionOutput({
-        ok: false,
-        error: { code: "unknown_tool", message: `tool not registered: ${name}` },
-      });
+      return toExecutionOutput(
+        {
+          ok: false,
+          error: { code: "unknown_tool", message: `tool not registered: ${name}` },
+        },
+        this.maxSerializedToolResultCharacters,
+      );
     }
     const invalidArgsMessage = this.validateArgs(tool, args);
     if (invalidArgsMessage !== undefined) {
-      return toExecutionOutput({
-        ok: false,
-        error: { code: "invalid_arguments", message: invalidArgsMessage },
-      });
+      return toExecutionOutput(
+        {
+          ok: false,
+          error: { code: "invalid_arguments", message: invalidArgsMessage },
+        },
+        this.maxSerializedToolResultCharacters,
+      );
     }
     try {
-      return toExecutionOutput(await tool.execute(args));
+      return toExecutionOutput(await tool.execute(args), this.maxSerializedToolResultCharacters);
     } catch (e) {
-      return toExecutionOutput({
-        ok: false,
-        error: {
-          code: "execution_failed",
-          message: e instanceof Error ? e.message : String(e),
+      return toExecutionOutput(
+        {
+          ok: false,
+          error: {
+            code: "execution_failed",
+            message: e instanceof Error ? e.message : String(e),
+          },
         },
-      });
+        this.maxSerializedToolResultCharacters,
+      );
     }
   }
 
@@ -117,8 +143,11 @@ export class ToolRegistry {
   }
 }
 
-// 校验并序列化归一化结果；违规 payload 会先替换为稳定的 execution_failed，避免 JSON 静默改值或丢字段。
-function toExecutionOutput(result: ToolResult): ToolExecutionOutput {
+// 校验并序列化归一化结果；违规或超限 payload 会替换为较小的结构化失败，始终返回完整 JSON。
+function toExecutionOutput(
+  result: ToolResult,
+  maxSerializedToolResultCharacters: number,
+): ToolExecutionOutput {
   const safeResult: ToolResult = isJsonValue(result)
     ? result
     : {
@@ -128,9 +157,21 @@ function toExecutionOutput(result: ToolResult): ToolExecutionOutput {
           message: "tool returned a result that is not JSON-compatible",
         },
       };
+  const content = JSON.stringify(safeResult);
+  if (content.length <= maxSerializedToolResultCharacters) {
+    return { result: safeResult, content };
+  }
+
+  const limitedResult: ToolResult = {
+    ok: false,
+    error: {
+      code: "resource_limit",
+      message: `serialized tool result exceeds ${maxSerializedToolResultCharacters} characters`,
+    },
+  };
   return {
-    result: safeResult,
-    content: JSON.stringify(safeResult),
+    result: limitedResult,
+    content: JSON.stringify(limitedResult),
   };
 }
 

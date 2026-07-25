@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 1 / TDD 小步 4 GREEN）
+- 状态：开发中（Batch 1 GREEN，等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -16,6 +16,8 @@
 - Batch 以完整的行为边界拆分，不为了追求小行数而把同一能力的契约、测试和实现拆到多个 commit。
 - 每个 Batch 完成后先停下等待 Review，不自动进入下一批。
 - 不引入新的运行时依赖；文件系统能力使用 Node.js 异步 API，schema 校验继续使用现有 Ajv。
+- 从 2026-07-25 的 Batch 1 剩余工作开始，以整个 Batch 为 TDD 反馈单位：先一次性写完本 Batch 全部目标测试并确认 RED，再统一完成生产代码、全量验证和 GREEN Review；不再为 Batch 内部小步设置 RED/GREEN 暂停点。
+- Batch 1 已经产生的小步提交保留，不重写历史；后续 Batch 恢复“一个 Batch 对应一个 commit”。
 
 ### 2.1 实施契约与行为决策
 
@@ -211,9 +213,9 @@ TDD 小步：
 2. [x] `rejects invalid tool definitions during registration`：覆盖非法名称、空说明、无效 schema 和重名；注册期快速失败已实现。
 3. [x] `normalizes registry execution boundary failures`：覆盖 unknown_tool、invalid_arguments 和 execute throw；结构化错误与失败 JSON 已实现。
 4. [x] `rejects non-JSON tool payloads`：覆盖 undefined、非有限数、bigint、函数、symbol、稀疏数组、循环引用和非普通对象；违规结果归一化已实现。
-5. [ ] `returns resource_limit when serialized output exceeds the hard limit`：验证超限后仍返回完整合法 JSON；预计 50～100 行。
-6. [ ] `projects only model-visible fields from registered tools`：验证稳定排序且不泄露 execute、concurrency 或 Runtime 属性；预计 50～100 行。
-7. [ ] `writes serialized tool envelopes into ToolMessage`：验证 Runner、Provider、checkpoint 和消息顺序在新契约下不回归；预计 100～180 行。
+5. [x] `returns resource_limit when serialized output exceeds the hard limit`：成功数据或失败 details 超限后返回完整、受限的合法 JSON；默认上限为 24,000 字符。
+6. [x] `projects only model-visible fields from registered tools`：稳定排序和模型字段投影保持兼容；Registry 提供并发资格查询，未声明或未知工具默认串行。
+7. [x] `writes serialized tool envelopes into ToolMessage`：Runner 对成功与失败 envelope、Provider 映射、checkpoint 和消息顺序均通过回归测试。
 
 开发进度：
 
@@ -224,6 +226,9 @@ TDD 小步：
 - 2026-07-25：Batch 1 / 小步 3 GREEN。`ToolError` 收敛为完整错误码联合与可选 details，Registry 统一生成 unknown_tool、invalid_arguments、execution_failed，并拒绝无 schema 时的非对象参数；失败对象与 ToolMessage JSON 保持一致。全量 154 个测试、typecheck、lint、format check 通过。
 - 2026-07-25：Batch 1 / 小步 4 RED。新增成功 data 与失败 details 的 JSON 安全边界测试；当前 Registry 会静默丢失 undefined 等字段、改变部分值或接受非普通对象，没有统一替换为 execution_failed（2 failed、10 passed）。
 - 2026-07-25：Batch 1 / 小步 4 GREEN。Registry 在唯一序列化入口递归验证完整 ToolResult，只接受 JSON primitive、密集数组和普通对象，拒绝循环引用及所有会被 JSON 静默改变的值；违规结果替换为可序列化的 execution_failed。全量 156 个测试、typecheck、lint、format check 通过。
+- 2026-07-25：Batch 1 / 小步 5 RED。新增成功 data 与失败 details 的序列化硬上限测试；当前 ToolRegistry 忽略 `maxSerializedToolResultCharacters` 配置并直接返回超限结果（1 failed、12 passed）。
+- 2026-07-25：按用户要求切换为 Batch 级 TDD，并一次性补齐 Batch 1 剩余测试：增加默认 24,000 字符上限、成功/失败超限、并发资格查询与模型可见字段隔离、Runner 失败 envelope 集成测试。Batch 1 定向测试当前 4 failed、60 passed；失败原因仅为序列化上限和 `getConcurrency()` 尚未实现。
+- 2026-07-25：Batch 1 GREEN。ToolRegistry 支持可配置序列化上限和默认 24,000 字符限制，超限结果归一化为 resource_limit；新增 runtime-only 并发资格查询，list() 继续只投影 Provider 可见字段；Runner 成功、失败 envelope 及既有 checkpoint/消息顺序回归通过。全量 162 个测试、typecheck、lint、format check 通过。
 
 Batch 1 完成定义：以上小步全部 GREEN，受影响测试、全量测试、typecheck、lint 与 format check 通过；随后停下等待 Review，不自动进入 Batch 2。
 

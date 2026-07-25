@@ -285,3 +285,65 @@ describe("ToolRegistry.execute JSON result boundary", () => {
     expect(JSON.parse(output.content)).toEqual(output.result);
   });
 });
+
+describe("ToolRegistry.execute serialized output limit", () => {
+  // 大型成功数据和错误 details 都会进入 ToolMessage；这里验证二者超过 Registry 硬上限时不会返回部分 JSON。
+  // Registry 应改为较小的 resource_limit 失败结果，并保证 content 完整可解析且不超过配置上限。
+  it("returns resource_limit when a serialized result exceeds the hard limit", async () => {
+    const maxSerializedToolResultCharacters = 200;
+    const registry = new ToolRegistry({ maxSerializedToolResultCharacters });
+    registry.register({
+      name: "oversized_success",
+      description: "returns oversized success data",
+      async execute() {
+        return { ok: true, data: "x".repeat(500) };
+      },
+    });
+    registry.register({
+      name: "oversized_failure",
+      description: "returns oversized error details",
+      async execute() {
+        return {
+          ok: false,
+          error: {
+            code: "path_not_found",
+            message: "missing",
+            details: { attemptedPath: "x".repeat(500) },
+          },
+        };
+      },
+    });
+
+    for (const name of ["oversized_success", "oversized_failure"]) {
+      const output = await registry.execute(name, {});
+
+      expect(output.result).toMatchObject({
+        ok: false,
+        error: { code: "resource_limit" },
+      });
+      expect(JSON.parse(output.content)).toEqual(output.result);
+      expect(output.content.length).toBeLessThanOrEqual(maxSerializedToolResultCharacters);
+    }
+  });
+
+  // 调用方未配置上限时应使用设计确定的 24,000 字符默认值；这里验证超出默认值的结果同样被拒绝。
+  it("uses a 24,000 character serialized output limit by default", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "default_limit",
+      description: "returns data above the default output limit",
+      async execute() {
+        return { ok: true, data: "x".repeat(24_000) };
+      },
+    });
+
+    const output = await registry.execute("default_limit", {});
+
+    expect(output.result).toMatchObject({
+      ok: false,
+      error: { code: "resource_limit" },
+    });
+    expect(JSON.parse(output.content)).toEqual(output.result);
+    expect(output.content.length).toBeLessThanOrEqual(24_000);
+  });
+});

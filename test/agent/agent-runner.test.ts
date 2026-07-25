@@ -283,6 +283,64 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  // 工具返回预期失败时，Runner 应把完整错误 envelope 写入 ToolMessage，并继续把该消息交给模型生成最终回答。
+  it("writes a serialized tool failure before the final provider response", async () => {
+    const inputMessages: Message[] = [
+      { id: createMessageId(), role: "user", content: "read missing file" },
+    ];
+    const toolCallId = createToolCallId();
+    const provider = invokeProvider(async (req) =>
+      req.messages.length === 1
+        ? {
+            message: {
+              role: "assistant",
+              toolCalls: [{ id: toolCallId, name: "read_file", args: { path: "missing.txt" } }],
+            },
+            stopReason: "tool_calls",
+          }
+        : {
+            message: { role: "assistant", content: "The file does not exist." },
+            stopReason: "completed",
+          },
+    );
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "read_file",
+      description: "read one file",
+      async execute() {
+        return {
+          ok: false,
+          error: {
+            code: "path_not_found",
+            message: "missing file",
+            details: { path: "missing.txt" },
+          },
+        };
+      },
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: inputMessages,
+      tools,
+    });
+
+    expect(result.stopReason).toBe("completed");
+    const toolMessage = result.newMessages[1] as ToolMessage;
+    expect(JSON.parse(toolMessage.content)).toEqual({
+      ok: false,
+      error: {
+        code: "path_not_found",
+        message: "missing file",
+        details: { path: "missing.txt" },
+      },
+    });
+    expect(result.newMessages[2]).toMatchObject({
+      role: "assistant",
+      content: "The file does not exist.",
+    });
+  });
+
   // 验证工具执行前后的 checkpoint 分别记录待执行调用和已经序列化的工具结果。
   it("checkpoints tool calls before and after execution", async () => {
     const toolCallId = createToolCallId();

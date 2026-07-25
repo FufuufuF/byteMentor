@@ -119,3 +119,33 @@ describe("ToolRegistry.list sort order", () => {
     expect(registry.list()).toEqual([]);
   });
 });
+
+describe("ToolRegistry runtime metadata boundary", () => {
+  // concurrency 只供 Runner 决定调度方式；这里验证 Registry 能读取该属性，但 list() 给模型的定义不会泄露它或其他运行时字段。
+  it("keeps concurrency and runtime fields out of model-visible definitions", () => {
+    const registry = new ToolRegistry();
+    const tool = {
+      ...makeTool("search"),
+      concurrency: "safe" as const,
+      runtimeContext: { secret: true },
+    };
+    registry.register(tool);
+
+    expect(registry.getConcurrency("search")).toBe("safe");
+    expect(registry.list()).toEqual([
+      {
+        name: "search",
+        description: "search tool",
+      },
+    ]);
+  });
+
+  // 未声明并发资格的工具以及未知名称都必须采用保守串行策略，避免未来写入工具被意外并发执行。
+  it("treats undeclared and unknown tools as serial", () => {
+    const registry = new ToolRegistry();
+    registry.register(makeTool("search"));
+
+    expect(registry.getConcurrency("search")).toBe("serial");
+    expect(registry.getConcurrency("missing")).toBe("serial");
+  });
+});
