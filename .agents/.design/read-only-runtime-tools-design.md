@@ -81,6 +81,25 @@ CLI 的 `createRuntime()` 负责：
 
 `AgentLoop` 不根据 `workspaceRoot` 创建具体 Tool，避免编排层依赖文件系统实现。为兼容现有测试，`AgentLoop` 的 `tools` 输入可以缺省；缺省时使用空 Registry。真实 CLI 运行路径必须显式注入配置好的 Registry。
 
+### 5.3 只读 Tool 的有界并发
+
+第一阶段在两个层次上处理并发：
+
+1. Tool 内部的文件系统访问使用 Node.js 异步 API，例如 `node:fs/promises`，不使用会阻塞事件循环的同步文件 API。Promise 是非阻塞 I/O 的基础，不代表单次读取本身会更快。
+2. 当模型在同一个 AssistantMessage 中返回多个独立的只读 Tool Call 时，Runtime 使用受限并发调度它们，使多个 I/O 等待可以重叠。
+
+Tool Call 调度使用计数信号量或等价的并发限制器，而不是互斥锁。第一阶段的 `maxConcurrentToolCalls` 默认为 4，由 Runtime 配置，模型不能通过 Tool 参数修改该上限。不使用无上限的 `Promise.all` 启动任意数量的调用。
+
+并发资格是 Runtime 内部的显式执行属性，不暴露给模型：
+
+- `list_directory`、`find_files`、`search_text` 和 `read_file` 明确允许并发。
+- 未明确声明可并发的 Tool 默认串行，不仅根据 Tool 名称或描述推断其安全性。
+- 未来的写入、编辑和 Shell Tool 的调度规则留待对应的安全设计确认。
+
+同一批调用全部完成后，ToolMessage 必须按 AssistantMessage 中原始 Tool Call 的顺序加入模型轨迹，不由实际完成顺序决定，从而保持消息、checkpoint 和恢复行为稳定。单个调用失败不取消同批的其他只读调用；Registry 分别将每个结果归一化为结构化 ToolResult。
+
+第一阶段不在单个 `find_files` 或 `search_text` 内部引入多文件并发 worker pool；目录遍历、稳定排序和资源计数仍在单个 Tool 内按确定性流程执行。如果后续性能测量表明必要，再在不改变 Tool 契约的前提下增加 Tool 内部的有界 I/O 并发。
+
 ## 6. 模块边界
 
 第一阶段继续把 Tool 体系放在 `@byte-mentor/agent` 内，不创建新的 workspace package。
@@ -652,6 +671,9 @@ type ToolFailedEvent = {
 
 - Tool 注册期快速失败和重复名称拒绝。
 - ToolExecutionContext 被正确注入具体 Tool。
+- 同一 AssistantMessage 中的四个内置只读 Tool Call 按 `maxConcurrentToolCalls` 有界并发，且运行中的调用数从不超过上限。
+- 未声明可并发的 Tool 保持串行，并发完成顺序不改变 ToolMessage 的原始调用顺序。
+- 一个只读 Tool Call 失败时，同批的其他调用仍会完成并各自返回结构化结果。
 - ToolResult 被序列化为合法 JSON ToolMessage。
 - Tool RuntimeEvent 只携带最多 500 字符的结果预览、耗时和错误元数据，不复制完整结果。
 - checkpoint、消息顺序和现有恢复行为不退化。
