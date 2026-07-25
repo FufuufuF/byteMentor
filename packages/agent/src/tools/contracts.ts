@@ -8,11 +8,20 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
-export type ToolErrorKind = "unknown_tool" | "invalid_args" | "execution_failed";
+export type ToolErrorCode =
+  | "unknown_tool"
+  | "invalid_arguments"
+  | "path_not_found"
+  | "access_denied"
+  | "wrong_path_type"
+  | "unsupported_content"
+  | "resource_limit"
+  | "execution_failed";
 
 export interface ToolError {
-  kind: ToolErrorKind;
+  code: ToolErrorCode;
   message: string;
+  details?: JsonObject;
 }
 
 export type ToolResult = { ok: true; data: JsonValue } | { ok: false; error: ToolError };

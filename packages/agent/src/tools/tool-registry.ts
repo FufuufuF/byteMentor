@@ -67,14 +67,14 @@ export class ToolRegistry {
     if (tool === undefined) {
       return toExecutionOutput({
         ok: false,
-        error: { kind: "unknown_tool", message: `tool not registered: ${name}` },
+        error: { code: "unknown_tool", message: `tool not registered: ${name}` },
       });
     }
     const invalidArgsMessage = this.validateArgs(tool, args);
     if (invalidArgsMessage !== undefined) {
       return toExecutionOutput({
         ok: false,
-        error: { kind: "invalid_args", message: invalidArgsMessage },
+        error: { code: "invalid_arguments", message: invalidArgsMessage },
       });
     }
     try {
@@ -83,29 +83,25 @@ export class ToolRegistry {
       return toExecutionOutput({
         ok: false,
         error: {
-          kind: "execution_failed",
+          code: "execution_failed",
           message: e instanceof Error ? e.message : String(e),
         },
       });
     }
   }
 
+  // 在工具执行前验证参数必须是对象，并在有 schema 时返回具体的 Ajv 校验错误。
   private validateArgs(tool: AgentTool, args: unknown): string | undefined {
     if (tool.parametersJsonSchema === undefined) {
-      if (args !== null && !isObjectArgs(args)) {
+      if (!isObjectArgs(args)) {
         return `args must be an object, got ${typeof args}`;
       }
       return undefined;
     }
 
-    try {
-      const validate = this.getValidator(tool);
-      if (!validate(args)) {
-        return `args do not match parametersJsonSchema: ${ajv.errorsText(validate.errors)}`;
-      }
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      return `invalid parametersJsonSchema: ${message}`;
+    const validate = this.getValidator(tool);
+    if (!validate(args)) {
+      return `args do not match parametersJsonSchema: ${ajv.errorsText(validate.errors)}`;
     }
     return undefined;
   }

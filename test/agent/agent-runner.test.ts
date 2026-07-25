@@ -754,7 +754,7 @@ describe("AgentRunner.run", () => {
         message: {
           role: "assistant",
           content: "",
-          toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+          toolCalls: [{ id: toolCallId, name: "lookup", args: {} }],
         },
         stopReason: "tool_calls",
       };
@@ -780,7 +780,7 @@ describe("AgentRunner.run", () => {
     expect(result.newMessages.length).toBe(2);
     expect(result.newMessages[0]).toMatchObject({
       role: "assistant",
-      toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+      toolCalls: [{ id: toolCallId, name: "lookup", args: {} }],
     });
     expect(result.newMessages[1]).toMatchObject({
       role: "tool",

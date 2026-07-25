@@ -45,16 +45,18 @@ describe("ToolRegistry.execute known tool", () => {
 });
 
 describe("ToolRegistry.execute unknown tool", () => {
-  // 验证调用未注册名称时不会抛异常，而是返回可供模型处理的 unknown_tool 失败结果。
-  it("returns ToolError with kind unknown_tool when tool is not registered", async () => {
+  // 调用未注册名称时，Registry 应返回 unknown_tool 对象，并生成内容完全相同的 JSON 供 ToolMessage 使用。
+  it("returns a serialized unknown_tool error when the tool is not registered", async () => {
     const registry = new ToolRegistry();
-    const r = (await registry.execute("nonexistent", {})).result;
+    const output = await registry.execute("nonexistent", {});
+    const r = output.result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("unknown_tool");
+      expect(r.error.code).toBe("unknown_tool");
       expect(typeof r.error.message).toBe("string");
       expect(r.error.message.length).toBeGreaterThan(0);
     }
+    expect(JSON.parse(output.content)).toEqual(output.result);
   });
 });
 
@@ -80,11 +82,13 @@ describe("ToolRegistry.execute invalid args", () => {
       },
     });
 
-    const missingRequired = (await registry.execute("search", {})).result;
+    const missingRequiredOutput = await registry.execute("search", {});
+    const missingRequired = missingRequiredOutput.result;
     expect(missingRequired.ok).toBe(false);
     if (!missingRequired.ok) {
-      expect(missingRequired.error.kind).toBe("invalid_args");
+      expect(missingRequired.error.code).toBe("invalid_arguments");
     }
+    expect(JSON.parse(missingRequiredOutput.content)).toEqual(missingRequired);
 
     const optionalAbsent = (await registry.execute("search", { query: "docs" })).result;
     expect(optionalAbsent.ok).toBe(true);
@@ -100,12 +104,12 @@ describe("ToolRegistry.execute invalid args", () => {
     ).result;
     expect(invalidOptional.ok).toBe(false);
     if (!invalidOptional.ok) {
-      expect(invalidOptional.error.kind).toBe("invalid_args");
+      expect(invalidOptional.error.code).toBe("invalid_arguments");
     }
   });
 
   // 验证没有参数 schema 的工具仍拒绝字符串参数，避免把非对象参数传入工具实现。
-  it("returns ToolError with kind invalid_args when args is not an object", async () => {
+  it("returns invalid_arguments when args is not an object", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
@@ -117,12 +121,12 @@ describe("ToolRegistry.execute invalid args", () => {
     const r = (await registry.execute("t", "string-not-object")).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
-  // 验证当前兼容行为：没有参数 schema 的工具可以用 null 表示没有参数，并正常返回结果。
-  it("accepts null for a tool with no parametersJsonSchema", async () => {
+  // 即使工具没有声明 schema，参数仍必须是对象；这里验证 null 会被拒绝，而不会执行工具。
+  it("returns invalid_arguments for null without a parametersJsonSchema", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
@@ -132,14 +136,14 @@ describe("ToolRegistry.execute invalid args", () => {
       },
     });
     const r = (await registry.execute("t", null)).result;
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.data).toBe("no args");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
-  // 验证声明对象 schema 后，null 不会被当成空对象，而会返回 invalid_args。
-  it("returns invalid_args for null when tool has parametersJsonSchema", async () => {
+  // 声明对象 schema 后，null 同样不能被当成空对象；这里验证它返回 invalid_arguments。
+  it("returns invalid_arguments for null when tool has parametersJsonSchema", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
@@ -152,12 +156,12 @@ describe("ToolRegistry.execute invalid args", () => {
     const r = (await registry.execute("t", null)).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
   // 验证数组不会绕过“工具参数必须是对象”的边界。
-  it("returns invalid_args when args is an array", async () => {
+  it("returns invalid_arguments when args is an array", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
@@ -169,14 +173,14 @@ describe("ToolRegistry.execute invalid args", () => {
     const r = (await registry.execute("t", [1, 2, 3])).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 });
 
 describe("ToolRegistry.execute tool throws", () => {
-  // 验证工具抛出 Error 时，Registry 返回 execution_failed，并保留可读的原始错误消息。
-  it("returns ToolError with kind execution_failed when tool.execute throws", async () => {
+  // 工具抛出 Error 时，Registry 应返回 execution_failed、保留原消息，并生成等价 JSON，而不是 reject。
+  it("returns a serialized execution_failed error when tool.execute throws", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "boom",
@@ -185,12 +189,14 @@ describe("ToolRegistry.execute tool throws", () => {
         throw new Error("kaboom");
       },
     });
-    const r = (await registry.execute("boom", {})).result;
+    const output = await registry.execute("boom", {});
+    const r = output.result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("execution_failed");
+      expect(r.error.code).toBe("execution_failed");
       expect(r.error.message).toContain("kaboom");
     }
+    expect(JSON.parse(output.content)).toEqual(output.result);
   });
 
   // 验证工具抛出字符串等非 Error 值时，Registry 仍能生成稳定的 execution_failed 结果。
@@ -206,7 +212,7 @@ describe("ToolRegistry.execute tool throws", () => {
     const r = (await registry.execute("boom2", {})).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("execution_failed");
+      expect(r.error.code).toBe("execution_failed");
       expect(typeof r.error.message).toBe("string");
     }
   });

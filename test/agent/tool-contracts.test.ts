@@ -10,20 +10,23 @@ import type {
 import type { AssistantMessage, Message, StopReason } from "@byte-mentor/core";
 
 describe("agent tool type contracts", () => {
-  it("ToolError can express unknown_tool kind", () => {
-    const err: ToolError = { kind: "unknown_tool", message: "no such tool" };
-    expect(err.kind).toBe("unknown_tool");
+  // 验证 Registry 可以用 unknown_tool code 表达调用名称不存在，并附带模型可读消息。
+  it("ToolError can express unknown_tool code", () => {
+    const err: ToolError = { code: "unknown_tool", message: "no such tool" };
+    expect(err.code).toBe("unknown_tool");
     expect(err.message).toBe("no such tool");
   });
 
-  it("ToolError can express invalid_args kind", () => {
-    const err: ToolError = { kind: "invalid_args", message: "args must be object" };
-    expect(err.kind).toBe("invalid_args");
+  // 验证参数不符合工具 schema 时使用完整的 invalid_arguments code，而不是旧缩写。
+  it("ToolError can express invalid_arguments code", () => {
+    const err: ToolError = { code: "invalid_arguments", message: "args must be object" };
+    expect(err.code).toBe("invalid_arguments");
   });
 
-  it("ToolError can express execution_failed kind", () => {
-    const err: ToolError = { kind: "execution_failed", message: "tool threw" };
-    expect(err.kind).toBe("execution_failed");
+  // 验证未预期的工具异常可以用 execution_failed code 与正常失败结果统一传递。
+  it("ToolError can express execution_failed code", () => {
+    const err: ToolError = { code: "execution_failed", message: "tool threw" };
+    expect(err.code).toBe("execution_failed");
   });
 
   // 验证成功结果把可序列化的数据放在 data 字段，供 Registry 统一包装和序列化。
@@ -33,10 +36,11 @@ describe("agent tool type contracts", () => {
     expect(r.data).toBe("42");
   });
 
+  // 验证失败 ToolResult 通过 error 字段携带结构化 code 和消息。
   it("ToolResult failure variant carries ToolError", () => {
-    const r: ToolResult = { ok: false, error: { kind: "unknown_tool", message: "x" } };
+    const r: ToolResult = { ok: false, error: { code: "unknown_tool", message: "x" } };
     expect(r.ok).toBe(false);
-    expect(r.error.kind).toBe("unknown_tool");
+    expect(r.error.code).toBe("unknown_tool");
   });
 
   // 验证 AgentTool 同时提供模型可见定义和返回结构化 ToolResult 的执行函数。

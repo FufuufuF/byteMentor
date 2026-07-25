@@ -771,7 +771,7 @@ describe("AgentLoop.runTurn", () => {
           message: {
             role: "assistant",
             content: "",
-            toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+            toolCalls: [{ id: toolCallId, name: "lookup", args: {} }],
           },
           stopReason: "tool_calls",
         };
