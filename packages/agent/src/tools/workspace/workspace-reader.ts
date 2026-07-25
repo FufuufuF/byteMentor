@@ -1,5 +1,5 @@
 import type { Stats } from "node:fs";
-import { lstat, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { JsonObject, ToolErrorCode } from "../contracts.js";
 import type { WorkspaceAccessPolicy } from "./workspace-policy.js";
@@ -37,6 +37,37 @@ export interface WorkspaceFileTraversal {
   files: WorkspaceFileEntry[];
 }
 
+export interface WorkspaceTextPosition {
+  line: number;
+  column: number;
+}
+
+export interface WorkspaceTextRange {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+}
+
+export interface WorkspaceTextWindow {
+  path: string;
+  encoding: "utf-8";
+  bom: boolean;
+  content: string;
+  range: WorkspaceTextRange | null;
+  eof: boolean;
+  truncated: boolean;
+  truncatedBy?: "line_limit" | "character_limit";
+  nextPosition?: WorkspaceTextPosition;
+}
+
+interface ReadTextWindowOptions {
+  startLine: number;
+  startColumn: number;
+  lineLimit: number;
+  maxCharacters: number;
+}
+
 interface FileTraversalState {
   visitedDirectories: Set<string>;
   visitedEntries: number;
@@ -48,6 +79,23 @@ interface TraversalTarget {
   canonicalRelativePath: string;
   metadata: Stats;
 }
+
+interface ParsedTextLine {
+  body: string[];
+  ending: "" | "\n" | "\r" | "\r\n";
+  complete: boolean;
+}
+
+interface PositionedTextUnit {
+  text: string;
+  line: number;
+  column: number;
+  next: WorkspaceTextPosition;
+}
+
+type TextWindowAnalysis =
+  | { status: "need_more" }
+  | { status: "complete"; window: Omit<WorkspaceTextWindow, "path" | "encoding" | "bom"> };
 
 export class WorkspaceError extends Error {
   readonly code: ToolErrorCode;
@@ -174,6 +222,30 @@ export class WorkspaceReader {
     await this.walkDirectory(resolvedDirectory.path, absoluteDirectory, state);
     state.files.sort(compareWorkspaceFiles);
     return { path: resolvedDirectory.path, files: state.files };
+  }
+
+  // 从指定 1-based 行列增量读取 UTF-8 窗口，并以 Policy 扫描预算限制定位成本。
+  async readTextWindow(path: string, options: ReadTextWindowOptions): Promise<WorkspaceTextWindow> {
+    const resolvedFile = await this.resolvePath(path);
+    if (resolvedFile.type !== "file") {
+      throw new WorkspaceError(
+        "wrong_path_type",
+        `workspace path is not a file: ${resolvedFile.path}`,
+      );
+    }
+
+    const absolutePath = resolve(this.workspaceRoot, resolvedFile.path);
+    const decoded = await readUtf8Window(
+      absolutePath,
+      options,
+      this.policy.limits.maxReadScanBytes,
+    );
+    return {
+      path: resolvedFile.path,
+      encoding: "utf-8",
+      bom: decoded.bom,
+      ...decoded.window,
+    };
   }
 
   // 拒绝绝对路径和词法越界，再生成位于工作区根目录内的绝对访问目标与规范相对路径。
@@ -310,6 +382,269 @@ export class WorkspaceReader {
       metadata: await stat(canonicalPath),
     };
   }
+}
+
+// 按递增块大小扫描文件，严格解码 UTF-8，并在窗口已确定时立即停止后续 I/O。
+async function readUtf8Window(
+  absolutePath: string,
+  options: ReadTextWindowOptions,
+  maxScanBytes: number,
+): Promise<{
+  bom: boolean;
+  window: Omit<WorkspaceTextWindow, "path" | "encoding" | "bom">;
+}> {
+  const handle = await open(absolutePath, "r");
+  try {
+    const metadata = await handle.stat();
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    let decodedText = "";
+    let position = 0;
+    let chunkSize = Math.min(4_096, maxScanBytes);
+    let bom = false;
+    let firstChunk = true;
+
+    while (position < metadata.size) {
+      if (position >= maxScanBytes) {
+        throw new WorkspaceError(
+          "resource_limit",
+          `reading the requested position exceeds ${maxScanBytes} scanned bytes`,
+        );
+      }
+
+      const readSize = Math.min(chunkSize, metadata.size - position, maxScanBytes - position);
+      const buffer = Buffer.allocUnsafe(readSize);
+      const { bytesRead } = await handle.read(buffer, 0, readSize, position);
+      if (bytesRead === 0) {
+        break;
+      }
+      const bytes = buffer.subarray(0, bytesRead);
+      if (bytes.includes(0)) {
+        throw new WorkspaceError("unsupported_content", "file contains NUL binary content");
+      }
+
+      let contentBytes = bytes;
+      if (
+        firstChunk &&
+        bytes.length >= 3 &&
+        bytes[0] === 0xef &&
+        bytes[1] === 0xbb &&
+        bytes[2] === 0xbf
+      ) {
+        bom = true;
+        contentBytes = bytes.subarray(3);
+      }
+      firstChunk = false;
+      position += bytesRead;
+
+      try {
+        decodedText += decoder.decode(contentBytes, { stream: position < metadata.size });
+      } catch {
+        throw new WorkspaceError("unsupported_content", "file is not valid UTF-8 text");
+      }
+
+      const atEof = position >= metadata.size;
+      const analysis = analyzeTextWindow(decodedText, atEof, options);
+      if (analysis.status === "complete") {
+        return { bom, window: analysis.window };
+      }
+      chunkSize = Math.min(chunkSize * 2, 1024 * 1024);
+    }
+
+    try {
+      decodedText += decoder.decode();
+    } catch {
+      throw new WorkspaceError("unsupported_content", "file is not valid UTF-8 text");
+    }
+    const finalAnalysis = analyzeTextWindow(decodedText, true, options);
+    if (finalAnalysis.status === "complete") {
+      return { bom, window: finalAnalysis.window };
+    }
+    throw new WorkspaceError("execution_failed", "unable to resolve the requested text window");
+  } finally {
+    await handle.close();
+  }
+}
+
+// 将当前已解码前缀解释为逻辑行，并在具备截断或 EOF 证据时生成精确续读位置。
+function analyzeTextWindow(
+  text: string,
+  atEof: boolean,
+  options: ReadTextWindowOptions,
+): TextWindowAnalysis {
+  const lines = parseTextLines(text, atEof);
+  const startIndex = options.startLine - 1;
+  if (startIndex >= lines.length) {
+    return atEof
+      ? { status: "complete", window: createEmptyTextWindow() }
+      : { status: "need_more" };
+  }
+
+  const startLine = lines[startIndex]!;
+  if (options.startColumn > startLine.body.length + 1) {
+    if (!startLine.complete) {
+      return { status: "need_more" };
+    }
+    throw new WorkspaceError("invalid_arguments", `startColumn exceeds line ${options.startLine}`);
+  }
+  if (
+    options.startColumn === startLine.body.length + 1 &&
+    startLine.ending === "" &&
+    !startLine.complete
+  ) {
+    return { status: "need_more" };
+  }
+
+  const units = positionTextUnits(lines, options.startLine, options.startColumn);
+  if (units.length === 0) {
+    return atEof
+      ? { status: "complete", window: createEmptyTextWindow() }
+      : { status: "need_more" };
+  }
+
+  const lastAllowedLine = options.startLine + options.lineLimit - 1;
+  const allowedUnits = units.filter((unit) => unit.line <= lastAllowedLine);
+  const selected: PositionedTextUnit[] = [];
+  let characters = 0;
+  for (const unit of allowedUnits) {
+    const unitCharacters = Array.from(unit.text).length;
+    if (characters + unitCharacters > options.maxCharacters) {
+      if (selected.length === 0) {
+        throw new WorkspaceError(
+          "resource_limit",
+          "the next line ending cannot fit within the character limit",
+        );
+      }
+      return {
+        status: "complete",
+        window: createTruncatedTextWindow(selected, "character_limit"),
+      };
+    }
+    selected.push(unit);
+    characters += unitCharacters;
+    if (characters === options.maxCharacters) {
+      const hasKnownRemainder = units.length > selected.length;
+      if (hasKnownRemainder || !atEof) {
+        return {
+          status: "complete",
+          window: createTruncatedTextWindow(selected, "character_limit"),
+        };
+      }
+    }
+  }
+
+  if (units.some((unit) => unit.line > lastAllowedLine)) {
+    return {
+      status: "complete",
+      window: createTruncatedTextWindow(selected, "line_limit"),
+    };
+  }
+  if (!atEof) {
+    return { status: "need_more" };
+  }
+  return { status: "complete", window: createCompleteTextWindow(selected) };
+}
+
+// 将文本拆为保留原始行尾的逻辑行；未到 EOF 的末行保持 incomplete 以避免过早判定列越界。
+function parseTextLines(text: string, atEof: boolean): ParsedTextLine[] {
+  const lines: ParsedTextLine[] = [];
+  let bodyStart = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    const character = text[index];
+    if (character !== "\n" && character !== "\r") {
+      continue;
+    }
+    const isCrLf = character === "\r" && text[index + 1] === "\n";
+    lines.push({
+      body: Array.from(text.slice(bodyStart, index)),
+      ending: isCrLf ? "\r\n" : character,
+      complete: true,
+    });
+    index += isCrLf ? 1 : 0;
+    bodyStart = index + 1;
+  }
+  if (bodyStart < text.length || (atEof && lines.length === 0)) {
+    lines.push({ body: Array.from(text.slice(bodyStart)), ending: "", complete: atEof });
+  }
+  return lines;
+}
+
+// 为正文 code point 和原始行尾建立 1-based 坐标，使 range 与 nextPosition 使用同一位置模型。
+function positionTextUnits(
+  lines: ParsedTextLine[],
+  startLine: number,
+  startColumn: number,
+): PositionedTextUnit[] {
+  const units: PositionedTextUnit[] = [];
+  for (let index = startLine - 1; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const lineNumber = index + 1;
+    const firstColumn = lineNumber === startLine ? startColumn : 1;
+    for (let column = firstColumn; column <= line.body.length; column += 1) {
+      units.push({
+        text: line.body[column - 1]!,
+        line: lineNumber,
+        column,
+        next: { line: lineNumber, column: column + 1 },
+      });
+    }
+    if (line.ending !== "" && firstColumn <= line.body.length + 1) {
+      units.push({
+        text: line.ending,
+        line: lineNumber,
+        column: line.body.length + 1,
+        next: { line: lineNumber + 1, column: 1 },
+      });
+    }
+  }
+  return units;
+}
+
+// 构造没有可读字符的 EOF 窗口，避免伪造不存在的行列范围。
+function createEmptyTextWindow(): Omit<WorkspaceTextWindow, "path" | "encoding" | "bom"> {
+  return { content: "", range: null, eof: true, truncated: false };
+}
+
+// 构造读取至真实 EOF 的窗口，并以首尾文本单元生成闭区间坐标。
+function createCompleteTextWindow(
+  units: PositionedTextUnit[],
+): Omit<WorkspaceTextWindow, "path" | "encoding" | "bom"> {
+  if (units.length === 0) {
+    return createEmptyTextWindow();
+  }
+  return {
+    content: units.map((unit) => unit.text).join(""),
+    range: createTextRange(units),
+    eof: true,
+    truncated: false,
+  };
+}
+
+// 构造显式截断窗口，并把续读位置设置为最后一个完整文本单元之后。
+function createTruncatedTextWindow(
+  units: PositionedTextUnit[],
+  truncatedBy: "line_limit" | "character_limit",
+): Omit<WorkspaceTextWindow, "path" | "encoding" | "bom"> {
+  const lastUnit = units.at(-1)!;
+  return {
+    content: units.map((unit) => unit.text).join(""),
+    range: createTextRange(units),
+    eof: false,
+    truncated: true,
+    truncatedBy,
+    nextPosition: lastUnit.next,
+  };
+}
+
+// 将首尾文本单元坐标投影为模型可见的闭区间 range。
+function createTextRange(units: PositionedTextUnit[]): WorkspaceTextRange {
+  const first = units[0]!;
+  const last = units.at(-1)!;
+  return {
+    startLine: first.line,
+    startColumn: first.column,
+    endLine: last.line,
+    endColumn: last.column,
+  };
 }
 
 // 将 lstat 元数据归一化为模型可见的目录项类型，并保留符号链接自身而不是目标类型。

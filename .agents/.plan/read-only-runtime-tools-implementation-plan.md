@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 4 GREEN / 等待 Review）
+- 状态：开发中（Batch 5 GREEN / 连续推进 Batch 6）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -425,6 +425,27 @@ Review 重点：
 - 列计数是否基于 Unicode code point，而不是 JavaScript UTF-16 code unit。
 - `range`、`eof`、`truncatedBy` 和 `nextPosition` 在边界位置是否一致。
 - 字符截断是否保留完整 code point 和合法 JSON，没有对序列化字符串做硬切割。
+
+Batch 5 实施契约：
+
+- 公共入口导出无状态常量 `readFileTool`，声明 `concurrency: "safe"`，通过 `ToolExecutionContext.workspaceReader` 读取文本。
+- `WorkspaceReader.readTextWindow(path, options)` 负责路径类型、增量异步读取、严格 UTF-8/NUL 检查、BOM、混合行尾、Unicode code point 行列、扫描预算与精确续读；Tool 只负责参数默认值、Policy 行数上限和错误映射。
+- Reader 从 4 KiB 开始按倍增块扫描，窗口一旦具备截断或 EOF 证据即停止 I/O；实际读取字节达到 `maxReadScanBytes` 仍无法确定窗口时返回 `resource_limit`，不按文件总大小预先拒绝。
+- 行尾作为所属逻辑行的完整文本单元保留；LF、CR 和 CRLF 消费后续位置均为下一行第 1 列。行末后一列可以读取行尾，再后一列返回 `invalid_arguments`。
+- `range` 是首尾返回文本单元的 1-based 闭区间；空窗口为 `null`。字符上限按 Unicode code point 计数，CRLF 不从中间切断。
+- `lineLimit` 包含起始位置所在行；只有确有剩余内容时才产生 `line_limit`。字符上限优先于尚未达到的行数上限，并通过同一位置模型生成 `nextPosition`。
+- Tool 只把预期 `WorkspaceError` 转为同码 ToolResult；最终 payload 由 Registry 再次执行 JSON 与序列化硬上限校验。
+
+Batch 5 TDD 状态：
+
+- [x] Batch 4 已以 `932cf85 feat(agent): add workspace file discovery tool` 提交。
+- [x] RED：一次性完成编码/行尾、Unicode 定位、空窗口、路径与内容错误、行/字符/扫描上限、无损续读、schema 和模型说明测试。
+- [x] GREEN：实现增量 UTF-8 文本窗口与 `readFileTool`，并通过全量验证。
+
+开发进度：
+
+- 2026-07-25：Batch 5 RED。新增 14 个真实文件系统与 Registry 纵向测试；覆盖 UTF-8 BOM、LF/CRLF/CR、emoji code point 列、Policy 默认行数、行/字符分页无损续读、空文件/EOF/列边界、非法 UTF-8、NUL、实际扫描字节上限、路径错误、schema/Policy limit 与四段模型说明。定向测试 14 failed，全部按预期失败于公共入口尚未导出 `readFileTool`。
+- 2026-07-25：Batch 5 GREEN。WorkspaceReader 新增异步倍增块扫描、严格增量 UTF-8 解码、原始行尾位置模型与精确窗口；无状态 `readFileTool` 完成参数/Policy 映射和 WorkspaceError 归一化。Batch 5 定向 14 个测试、全量 215 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 6: `search_text` 纵向切片
 
