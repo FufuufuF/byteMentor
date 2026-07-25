@@ -109,6 +109,7 @@ Vague name, tests mock not code
 - One behavior
 - Clear name
 - Real code (no mocks unless unavoidable)
+- A concise comment immediately above the test case explaining the behavior or scenario under test
 
 ### Verify RED - Watch It Fail
 
@@ -165,6 +166,8 @@ Over-engineered
 
 Don't add features, refactor other code, or "improve" beyond the test.
 
+Add a concise responsibility comment immediately above every production function or method introduced or changed in this step. The comment must explain what the function or method does so a reviewer does not need to infer its responsibility from the name.
+
 ### Verify GREEN - Watch It Pass
 
 **MANDATORY.**
@@ -194,6 +197,64 @@ Keep tests green. Don't add behavior.
 ### Repeat
 
 Next failing test for next feature.
+
+## Code Comments (Mandatory)
+
+Comments are part of the TDD increment, not cleanup to defer until later.
+
+### Test Code
+
+- Put a concise comment immediately above every `test(...)` or `it(...)` case.
+- Explain the setup or input, the behavior being exercised, and the observable expected outcome.
+- Explain why multiple outputs or assertions are needed when their relationship is part of the contract.
+- Prefer plain domain language. Define internal terms at first use instead of relying on jargon, abbreviations, or implementation vocabulary.
+- Use two to four short lines when one compressed sentence would be harder to understand; concise does not mean cryptic.
+- Do not merely repeat the test name in different words.
+
+<Good>
+```typescript
+// Verifies that a transient operation succeeds on its third attempt without exceeding the retry budget.
+test('retries failed operations 3 times', async () => {
+  // ...
+});
+```
+</Good>
+
+<Bad>
+```typescript
+// Tests retry.
+test('retries failed operations 3 times', async () => {
+  // ...
+});
+```
+</Bad>
+
+### Production Code
+
+- Put a concise responsibility comment immediately above every function declaration, class method, and function-valued variable introduced or changed by the TDD step.
+- Include constructors when their setup responsibility is not completely represented by field declarations.
+- Explain what the function or method does, including an important boundary or side effect when relevant.
+- Prefer plain domain language and explain unfamiliar implementation terms when they are necessary.
+- Comment non-trivial inline callbacks at the call site when a reviewer would otherwise need to infer their role.
+- Do not merely translate the function name, narrate individual statements, or use comments to compensate for unclear code.
+
+<Good>
+```typescript
+// Executes an operation up to three times and returns the first successful result.
+async function retryOperation<T>(fn: () => Promise<T>): Promise<T> {
+  // ...
+}
+```
+</Good>
+
+<Bad>
+```typescript
+// Retry operation.
+async function retryOperation<T>(fn: () => Promise<T>): Promise<T> {
+  // ...
+}
+```
+</Bad>
 
 ## Good Tests
 
@@ -329,6 +390,8 @@ Extract validation for multiple fields if needed.
 Before marking work complete:
 
 - [ ] Every new function/method has a test
+- [ ] Every test case has a concise comment explaining what it verifies
+- [ ] Every introduced or changed production function/method has a concise responsibility comment
 - [ ] Watched each test fail before implementing
 - [ ] Each test failed for expected reason (feature missing, not typo)
 - [ ] Wrote minimal code to pass each test
