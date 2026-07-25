@@ -1,5 +1,9 @@
 import type { AgentTool, JsonObject, ToolResult } from "../contracts.js";
-import { WorkspaceError, type WorkspaceTextWindow } from "../workspace/workspace-reader.js";
+import {
+  WorkspaceError,
+  type WorkspaceReader,
+  type WorkspaceTextWindow,
+} from "../workspace/workspace-reader.js";
 
 interface ReadFileArguments {
   path: string;
@@ -67,12 +71,13 @@ export const readFileTool: AgentTool = {
     }
 
     try {
-      const window = await context.workspaceReader.readTextWindow(input.path, {
-        startLine: input.startLine ?? 1,
-        startColumn: input.startColumn ?? 1,
+      const window = await readFittingTextWindow(
+        context.workspaceReader,
+        input,
         lineLimit,
-        maxCharacters: policy.limits.maxOutputCharacters,
-      });
+        policy.limits.maxOutputCharacters,
+        policy.limits.maxSerializedToolResultCharacters,
+      );
       return { ok: true, data: toJsonTextWindow(window) };
     } catch (error) {
       if (error instanceof WorkspaceError) {
@@ -89,6 +94,60 @@ export const readFileTool: AgentTool = {
     }
   },
 };
+
+// 读取最大的可序列化文本窗口，必要时二分收缩字符预算以保留精确续读位置。
+async function readFittingTextWindow(
+  reader: WorkspaceReader,
+  input: ReadFileArguments,
+  lineLimit: number,
+  maxCharacters: number,
+  maxSerializedCharacters: number,
+): Promise<WorkspaceTextWindow> {
+  // 使用固定起点与行数执行一次候选字符预算读取，供初始请求和二分探测复用。
+  const readWindow = async (characterLimit: number): Promise<WorkspaceTextWindow> =>
+    reader.readTextWindow(input.path, {
+      startLine: input.startLine ?? 1,
+      startColumn: input.startColumn ?? 1,
+      lineLimit,
+      maxCharacters: characterLimit,
+    });
+
+  const requestedWindow = await readWindow(maxCharacters);
+  if (serializedSuccessLength(toJsonTextWindow(requestedWindow)) <= maxSerializedCharacters) {
+    return requestedWindow;
+  }
+
+  let lower = 1;
+  let upper = maxCharacters - 1;
+  let bestWindow: WorkspaceTextWindow | undefined;
+  while (lower <= upper) {
+    const candidateLimit = Math.floor((lower + upper) / 2);
+    let candidate: WorkspaceTextWindow;
+    try {
+      candidate = await readWindow(candidateLimit);
+    } catch (error) {
+      if (error instanceof WorkspaceError && error.code === "resource_limit") {
+        lower = candidateLimit + 1;
+        continue;
+      }
+      throw error;
+    }
+
+    if (serializedSuccessLength(toJsonTextWindow(candidate)) <= maxSerializedCharacters) {
+      bestWindow = candidate;
+      lower = candidateLimit + 1;
+    } else {
+      upper = candidateLimit - 1;
+    }
+  }
+  if (bestWindow !== undefined) {
+    return bestWindow;
+  }
+  throw new WorkspaceError(
+    "resource_limit",
+    "the next text window cannot fit within the serialized output limit",
+  );
+}
 
 // 将 Reader 窗口投影为严格 JsonObject，并只在截断时公开原因与续读位置。
 function toJsonTextWindow(window: WorkspaceTextWindow): JsonObject {
@@ -118,4 +177,9 @@ function toJsonTextWindow(window: WorkspaceTextWindow): JsonObject {
           },
         }),
   };
+}
+
+// 计算 Registry 最终写入 ToolMessage 的完整成功 envelope 字符数。
+function serializedSuccessLength(data: JsonObject): number {
+  return JSON.stringify({ ok: true, data }).length;
 }

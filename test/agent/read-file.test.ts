@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as agentExports from "@byte-mentor/agent";
@@ -217,6 +217,56 @@ describe("read_file text windows", () => {
     expect(contents.join("")).toBe("a\r\nb\rc\nend");
     expect(contents).toEqual(["a\r\n", "b\r", "c\n", "end"]);
   });
+
+  // 当首个读取块和字符预算同时结束在 CRLF 的 CR 上时，窗口不能拆开行尾或让续读跳过 LF。
+  it("preserves CRLF split at the character boundary", async () => {
+    const root = await createTemporaryDirectory();
+    const original = `${"x".repeat(4_095)}\r\nnext`;
+    await writeFile(join(root, "boundary.txt"), original);
+    const overrides = { limits: { maxOutputCharacters: 4_096 } } as const;
+
+    const first = readSuccessData(await executeReadFile(root, { path: "boundary.txt" }, overrides));
+    const second = readSuccessData(
+      await executeReadFile(
+        root,
+        {
+          path: "boundary.txt",
+          startLine: first.nextPosition?.line,
+          startColumn: first.nextPosition?.column,
+        },
+        overrides,
+      ),
+    );
+
+    expect(first.content + second.content).toBe(original);
+    expect(first.content.endsWith("\r")).toBe(false);
+    expect(second.content.startsWith("\r\n")).toBe(true);
+  });
+
+  // 非 BMP 正文的 code point 数虽在正文上限内，Tool 仍应缩小窗口以交付可续读的完整 JSON envelope。
+  it("fits non-BMP text within the serialized result budget", async () => {
+    const root = await createTemporaryDirectory();
+    const original = "😀".repeat(12_001);
+    await writeFile(join(root, "emoji.txt"), original);
+
+    const firstOutput = await executeReadFile(root, { path: "emoji.txt" });
+    const first = readSuccessData(firstOutput);
+    expect(firstOutput.content.length).toBeLessThanOrEqual(24_000);
+    expect(first).toMatchObject({
+      eof: false,
+      truncated: true,
+      truncatedBy: "character_limit",
+    });
+
+    const second = readSuccessData(
+      await executeReadFile(root, {
+        path: "emoji.txt",
+        startLine: first.nextPosition?.line,
+        startColumn: first.nextPosition?.column,
+      }),
+    );
+    expect(first.content + second.content).toBe(original);
+  });
 });
 
 describe("read_file empty and boundary positions", () => {
@@ -353,6 +403,21 @@ describe("read_file errors and model contract", () => {
         error: { code: testCase.code },
       });
     }
+  });
+
+  // 文件在路径校验后仍可能因权限不可读；应返回相对路径的 access_denied，不能泄露主机绝对路径。
+  it("normalizes unreadable files without exposing absolute paths", async () => {
+    const root = await createTemporaryDirectory();
+    await writeFile(join(root, "unreadable.txt"), "text");
+    await chmod(join(root, "unreadable.txt"), 0);
+
+    const output = await executeReadFile(root, { path: "unreadable.txt" });
+
+    expect(output.result).toMatchObject({
+      ok: false,
+      error: { code: "access_denied" },
+    });
+    expect(output.content).not.toContain(root);
   });
 
   // Registry schema 应拒绝缺失路径、非正位置、超出协议行数和未声明字段。

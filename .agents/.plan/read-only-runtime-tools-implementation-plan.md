@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 6 GREEN / 等待 Review）
+- 状态：开发中（Batch 6 GREEN / Review 问题已修复）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -502,6 +502,7 @@ Batch 6 TDD 状态：
 - 2026-07-25：Batch 6 RED。新增 13 个真实文件系统与 Registry 纵向测试；覆盖单文件/目录字面量搜索、大小写、同行多次出现、Unicode 列、跨行隔离、300 字符预览、binary/invalid UTF-8/过大文件跳过及单文件失败、稳定分页、输出预算、总扫描/遍历上限、schema/Policy limit 与四段模型说明。定向测试 13 failed，全部按预期失败于公共入口尚未导出 `searchTextTool`。
 - 2026-07-25：Batch 6 补充 RED/GREEN。新增真实不可读文件测试，验证目录搜索返回受限 `unreadable` 详情、显式单文件搜索返回 `access_denied`；撤去实现时 1 failed、13 passed，恢复最小错误映射后 14 passed。
 - 2026-07-25：Batch 6 GREEN。WorkspaceReader 新增复用安全遍历的顺序内容搜索、严格内容分类、单文件与总扫描预算、Unicode 行匹配与预览；无状态 `searchTextTool` 完成默认值、无总数分页、输出预算、schema/说明和 WorkspaceError 映射。Batch 6 定向 14 个测试、全量 229 个测试、typecheck、lint 与 format check 全部通过。
+- 2026-07-25：Batch 5/6 Review 修复。`$review-agent` 确认 3 个问题：字符边界拆分 CRLF、不可读文件泄露绝对路径、Unicode/转义正文超过完整 JSON 预算。新增 3 个 RED 回归测试后，Reader 延迟尾随 CR 判定并归一化读取权限错误，`readFileTool` 按完整成功 envelope 二分收缩字符预算；全量 232 个测试、typecheck、lint 与 format check 全部通过。报告见 `.agents/.session/read-only-runtime-tools-batch5-6-review.md`。
 
 ### Batch 7: 只读 Tool Call 有界并发与 RuntimeEvent 收敛
 

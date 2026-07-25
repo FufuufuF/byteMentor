@@ -268,11 +268,18 @@ export class WorkspaceReader {
     }
 
     const absolutePath = resolve(this.workspaceRoot, resolvedFile.path);
-    const decoded = await readUtf8Window(
-      absolutePath,
-      options,
-      this.policy.limits.maxReadScanBytes,
-    );
+    let decoded;
+    try {
+      decoded = await readUtf8Window(absolutePath, options, this.policy.limits.maxReadScanBytes);
+    } catch (error) {
+      if (isPermissionError(error)) {
+        throw new WorkspaceError(
+          "access_denied",
+          `workspace file is unreadable: ${resolvedFile.path}`,
+        );
+      }
+      throw error;
+    }
     return {
       path: resolvedFile.path,
       encoding: "utf-8",
@@ -806,10 +813,15 @@ function analyzeTextWindow(
 function parseTextLines(text: string, atEof: boolean): ParsedTextLine[] {
   const lines: ParsedTextLine[] = [];
   let bodyStart = 0;
+  let partialEnd = text.length;
   for (let index = 0; index < text.length; index += 1) {
     const character = text[index];
     if (character !== "\n" && character !== "\r") {
       continue;
+    }
+    if (character === "\r" && index === text.length - 1 && !atEof) {
+      partialEnd = index;
+      break;
     }
     const isCrLf = character === "\r" && text[index + 1] === "\n";
     lines.push({
@@ -820,8 +832,12 @@ function parseTextLines(text: string, atEof: boolean): ParsedTextLine[] {
     index += isCrLf ? 1 : 0;
     bodyStart = index + 1;
   }
-  if (bodyStart < text.length || (atEof && lines.length === 0)) {
-    lines.push({ body: Array.from(text.slice(bodyStart)), ending: "", complete: atEof });
+  if (bodyStart < partialEnd || (atEof && lines.length === 0)) {
+    lines.push({
+      body: Array.from(text.slice(bodyStart, partialEnd)),
+      ending: "",
+      complete: atEof,
+    });
   }
   return lines;
 }
