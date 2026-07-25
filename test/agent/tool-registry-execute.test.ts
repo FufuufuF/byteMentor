@@ -217,3 +217,71 @@ describe("ToolRegistry.execute tool throws", () => {
     }
   });
 });
+
+describe("ToolRegistry.execute JSON result boundary", () => {
+  // ToolResult 最终会进入 JSON 字符串；这里逐一验证 JSON 无法无损表达的数据不会被静默删除或改成其他值。
+  // Registry 应把这些违规成功结果替换为 execution_failed，并且替换后的 content 仍是完整、可解析的 JSON。
+  it("rejects non-JSON data returned by a tool", async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const sparse: unknown[] = [];
+    sparse.length = 2;
+    sparse[1] = "value";
+    const invalidValues: Array<{ label: string; value: unknown }> = [
+      { label: "undefined", value: undefined },
+      { label: "non-finite number", value: Number.NaN },
+      { label: "bigint", value: 1n },
+      { label: "function", value: () => "not json" },
+      { label: "symbol", value: Symbol("not-json") },
+      { label: "sparse array", value: sparse },
+      { label: "cyclic object", value: cyclic },
+      { label: "non-plain object", value: new Date(0) },
+    ];
+
+    for (const [index, invalid] of invalidValues.entries()) {
+      const registry = new ToolRegistry();
+      registry.register({
+        name: `invalid_result_${index}`,
+        description: `returns ${invalid.label}`,
+        async execute() {
+          return { ok: true, data: invalid.value as never };
+        },
+      });
+
+      const output = await registry.execute(`invalid_result_${index}`, {});
+
+      expect(output.result).toMatchObject({
+        ok: false,
+        error: { code: "execution_failed" },
+      });
+      expect(JSON.parse(output.content)).toEqual(output.result);
+    }
+  });
+
+  // 失败结果的 details 也会写入 ToolMessage；这里验证其中的非 JSON 对象同样被替换为 execution_failed。
+  it("rejects non-JSON details returned in a tool error", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "invalid_error_details",
+      description: "returns invalid error details",
+      async execute() {
+        return {
+          ok: false,
+          error: {
+            code: "path_not_found",
+            message: "missing",
+            details: { value: new Date(0) as never },
+          },
+        };
+      },
+    });
+
+    const output = await registry.execute("invalid_error_details", {});
+
+    expect(output.result).toMatchObject({
+      ok: false,
+      error: { code: "execution_failed" },
+    });
+    expect(JSON.parse(output.content)).toEqual(output.result);
+  });
+});

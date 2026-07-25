@@ -1,6 +1,6 @@
 import { Ajv, type AnySchema, type ValidateFunction } from "ajv";
 import type { ToolDefinition } from "../providers/provider.js";
-import type { AgentTool, ToolExecutionOutput, ToolResult } from "./contracts.js";
+import type { AgentTool, JsonValue, ToolExecutionOutput, ToolResult } from "./contracts.js";
 
 const ajv = new Ajv({ allErrors: true });
 const TOOL_NAME_PATTERN = /^[a-z][a-z0-9_]{0,63}$/;
@@ -117,12 +117,74 @@ export class ToolRegistry {
   }
 }
 
-// 把归一化结果统一序列化一次，确保 Runtime 读取的对象与 ToolMessage 携带的字符串表达同一份数据。
+// 校验并序列化归一化结果；违规 payload 会先替换为稳定的 execution_failed，避免 JSON 静默改值或丢字段。
 function toExecutionOutput(result: ToolResult): ToolExecutionOutput {
+  const safeResult: ToolResult = isJsonValue(result)
+    ? result
+    : {
+        ok: false,
+        error: {
+          code: "execution_failed",
+          message: "tool returned a result that is not JSON-compatible",
+        },
+      };
   return {
-    result,
-    content: JSON.stringify(result),
+    result: safeResult,
+    content: JSON.stringify(safeResult),
   };
+}
+
+// 递归确认一个值只包含 JSON 能无损表达的 primitive、密集数组和普通对象，并拒绝循环引用。
+function isJsonValue(value: unknown, ancestors = new WeakSet<object>()): value is JsonValue {
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return true;
+  }
+  if (typeof value === "number") {
+    return Number.isFinite(value);
+  }
+  if (typeof value !== "object" || ancestors.has(value)) {
+    return false;
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      const keys = Reflect.ownKeys(value);
+      if (keys.length !== value.length + 1) {
+        return false;
+      }
+      for (let index = 0; index < value.length; index += 1) {
+        const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+        if (descriptor === undefined || !("value" in descriptor)) {
+          return false;
+        }
+        if (!isJsonValue(descriptor.value, ancestors)) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    const prototype = Object.getPrototypeOf(value) as object | null;
+    if (prototype !== Object.prototype && prototype !== null) {
+      return false;
+    }
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== "string") {
+        return false;
+      }
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !descriptor.enumerable || !("value" in descriptor)) {
+        return false;
+      }
+      if (!isJsonValue(descriptor.value, ancestors)) {
+        return false;
+      }
+    }
+    return true;
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function isObjectArgs(args: unknown): args is Record<string, unknown> {
