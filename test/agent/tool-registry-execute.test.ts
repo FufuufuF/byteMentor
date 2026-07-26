@@ -1,26 +1,34 @@
 import { describe, expect, it } from "vitest";
 import { ToolRegistry } from "@byte-mentor/agent";
-import type { AgentTool } from "@byte-mentor/agent";
+import type { ToolExecutionContext } from "@byte-mentor/agent";
 
 describe("ToolRegistry.execute known tool", () => {
-  it("executes a registered tool and returns success result", async () => {
+  // 工具执行成功后，Registry 需要同时提供两种表示：result 保留对象，方便运行时代码读取字段；
+  // content 则把相同数据转成 JSON 字符串，供只接受字符串的 ToolMessage 使用。这里验证两者没有丢失或改变数据。
+  it("serializes a successful structured tool result", async () => {
     const registry = new ToolRegistry();
-    const tool: AgentTool = {
+    const tool = {
       name: "echo",
       description: "echo back",
-      async execute(args: unknown) {
-        const a = args as { text: string };
-        return { ok: true, result: a.text };
+      async execute() {
+        return {
+          ok: true as const,
+          data: { message: "hi", count: 1 },
+        };
       },
     };
     registry.register(tool);
-    const r = await registry.execute("echo", { text: "hi" });
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.result).toBe("hi");
-    }
+    const output = await registry.execute("echo", {});
+
+    expect(output.result).toEqual({
+      ok: true,
+      data: { message: "hi", count: 1 },
+    });
+    expect(output.content).toBe('{"ok":true,"data":{"message":"hi","count":1}}');
+    expect(JSON.parse(output.content)).toEqual(output.result);
   });
 
+  // 验证 Registry 不修改已经通过校验的参数，而是把同一个对象交给工具执行函数。
   it("execute passes args through to tool.execute", async () => {
     const registry = new ToolRegistry();
     let captured: unknown = null;
@@ -29,7 +37,7 @@ describe("ToolRegistry.execute known tool", () => {
       description: "capture args",
       async execute(args: unknown) {
         captured = args;
-        return { ok: true, result: "" };
+        return { ok: true, data: "" };
       },
     });
     await registry.execute("capture", { x: 1, y: [2, 3] });
@@ -37,20 +45,55 @@ describe("ToolRegistry.execute known tool", () => {
   });
 });
 
-describe("ToolRegistry.execute unknown tool", () => {
-  it("returns ToolError with kind unknown_tool when tool is not registered", async () => {
+describe("ToolRegistry execution context", () => {
+  // Registry 负责持有统一运行环境；这里使用完整的 context 形状作为不透明值，验证同一对象原样传给 Tool。
+  it("injects the configured context into tool execution", async () => {
+    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    const registry = new ToolRegistry({ context });
+    let receivedContext: ToolExecutionContext | undefined;
+    registry.register({
+      name: "capture_context",
+      description: "captures the execution context",
+      async execute(_args: unknown, executionContext: ToolExecutionContext) {
+        receivedContext = executionContext;
+        return { ok: true, data: "captured" };
+      },
+    });
+
+    await registry.execute("capture_context", {});
+
+    expect(receivedContext).toBe(context);
+  });
+
+  // AgentLoop 缺省使用无上下文的空 Registry；这里验证它仍能安全列举并归一化未知工具调用。
+  it("keeps an empty context-free registry safe", async () => {
     const registry = new ToolRegistry();
-    const r = await registry.execute("nonexistent", {});
+
+    expect(registry.list()).toEqual([]);
+    await expect(registry.execute("missing", {})).resolves.toMatchObject({
+      result: { ok: false, error: { code: "unknown_tool" } },
+    });
+  });
+});
+
+describe("ToolRegistry.execute unknown tool", () => {
+  // 调用未注册名称时，Registry 应返回 unknown_tool 对象，并生成内容完全相同的 JSON 供 ToolMessage 使用。
+  it("returns a serialized unknown_tool error when the tool is not registered", async () => {
+    const registry = new ToolRegistry();
+    const output = await registry.execute("nonexistent", {});
+    const r = output.result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("unknown_tool");
+      expect(r.error.code).toBe("unknown_tool");
       expect(typeof r.error.message).toBe("string");
       expect(r.error.message.length).toBeGreaterThan(0);
     }
+    expect(JSON.parse(output.content)).toEqual(output.result);
   });
 });
 
 describe("ToolRegistry.execute invalid args", () => {
+  // 验证 Registry 在执行前使用工具 schema 拒绝缺失或类型错误的参数，同时允许合法的可选字段缺省。
   it("validates args with parametersJsonSchema", async () => {
     const registry = new ToolRegistry();
     registry.register({
@@ -67,120 +110,109 @@ describe("ToolRegistry.execute invalid args", () => {
       },
       async execute(args: unknown) {
         const a = args as { query: string; limit?: number };
-        return { ok: true, result: `${a.query}:${a.limit ?? "default"}` };
+        return { ok: true, data: `${a.query}:${a.limit ?? "default"}` };
       },
     });
 
-    const missingRequired = await registry.execute("search", {});
+    const missingRequiredOutput = await registry.execute("search", {});
+    const missingRequired = missingRequiredOutput.result;
     expect(missingRequired.ok).toBe(false);
     if (!missingRequired.ok) {
-      expect(missingRequired.error.kind).toBe("invalid_args");
+      expect(missingRequired.error.code).toBe("invalid_arguments");
     }
+    expect(JSON.parse(missingRequiredOutput.content)).toEqual(missingRequired);
 
-    const optionalAbsent = await registry.execute("search", { query: "docs" });
+    const optionalAbsent = (await registry.execute("search", { query: "docs" })).result;
     expect(optionalAbsent.ok).toBe(true);
     if (optionalAbsent.ok) {
-      expect(optionalAbsent.result).toBe("docs:default");
+      expect(optionalAbsent.data).toBe("docs:default");
     }
 
-    const invalidOptional = await registry.execute("search", {
-      query: "docs",
-      limit: "many",
-    });
+    const invalidOptional = (
+      await registry.execute("search", {
+        query: "docs",
+        limit: "many",
+      })
+    ).result;
     expect(invalidOptional.ok).toBe(false);
     if (!invalidOptional.ok) {
-      expect(invalidOptional.error.kind).toBe("invalid_args");
+      expect(invalidOptional.error.code).toBe("invalid_arguments");
     }
   });
 
-  it("returns ToolError with kind invalid_args when args is not an object", async () => {
+  // 验证没有参数 schema 的工具仍拒绝字符串参数，避免把非对象参数传入工具实现。
+  it("returns invalid_arguments when args is not an object", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
       description: "t",
       async execute() {
-        return { ok: true, result: "" };
+        return { ok: true, data: "" };
       },
     });
-    const r = await registry.execute("t", "string-not-object");
+    const r = (await registry.execute("t", "string-not-object")).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
-  it("accepts null for a tool with no parametersJsonSchema", async () => {
+  // 即使工具没有声明 schema，参数仍必须是对象；这里验证 null 会被拒绝，而不会执行工具。
+  it("returns invalid_arguments for null without a parametersJsonSchema", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
       description: "t",
       async execute() {
-        return { ok: true, result: "no args" };
+        return { ok: true, data: "no args" };
       },
     });
-    const r = await registry.execute("t", null);
-    expect(r.ok).toBe(true);
-    if (r.ok) {
-      expect(r.result).toBe("no args");
+    const r = (await registry.execute("t", null)).result;
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
-  it("returns invalid_args for null when tool has parametersJsonSchema", async () => {
+  // 声明对象 schema 后，null 同样不能被当成空对象；这里验证它返回 invalid_arguments。
+  it("returns invalid_arguments for null when tool has parametersJsonSchema", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
       description: "t",
       parametersJsonSchema: { type: "object" },
       async execute() {
-        return { ok: true, result: "" };
+        return { ok: true, data: "" };
       },
     });
-    const r = await registry.execute("t", null);
+    const r = (await registry.execute("t", null)).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 
-  it("returns invalid_args when args is an array", async () => {
+  // 验证数组不会绕过“工具参数必须是对象”的边界。
+  it("returns invalid_arguments when args is an array", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "t",
       description: "t",
       async execute() {
-        return { ok: true, result: "ok" };
+        return { ok: true, data: "ok" };
       },
     });
-    const r = await registry.execute("t", [1, 2, 3]);
+    const r = (await registry.execute("t", [1, 2, 3])).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
-    }
-  });
-
-  it("returns invalid_args instead of rejecting when parametersJsonSchema is invalid", async () => {
-    const registry = new ToolRegistry();
-    registry.register({
-      name: "bad-schema",
-      description: "bad schema",
-      parametersJsonSchema: "not-an-object",
-      async execute() {
-        return { ok: true, result: "should not run" };
-      },
-    });
-
-    const r = await registry.execute("bad-schema", {});
-
-    expect(r.ok).toBe(false);
-    if (!r.ok) {
-      expect(r.error.kind).toBe("invalid_args");
-      expect(r.error.message).toContain("invalid parametersJsonSchema");
+      expect(r.error.code).toBe("invalid_arguments");
     }
   });
 });
 
 describe("ToolRegistry.execute tool throws", () => {
-  it("returns ToolError with kind execution_failed when tool.execute throws", async () => {
+  // 工具抛出 Error 时，Registry 应返回 execution_failed、保留原消息，并生成等价 JSON，而不是 reject。
+  it("returns a serialized execution_failed error when tool.execute throws", async () => {
     const registry = new ToolRegistry();
     registry.register({
       name: "boom",
@@ -189,14 +221,17 @@ describe("ToolRegistry.execute tool throws", () => {
         throw new Error("kaboom");
       },
     });
-    const r = await registry.execute("boom", {});
+    const output = await registry.execute("boom", {});
+    const r = output.result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("execution_failed");
+      expect(r.error.code).toBe("execution_failed");
       expect(r.error.message).toContain("kaboom");
     }
+    expect(JSON.parse(output.content)).toEqual(output.result);
   });
 
+  // 验证工具抛出字符串等非 Error 值时，Registry 仍能生成稳定的 execution_failed 结果。
   it("returns execution_failed when tool.execute throws non-Error", async () => {
     const registry = new ToolRegistry();
     registry.register({
@@ -206,11 +241,141 @@ describe("ToolRegistry.execute tool throws", () => {
         throw "string error";
       },
     });
-    const r = await registry.execute("boom2", {});
+    const r = (await registry.execute("boom2", {})).result;
     expect(r.ok).toBe(false);
     if (!r.ok) {
-      expect(r.error.kind).toBe("execution_failed");
+      expect(r.error.code).toBe("execution_failed");
       expect(typeof r.error.message).toBe("string");
     }
+  });
+});
+
+describe("ToolRegistry.execute JSON result boundary", () => {
+  // ToolResult 最终会进入 JSON 字符串；这里逐一验证 JSON 无法无损表达的数据不会被静默删除或改成其他值。
+  // Registry 应把这些违规成功结果替换为 execution_failed，并且替换后的 content 仍是完整、可解析的 JSON。
+  it("rejects non-JSON data returned by a tool", async () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const sparse: unknown[] = [];
+    sparse.length = 2;
+    sparse[1] = "value";
+    const invalidValues: Array<{ label: string; value: unknown }> = [
+      { label: "undefined", value: undefined },
+      { label: "non-finite number", value: Number.NaN },
+      { label: "bigint", value: 1n },
+      { label: "function", value: () => "not json" },
+      { label: "symbol", value: Symbol("not-json") },
+      { label: "sparse array", value: sparse },
+      { label: "cyclic object", value: cyclic },
+      { label: "non-plain object", value: new Date(0) },
+    ];
+
+    for (const [index, invalid] of invalidValues.entries()) {
+      const registry = new ToolRegistry();
+      registry.register({
+        name: `invalid_result_${index}`,
+        description: `returns ${invalid.label}`,
+        async execute() {
+          return { ok: true, data: invalid.value as never };
+        },
+      });
+
+      const output = await registry.execute(`invalid_result_${index}`, {});
+
+      expect(output.result).toMatchObject({
+        ok: false,
+        error: { code: "execution_failed" },
+      });
+      expect(JSON.parse(output.content)).toEqual(output.result);
+    }
+  });
+
+  // 失败结果的 details 也会写入 ToolMessage；这里验证其中的非 JSON 对象同样被替换为 execution_failed。
+  it("rejects non-JSON details returned in a tool error", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "invalid_error_details",
+      description: "returns invalid error details",
+      async execute() {
+        return {
+          ok: false,
+          error: {
+            code: "path_not_found",
+            message: "missing",
+            details: { value: new Date(0) as never },
+          },
+        };
+      },
+    });
+
+    const output = await registry.execute("invalid_error_details", {});
+
+    expect(output.result).toMatchObject({
+      ok: false,
+      error: { code: "execution_failed" },
+    });
+    expect(JSON.parse(output.content)).toEqual(output.result);
+  });
+});
+
+describe("ToolRegistry.execute serialized output limit", () => {
+  // 大型成功数据和错误 details 都会进入 ToolMessage；这里验证二者超过 Registry 硬上限时不会返回部分 JSON。
+  // Registry 应改为较小的 resource_limit 失败结果，并保证 content 完整可解析且不超过配置上限。
+  it("returns resource_limit when a serialized result exceeds the hard limit", async () => {
+    const maxSerializedToolResultCharacters = 200;
+    const registry = new ToolRegistry({ maxSerializedToolResultCharacters });
+    registry.register({
+      name: "oversized_success",
+      description: "returns oversized success data",
+      async execute() {
+        return { ok: true, data: "x".repeat(500) };
+      },
+    });
+    registry.register({
+      name: "oversized_failure",
+      description: "returns oversized error details",
+      async execute() {
+        return {
+          ok: false,
+          error: {
+            code: "path_not_found",
+            message: "missing",
+            details: { attemptedPath: "x".repeat(500) },
+          },
+        };
+      },
+    });
+
+    for (const name of ["oversized_success", "oversized_failure"]) {
+      const output = await registry.execute(name, {});
+
+      expect(output.result).toMatchObject({
+        ok: false,
+        error: { code: "resource_limit" },
+      });
+      expect(JSON.parse(output.content)).toEqual(output.result);
+      expect(output.content.length).toBeLessThanOrEqual(maxSerializedToolResultCharacters);
+    }
+  });
+
+  // 调用方未配置上限时应使用设计确定的 24,000 字符默认值；这里验证超出默认值的结果同样被拒绝。
+  it("uses a 24,000 character serialized output limit by default", async () => {
+    const registry = new ToolRegistry();
+    registry.register({
+      name: "default_limit",
+      description: "returns data above the default output limit",
+      async execute() {
+        return { ok: true, data: "x".repeat(24_000) };
+      },
+    });
+
+    const output = await registry.execute("default_limit", {});
+
+    expect(output.result).toMatchObject({
+      ok: false,
+      error: { code: "resource_limit" },
+    });
+    expect(JSON.parse(output.content)).toEqual(output.result);
+    expect(output.content.length).toBeLessThanOrEqual(24_000);
   });
 });

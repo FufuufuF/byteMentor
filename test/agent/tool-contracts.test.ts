@@ -5,64 +5,104 @@ import type {
   ProviderStreamEvent,
   ToolDefinition,
   ToolError,
+  ToolExecutionContext,
   ToolResult,
 } from "@byte-mentor/agent";
 import type { AssistantMessage, Message, StopReason } from "@byte-mentor/core";
 
 describe("agent tool type contracts", () => {
-  it("ToolError can express unknown_tool kind", () => {
-    const err: ToolError = { kind: "unknown_tool", message: "no such tool" };
-    expect(err.kind).toBe("unknown_tool");
+  // 验证 Registry 可以用 unknown_tool code 表达调用名称不存在，并附带模型可读消息。
+  it("ToolError can express unknown_tool code", () => {
+    const err: ToolError = { code: "unknown_tool", message: "no such tool" };
+    expect(err.code).toBe("unknown_tool");
     expect(err.message).toBe("no such tool");
   });
 
-  it("ToolError can express invalid_args kind", () => {
-    const err: ToolError = { kind: "invalid_args", message: "args must be object" };
-    expect(err.kind).toBe("invalid_args");
+  // 验证参数不符合工具 schema 时使用完整的 invalid_arguments code，而不是旧缩写。
+  it("ToolError can express invalid_arguments code", () => {
+    const err: ToolError = { code: "invalid_arguments", message: "args must be object" };
+    expect(err.code).toBe("invalid_arguments");
   });
 
-  it("ToolError can express execution_failed kind", () => {
-    const err: ToolError = { kind: "execution_failed", message: "tool threw" };
-    expect(err.kind).toBe("execution_failed");
+  // 验证未预期的工具异常可以用 execution_failed code 与正常失败结果统一传递。
+  it("ToolError can express execution_failed code", () => {
+    const err: ToolError = { code: "execution_failed", message: "tool threw" };
+    expect(err.code).toBe("execution_failed");
   });
 
-  it("ToolResult success variant carries result string", () => {
-    const r: ToolResult = { ok: true, result: "42" };
+  // 验证成功结果把可序列化的数据放在 data 字段，供 Registry 统一包装和序列化。
+  it("ToolResult success variant carries JSON-compatible data", () => {
+    const r: ToolResult = { ok: true, data: "42" };
     expect(r.ok).toBe(true);
-    expect(r.result).toBe("42");
+    expect(r.data).toBe("42");
   });
 
+  // 验证失败 ToolResult 通过 error 字段携带结构化 code 和消息。
   it("ToolResult failure variant carries ToolError", () => {
-    const r: ToolResult = { ok: false, error: { kind: "unknown_tool", message: "x" } };
+    const r: ToolResult = { ok: false, error: { code: "unknown_tool", message: "x" } };
     expect(r.ok).toBe(false);
-    expect(r.error.kind).toBe("unknown_tool");
+    expect(r.error.code).toBe("unknown_tool");
   });
 
+  // 验证 AgentTool 同时提供模型可见定义和返回结构化 ToolResult 的执行函数。
   it("AgentTool shape: name, description, optional schema, execute(args) -> Promise<ToolResult>", async () => {
     const tool: AgentTool = {
       name: "ping",
       description: "pong back",
       async execute(_args: unknown) {
-        return { ok: true, result: "pong" };
+        return { ok: true, data: "pong" };
       },
     };
     expect(tool.name).toBe("ping");
     expect(tool.description).toBe("pong back");
     expect(tool.parametersJsonSchema).toBeUndefined();
-    const r = await tool.execute({});
-    expect(r).toEqual({ ok: true, result: "pong" });
+    const r = await tool.execute({}, { workspaceReader: {} as never });
+    expect(r).toEqual({ ok: true, data: "pong" });
   });
 
+  // 验证 AgentTool 可以携带由 Registry 编译、Provider 原样映射的参数 schema。
   it("AgentTool can carry parametersJsonSchema as unknown", () => {
     const tool: AgentTool = {
       name: "calc",
       description: "calc",
       parametersJsonSchema: { type: "object", properties: { x: { type: "number" } } },
       async execute() {
-        return { ok: true, result: "" };
+        return { ok: true, data: "" };
       },
     };
     expect(tool.parametersJsonSchema).toBeDefined();
+  });
+
+  // 并发资格只描述 Runtime 调度能力；这里验证 AgentTool 可以显式声明 safe，供 Registry 查询。
+  it("AgentTool can declare runtime-only safe concurrency", () => {
+    const tool: AgentTool = {
+      name: "lookup",
+      description: "lookup docs",
+      concurrency: "safe",
+      async execute() {
+        return { ok: true, data: [] };
+      },
+    };
+
+    expect(tool.concurrency).toBe("safe");
+  });
+
+  // Tool 不读取全局 cwd；这里验证执行契约显式接收由 Registry 持有的统一 Workspace 上下文。
+  it("AgentTool receives an explicit ToolExecutionContext", async () => {
+    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    let receivedContext: ToolExecutionContext | undefined;
+    const tool: AgentTool = {
+      name: "capture_context",
+      description: "captures context",
+      async execute(_args: unknown, executionContext: ToolExecutionContext) {
+        receivedContext = executionContext;
+        return { ok: true, data: null };
+      },
+    };
+
+    await tool.execute({}, context);
+
+    expect(receivedContext).toBe(context);
   });
 
   it("ToolDefinition exposes name, description, optional schema", () => {

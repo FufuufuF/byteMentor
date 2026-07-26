@@ -65,6 +65,7 @@ function createConfig(input: { userMessage: string }): CliConfig {
     openaiApiKey: "sk-test",
     model: "gpt-test",
     dbPath: "/tmp/byte-mentor-test.sqlite",
+    workspaceRoot: "/tmp/byte-mentor-workspace",
   };
 }
 

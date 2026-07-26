@@ -17,6 +17,7 @@ import {
 } from "@byte-mentor/core";
 
 describe("RuntimeEvent common base", () => {
+  // 构造所有事件变体，验证公共的 turn 标识和数值时间戳在新工具观测字段下保持不变。
   it("every event carries type, turnId, ts:number", () => {
     const turnId = createTurnId();
     const sessionId = createSessionId();
@@ -28,8 +29,27 @@ describe("RuntimeEvent common base", () => {
       { type: "model.requested", turnId, ts: 3, messageCount: 0, toolCount: 0 },
       { type: "model.responded", turnId, ts: 4, messageId, stopReason: "completed" },
       { type: "tool.started", turnId, ts: 5, toolCallId, toolName: "n" },
-      { type: "tool.completed", turnId, ts: 6, toolCallId, result: "r" },
-      { type: "tool.failed", turnId, ts: 7, toolCallId, message: "m" },
+      {
+        type: "tool.completed",
+        turnId,
+        ts: 6,
+        toolCallId,
+        toolName: "read_file",
+        durationMs: 3,
+        outputCharacters: 12,
+        resultPreview: "preview",
+        resultPreviewTruncated: false,
+      },
+      {
+        type: "tool.failed",
+        turnId,
+        ts: 7,
+        toolCallId,
+        toolName: "read_file",
+        durationMs: 4,
+        errorCode: "path_not_found",
+        message: "m",
+      },
       { type: "turn.completed", turnId, ts: 8, sessionId, messageId, stopReason: "completed" },
       { type: "turn.failed", turnId, ts: 9, sessionId, message: "m" },
     ];
@@ -99,28 +119,49 @@ describe("RuntimeEvent variant-specific fields", () => {
     expect(e.toolName).toBe("search");
   });
 
-  it("tool.completed carries toolCallId and result", () => {
+  // 成功事件只携带工具名称、耗时、输出长度和有界预览，不复制完整 ToolResult 字段。
+  it("tool.completed carries bounded observation metadata", () => {
     const e: ToolCompletedEvent = {
       type: "tool.completed",
       turnId,
       ts: 1,
       toolCallId,
-      result: "ok",
+      toolName: "search_text",
+      durationMs: 12,
+      outputCharacters: 640,
+      resultPreview: "result prefix",
+      resultPreviewTruncated: true,
     };
     expect(e.toolCallId).toBe(toolCallId);
-    expect(e.result).toBe("ok");
+    expect(e).toMatchObject({
+      toolName: "search_text",
+      durationMs: 12,
+      outputCharacters: 640,
+      resultPreview: "result prefix",
+      resultPreviewTruncated: true,
+    });
+    expect(e).not.toHaveProperty("result");
   });
 
-  it("tool.failed carries toolCallId and error message", () => {
+  // 失败事件暴露结构化错误码和消息，同时保留定位调用所需的工具名称与耗时。
+  it("tool.failed carries structured observation metadata", () => {
     const e: ToolFailedEvent = {
       type: "tool.failed",
       turnId,
       ts: 1,
       toolCallId,
+      toolName: "read_file",
+      durationMs: 8,
+      errorCode: "unknown_tool",
       message: "unknown tool",
     };
     expect(e.toolCallId).toBe(toolCallId);
-    expect(e.message).toBe("unknown tool");
+    expect(e).toMatchObject({
+      toolName: "read_file",
+      durationMs: 8,
+      errorCode: "unknown_tool",
+      message: "unknown tool",
+    });
   });
 
   it("turn.completed carries sessionId, messageId, stopReason", () => {
@@ -153,16 +194,21 @@ describe("RuntimeEvent variant-specific fields", () => {
 describe("RuntimeEvent discriminated union narrowing", () => {
   const turnId = createTurnId();
 
-  it("narrows by type literal", () => {
+  // 判别联合收窄后应直接提供新的成功观测字段，而不是旧的完整 result 字段。
+  it("narrows tool completion observation fields by type literal", () => {
     const e: RuntimeEvent = {
       type: "tool.completed",
       turnId,
       ts: 1,
       toolCallId: createToolCallId(),
-      result: "x",
+      toolName: "find_files",
+      durationMs: 2,
+      outputCharacters: 1,
+      resultPreview: "x",
+      resultPreviewTruncated: false,
     };
     if (e.type === "tool.completed") {
-      expect(e.result).toBe("x");
+      expect(e.resultPreview).toBe("x");
     }
   });
 

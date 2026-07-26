@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { createMessageId, createToolCallId } from "@byte-mentor/core";
 import type { Message, RuntimeEvent, SessionId, StopReason } from "@byte-mentor/core";
-import { AgentLoop, AgentRunner, ContextBuilder } from "@byte-mentor/agent";
+import { AgentLoop, AgentRunner, ContextBuilder, ToolRegistry } from "@byte-mentor/agent";
 import type {
   ModelProvider,
   ProviderRequest,
@@ -130,6 +130,47 @@ describe("AgentLoop.runTurn", () => {
       },
       assistantMessage,
     ]);
+  });
+
+  // 应用组装层传入的 Registry 必须以同一实例进入 Runner，避免丢失已注册工具和执行上下文。
+  it("preserves an injected ToolRegistry instance", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        return { ok: true, data: "docs" };
+      },
+    });
+    let receivedTools: ToolRegistry | undefined;
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      tools,
+      runner: {
+        async run(input) {
+          receivedTools = input.tools;
+          return {
+            newMessages: [
+              {
+                id: createMessageId(),
+                role: "assistant" as const,
+                content: "done",
+              },
+            ],
+            stopReason: "completed" as const,
+            events: [],
+          };
+        },
+      },
+    });
+
+    await loop.runTurn({ userMessage: "hello" });
+
+    expect(loop.tools).toBe(tools);
+    expect(receivedTools).toBe(tools);
+    expect(receivedTools?.list().map((tool) => tool.name)).toEqual(["lookup"]);
   });
 
   it("passes existing session history to runner", async () => {
@@ -611,7 +652,7 @@ describe("AgentLoop.runTurn", () => {
       id: createMessageId(),
       role: "tool" as const,
       toolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     };
     await sessionStore.appendMessages(session.id, [previousUserMessage, storedAssistant]);
     await sessionStore.updateMetadata(session.id, () => ({
@@ -698,6 +739,7 @@ describe("AgentLoop.runTurn", () => {
     });
   });
 
+  // 验证 Loop 保存 Runner 产生的 assistant 调用、JSON 工具结果和最终回答完整轨迹。
   it("persists tool-call trace from runner", async () => {
     const toolCallId = createToolCallId();
     const provider = invokeProvider(async (req) => {
@@ -732,7 +774,7 @@ describe("AgentLoop.runTurn", () => {
       },
       async execute(args: unknown) {
         const a = args as { query: string };
-        return { ok: true, result: `result:${a.query}` };
+        return { ok: true, data: `result:${a.query}` };
       },
     });
 
@@ -755,12 +797,13 @@ describe("AgentLoop.runTurn", () => {
     expect(history[2]).toMatchObject({
       role: "tool",
       toolCallId,
-      content: "result:docs",
+      content: '{"ok":true,"data":"result:docs"}',
     });
     expect(history[3]).toMatchObject({ role: "assistant", content: "found docs" });
     expect(result.finalMessage).toBe(history[3]);
   });
 
+  // 验证一次工具 turn 的 Loop 事件包含上下文、模型和工具阶段，并保持发生顺序。
   it("emits runtime event sequence for a tool turn", async () => {
     const toolCallId = createToolCallId();
     const provider = invokeProvider(async (req) => {
@@ -769,7 +812,7 @@ describe("AgentLoop.runTurn", () => {
           message: {
             role: "assistant",
             content: "",
-            toolCalls: [{ id: toolCallId, name: "lookup", args: null }],
+            toolCalls: [{ id: toolCallId, name: "lookup", args: {} }],
           },
           stopReason: "tool_calls",
         };
@@ -789,7 +832,7 @@ describe("AgentLoop.runTurn", () => {
       name: "lookup",
       description: "lookup docs",
       async execute() {
-        return { ok: true, result: "result:docs" };
+        return { ok: true, data: "result:docs" };
       },
     });
 
@@ -828,8 +871,13 @@ describe("AgentLoop.runTurn", () => {
     expect(result.events[5]).toMatchObject({
       type: "tool.completed",
       toolCallId,
-      result: "result:docs",
+      toolName: "lookup",
+      durationMs: expect.any(Number),
+      outputCharacters: 32,
+      resultPreview: '{"ok":true,"data":"result:docs"}',
+      resultPreviewTruncated: false,
     });
+    expect(result.events[5]).not.toHaveProperty("result");
     expect(result.events[8]).toMatchObject({
       type: "turn.completed",
       sessionId: result.sessionId,
