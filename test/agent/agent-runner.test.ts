@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { createMessageId, createToolCallId, createTurnId } from "@byte-mentor/core";
-import type { AssistantMessage, Message, MessageId, ToolMessage } from "@byte-mentor/core";
+import type {
+  AssistantMessage,
+  Message,
+  MessageId,
+  RuntimeEvent,
+  ToolCall,
+  ToolMessage,
+} from "@byte-mentor/core";
 import { AgentRunner, ToolRegistry } from "@byte-mentor/agent";
 import type {
   ModelProvider,
@@ -8,7 +15,27 @@ import type {
   ProviderResponse,
   ProviderStreamEvent,
   RuntimeCheckpoint,
+  ToolResult,
 } from "@byte-mentor/agent";
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+async function settleAsyncWork(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
 
 function streamProvider(
   invokeStream: (req: ProviderRequest) => AsyncIterable<ProviderStreamEvent>,
@@ -46,6 +73,21 @@ function invokeProvider(
       message: response.message,
       stopReason: response.stopReason,
     };
+  });
+}
+
+function oneBatchProvider(toolCalls: ToolCall[], requests?: Message[][]): ModelProvider {
+  return invokeProvider(async (req) => {
+    requests?.push([...req.messages]);
+    return req.messages.length === 1
+      ? {
+          message: { role: "assistant", toolCalls },
+          stopReason: "tool_calls",
+        }
+      : {
+          message: { role: "assistant", content: "done" },
+          stopReason: "completed",
+        };
   });
 }
 
@@ -788,8 +830,13 @@ describe("AgentRunner.run", () => {
     expect(result.events[3]).toMatchObject({
       type: "tool.completed",
       toolCallId,
-      result: '{"ok":true,"data":"result:docs"}',
+      toolName: "lookup",
+      durationMs: expect.any(Number),
+      outputCharacters: 32,
+      resultPreview: '{"ok":true,"data":"result:docs"}',
+      resultPreviewTruncated: false,
     });
+    expect(result.events[3]).not.toHaveProperty("result");
     expect(result.events[4]).toMatchObject({
       type: "model.requested",
       messageCount: 3,
@@ -926,6 +973,413 @@ describe("AgentRunner.run", () => {
       role: "assistant",
       content: "checking tool",
       toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    });
+  });
+
+  // 非正整数并发度会让调度语义失去边界，因此 Runner 必须在构造时快速失败。
+  it.each([0, -1, 1.5, Number.NaN])(
+    "rejects invalid maxConcurrentToolCalls value %s",
+    (maxConcurrentToolCalls) => {
+      const provider = oneBatchProvider([]);
+
+      expect(() => new AgentRunner(provider, { maxConcurrentToolCalls })).toThrow(
+        "maxConcurrentToolCalls must be a positive integer",
+      );
+    },
+  );
+
+  // 六个 safe 调用共享阻塞门；默认配置只应先启动四个，同时证明确有 I/O 重叠。
+  it("bounds safe tool calls at the default concurrency of four", async () => {
+    const toolCalls = Array.from({ length: 6 }, (_, index) => ({
+      id: createToolCallId(),
+      name: "safe_read",
+      args: { index },
+    }));
+    const release = deferred<void>();
+    const started: number[] = [];
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        const { index } = args as { index: number };
+        started.push(index);
+        inFlight += 1;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await release.promise;
+        inFlight -= 1;
+        return { ok: true, data: index };
+      },
+    });
+    const runPromise = new AgentRunner(oneBatchProvider(toolCalls)).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "read all" }],
+      tools,
+    });
+
+    await settleAsyncWork(() => started.length >= 4);
+    try {
+      expect([...started]).toEqual([0, 1, 2, 3]);
+      expect(peakInFlight).toBe(4);
+    } finally {
+      release.resolve();
+      await runPromise;
+    }
+    expect(started).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(peakInFlight).toBe(4);
+  });
+
+  // 显式并发度二应覆盖完整 execute 生命周期，第三个调用必须等前两个之一完成后才启动。
+  it("honors a configured safe tool concurrency limit", async () => {
+    const toolCalls = Array.from({ length: 5 }, (_, index) => ({
+      id: createToolCallId(),
+      name: "safe_search",
+      args: { index },
+    }));
+    const release = deferred<void>();
+    const started: number[] = [];
+    let inFlight = 0;
+    let peakInFlight = 0;
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_search",
+      description: "search safely",
+      concurrency: "safe",
+      async execute(args) {
+        const { index } = args as { index: number };
+        started.push(index);
+        inFlight += 1;
+        peakInFlight = Math.max(peakInFlight, inFlight);
+        await release.promise;
+        inFlight -= 1;
+        return { ok: true, data: index };
+      },
+    });
+    const runPromise = new AgentRunner(oneBatchProvider(toolCalls), {
+      maxConcurrentToolCalls: 2,
+    }).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "search all" }],
+      tools,
+    });
+
+    await settleAsyncWork(() => started.length >= 2);
+    try {
+      expect([...started]).toEqual([0, 1]);
+      expect(peakInFlight).toBe(2);
+    } finally {
+      release.resolve();
+      await runPromise;
+    }
+    expect(started).toEqual([0, 1, 2, 3, 4]);
+    expect(peakInFlight).toBe(2);
+  });
+
+  // 只要批次含未声明 safe 的工具，前一个 safe 调用阻塞时后续调用都不得提前启动。
+  it("keeps mixed-concurrency tool batches serial", async () => {
+    const release = deferred<void>();
+    const started: string[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        started.push((args as { label: string }).label);
+        await release.promise;
+        return { ok: true, data: "safe" };
+      },
+    });
+    tools.register({
+      name: "serial_write",
+      description: "write serially",
+      async execute(args) {
+        started.push((args as { label: string }).label);
+        await release.promise;
+        return { ok: true, data: "serial" };
+      },
+    });
+    const runPromise = new AgentRunner(
+      oneBatchProvider([
+        { id: createToolCallId(), name: "safe_read", args: { label: "first" } },
+        { id: createToolCallId(), name: "serial_write", args: { label: "second" } },
+        { id: createToolCallId(), name: "safe_read", args: { label: "third" } },
+      ]),
+      { maxConcurrentToolCalls: 3 },
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "mixed batch" }],
+      tools,
+    });
+
+    await settleAsyncWork(() => started.length >= 1);
+    try {
+      expect(started).toEqual(["first"]);
+    } finally {
+      release.resolve();
+      await runPromise;
+    }
+    expect(started).toEqual(["first", "second", "third"]);
+  });
+
+  // 未知工具默认属于 serial；它出现在批次中时，不能让同批 safe 调用绕过保守调度。
+  it("keeps batches containing an unknown tool serial", async () => {
+    const release = deferred<void>();
+    const started: string[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        started.push((args as { label: string }).label);
+        await release.promise;
+        return { ok: true, data: "safe" };
+      },
+    });
+    const runPromise = new AgentRunner(
+      oneBatchProvider([
+        { id: createToolCallId(), name: "safe_read", args: { label: "first" } },
+        { id: createToolCallId(), name: "missing_tool", args: {} },
+        { id: createToolCallId(), name: "safe_read", args: { label: "third" } },
+      ]),
+      { maxConcurrentToolCalls: 3 },
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "unknown batch" }],
+      tools,
+    });
+
+    await settleAsyncWork(() => started.length >= 1);
+    try {
+      expect(started).toEqual(["first"]);
+    } finally {
+      release.resolve();
+      await runPromise;
+    }
+    expect(started).toEqual(["first", "third"]);
+  });
+
+  // 参数解析失败也使整批串行，但失败位置仍应生成 ToolMessage 且不执行对应工具。
+  it("keeps batches containing an argument parse failure serial", async () => {
+    const firstId = createToolCallId();
+    const malformedId = createToolCallId();
+    const thirdId = createToolCallId();
+    const release = deferred<void>();
+    const started: string[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        started.push((args as { label: string }).label);
+        await release.promise;
+        return { ok: true, data: "safe" };
+      },
+    });
+    const runPromise = new AgentRunner(
+      oneBatchProvider([
+        { id: firstId, name: "safe_read", args: { label: "first" } },
+        {
+          id: malformedId,
+          name: "safe_read",
+          args: "{bad-json",
+          argsParseError: "Unexpected token b in JSON",
+        },
+        { id: thirdId, name: "safe_read", args: { label: "third" } },
+      ]),
+      { maxConcurrentToolCalls: 3 },
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "malformed batch" }],
+      tools,
+    });
+
+    await settleAsyncWork(() => started.length >= 1);
+    let result: Awaited<ReturnType<AgentRunner["run"]>>;
+    try {
+      expect(started).toEqual(["first"]);
+    } finally {
+      release.resolve();
+      result = await runPromise;
+    }
+    expect(started).toEqual(["first", "third"]);
+    expect(result.newMessages.slice(1, 4)).toMatchObject([
+      { role: "tool", toolCallId: firstId },
+      {
+        role: "tool",
+        toolCallId: malformedId,
+        content: expect.stringContaining("Unexpected token b in JSON") as string,
+      },
+      { role: "tool", toolCallId: thirdId },
+    ]);
+  });
+
+  // 两个 safe 调用反向完成且其中一个失败时，消息和 tools_completed checkpoint 仍按调用顺序组装。
+  it("preserves tool call order when concurrent completion order differs", async () => {
+    const firstId = createToolCallId();
+    const secondId = createToolCallId();
+    const completions = {
+      first: deferred<ToolResult>(),
+      second: deferred<ToolResult>(),
+    };
+    const started: string[] = [];
+    const providerRequests: Message[][] = [];
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        const label = (args as { label: "first" | "second" }).label;
+        started.push(label);
+        return completions[label].promise;
+      },
+    });
+    const runPromise = new AgentRunner(
+      oneBatchProvider(
+        [
+          { id: firstId, name: "safe_read", args: { label: "first" } },
+          { id: secondId, name: "safe_read", args: { label: "second" } },
+        ],
+        providerRequests,
+      ),
+      { maxConcurrentToolCalls: 2 },
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "ordered batch" }],
+      tools,
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    await settleAsyncWork(() => started.length >= 2);
+    let result: Awaited<ReturnType<AgentRunner["run"]>>;
+    try {
+      expect([...started]).toEqual(["first", "second"]);
+      completions.second.resolve({
+        ok: false,
+        error: { code: "path_not_found", message: "second failed" },
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      completions.first.resolve({ ok: true, data: "first result" });
+      result = await runPromise;
+    } finally {
+      completions.first.resolve({ ok: true, data: "first result" });
+      completions.second.resolve({
+        ok: false,
+        error: { code: "path_not_found", message: "second failed" },
+      });
+      result = await runPromise;
+    }
+
+    expect(result.newMessages.slice(1, 3)).toMatchObject([
+      {
+        role: "tool",
+        toolCallId: firstId,
+        content: '{"ok":true,"data":"first result"}',
+      },
+      {
+        role: "tool",
+        toolCallId: secondId,
+        content: '{"ok":false,"error":{"code":"path_not_found","message":"second failed"}}',
+      },
+    ]);
+    expect(providerRequests[1]?.slice(-2)).toEqual(result.newMessages.slice(1, 3));
+    const toolsCompleted = checkpoints.find((checkpoint) => checkpoint.phase === "tools_completed");
+    expect(toolsCompleted?.newMessages.slice(1, 3)).toEqual(result.newMessages.slice(1, 3));
+    expect(result.events.filter((event) => event.type === "tool.completed")).toHaveLength(1);
+    expect(result.events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
+  });
+
+  // 长 emoji 结果按 Unicode code point 截取前 500 个字符，并仅在 ToolMessage 保留完整 JSON。
+  it("emits a bounded Unicode result preview for successful tools", async () => {
+    const toolCallId = createToolCallId();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute() {
+        return { ok: true, data: "😀".repeat(600) };
+      },
+    });
+
+    const result = await new AgentRunner(
+      oneBatchProvider([{ id: toolCallId, name: "safe_read", args: {} }]),
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "preview" }],
+      tools,
+    });
+    const toolMessage = result.newMessages[1] as ToolMessage;
+    const completed = result.events.find(
+      (event): event is Extract<RuntimeEvent, { type: "tool.completed" }> =>
+        event.type === "tool.completed",
+    );
+
+    expect(completed).toEqual({
+      type: "tool.completed",
+      turnId: expect.any(String),
+      ts: expect.any(Number),
+      toolCallId,
+      toolName: "safe_read",
+      durationMs: expect.any(Number),
+      outputCharacters: toolMessage.content.length,
+      resultPreview: [...toolMessage.content].slice(0, 500).join(""),
+      resultPreviewTruncated: true,
+    });
+    expect(completed).not.toHaveProperty("result");
+  });
+
+  // 预期 ToolResult 失败应生成结构化失败观测，完整失败 envelope 仍只写入 ToolMessage。
+  it("emits structured observation metadata for failed tools", async () => {
+    const toolCallId = createToolCallId();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute() {
+        return {
+          ok: false,
+          error: { code: "path_not_found", message: "missing file" },
+        };
+      },
+    });
+
+    const result = await new AgentRunner(
+      oneBatchProvider([{ id: toolCallId, name: "safe_read", args: {} }]),
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "missing" }],
+      tools,
+    });
+    const failed = result.events.find(
+      (event): event is Extract<RuntimeEvent, { type: "tool.failed" }> =>
+        event.type === "tool.failed",
+    );
+
+    expect(failed).toEqual({
+      type: "tool.failed",
+      turnId: expect.any(String),
+      ts: expect.any(Number),
+      toolCallId,
+      toolName: "safe_read",
+      durationMs: expect.any(Number),
+      errorCode: "path_not_found",
+      message: "missing file",
+    });
+    expect(result.newMessages[1]).toMatchObject({
+      role: "tool",
+      toolCallId,
+      content: '{"ok":false,"error":{"code":"path_not_found","message":"missing file"}}',
     });
   });
 });

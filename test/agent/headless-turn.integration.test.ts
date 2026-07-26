@@ -14,6 +14,25 @@ import type {
 } from "@byte-mentor/agent";
 import { InMemorySessionStore, SqliteSessionStore } from "@byte-mentor/session";
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => {
+    resolve = complete;
+  });
+  return { promise, resolve };
+}
+
+async function settleAsyncWork(condition: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20 && !condition(); attempt += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+}
+
 function invokeProvider(
   invoke: (req: ProviderRequest) => Promise<ProviderResponse>,
 ): ModelProvider {
@@ -132,6 +151,69 @@ describe("headless turn public API integration", () => {
     expect(providerRequests).toHaveLength(2);
   });
 
+  // 公共 Headless 链路应让 safe 调用重叠执行，同时按模型调用顺序持久化工具消息。
+  it("preserves persisted tool order across concurrent headless execution", async () => {
+    const firstId = createToolCallId();
+    const secondId = createToolCallId();
+    const provider = invokeProvider(async (req) =>
+      req.messages.length === 1
+        ? {
+            message: {
+              role: "assistant",
+              toolCalls: [
+                { id: firstId, name: "safe_read", args: { label: "first" } },
+                { id: secondId, name: "safe_read", args: { label: "second" } },
+              ],
+            },
+            stopReason: "tool_calls",
+          }
+        : {
+            message: { role: "assistant", content: "Both reads completed." },
+            stopReason: "completed",
+          },
+    );
+    const release = deferred<void>();
+    const started: string[] = [];
+    const sessionStore = new InMemorySessionStore();
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: new AgentRunner(provider, { maxConcurrentToolCalls: 2 }),
+    });
+    loop.tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        const label = (args as { label: string }).label;
+        started.push(label);
+        await release.promise;
+        return { ok: true, data: `${label} result` };
+      },
+    });
+    const turnPromise = loop.runTurn({ userMessage: "Read both files." });
+
+    await settleAsyncWork(() => started.length >= 2);
+    let result: Awaited<ReturnType<AgentLoop["runTurn"]>>;
+    try {
+      expect([...started]).toEqual(["first", "second"]);
+    } finally {
+      release.resolve();
+      result = await turnPromise;
+    }
+    const history = await sessionStore.getHistory(result.sessionId);
+    expect(history.slice(1, 4)).toMatchObject([
+      { role: "assistant", toolCalls: [{ id: firstId }, { id: secondId }] },
+      { role: "tool", toolCallId: firstId, content: '{"ok":true,"data":"first result"}' },
+      {
+        role: "tool",
+        toolCallId: secondId,
+        content: '{"ok":true,"data":"second result"}',
+      },
+    ]);
+  });
+
+  // SQLite 重开后应恢复最后 checkpoint，并在新 turn 构建上下文前清理恢复元数据。
   it("restores a runtime checkpoint after reopening a SQLite session store", async () => {
     const dir = await mkdtemp(join(tmpdir(), "byte-mentor-checkpoint-integration-"));
     const dbPath = join(dir, "session.sqlite");

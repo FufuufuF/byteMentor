@@ -38,12 +38,19 @@ export interface ToolStartedEvent extends RuntimeEventBase {
 export interface ToolCompletedEvent extends RuntimeEventBase {
   type: "tool.completed";
   toolCallId: ToolCallId;
-  result: string;
+  toolName: string;
+  durationMs: number;
+  outputCharacters: number;
+  resultPreview: string;
+  resultPreviewTruncated: boolean;
 }
 
 export interface ToolFailedEvent extends RuntimeEventBase {
   type: "tool.failed";
   toolCallId: ToolCallId;
+  toolName: string;
+  durationMs: number;
+  errorCode: string;
   message: string;
 }
 

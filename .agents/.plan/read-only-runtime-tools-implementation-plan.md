@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 6 GREEN / Review 问题已修复）
+- 状态：开发中（Batch 7 GREEN / 等待 Review）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -539,6 +539,17 @@ Review 重点：
 - 并发限制是否作用于整个 Tool Call 生命周期，没有无上限创建已开始的 Promise。
 - 并发是否只影响执行时间，没有改变模型轨迹、checkpoint 和恢复语义。
 - RuntimeEvent 是否仅用于观测，完整结果仍以 ToolMessage 为唯一模型输入来源。
+
+Batch 7 TDD 状态：
+
+- [x] Batch 5/6 Review 问题已以 `6605477 fix(agent): harden windowed text reading` 修复。
+- [x] RED：一次性完成构造配置、safe-only 有界并发、保守串行回退、稳定顺序、失败隔离和 RuntimeEvent 收敛测试。
+- [x] GREEN：实现有界 worker 调度与新的 Tool 观测事件，并通过全量验证。
+
+开发进度：
+
+- 2026-07-26：Batch 7 RED。新增 13 个 Runner / Headless 目标测试并迁移 RuntimeEvent 契约测试；定向测试 11 failed、33 passed，失败原因是 Runner 尚无并发配置与调度、事件仍携带旧 `result` 字段。lint 与 format check 通过，未修改生产代码。
+- 2026-07-26：Batch 7 GREEN。AgentRunner 新增默认值为 4 的正整数并发配置，仅对全部可解析且 Registry 明确标记 `safe` 的批次使用固定 worker 数执行；混合、未知和参数解析失败批次保持串行。并发结果按原始调用顺序写入 ToolMessage、working messages、checkpoint 与事件，单个失败不取消同批调用；Tool 事件收敛为耗时、输出字符数、500 code point 预览或结构化错误元数据。全量 245 个测试、typecheck、lint 与 format check 全部通过。
 
 ### Batch 8: CLI 组装与只读感知闭环
 

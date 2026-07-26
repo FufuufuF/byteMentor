@@ -18,8 +18,14 @@ import type { RuntimeCheckpoint } from "../loop/runtime-checkpoint.js";
 import type { ToolRegistry } from "../tools/tool-registry.js";
 
 const DEFAULT_MAX_ITERATIONS = 10;
+const DEFAULT_MAX_CONCURRENT_TOOL_CALLS = 4;
+const TOOL_RESULT_PREVIEW_CHARACTERS = 500;
 const CHECKPOINT_PERSISTENCE_FAILURE_TOOL_ERROR =
   "Error: Tool execution skipped because checkpoint persistence failed.";
+
+export interface AgentRunnerOptions {
+  maxConcurrentToolCalls?: number;
+}
 
 export interface AgentRunnerInput {
   turnId: TurnId;
@@ -37,8 +43,25 @@ export interface AgentRunnerResult {
   error?: { message: string };
 }
 
+interface ToolCallExecution {
+  toolMessage: ToolMessage;
+  events: RuntimeEvent[];
+}
+
 export class AgentRunner {
-  constructor(private readonly provider: ModelProvider) {}
+  private readonly provider: ModelProvider;
+  private readonly maxConcurrentToolCalls: number;
+
+  // 保存模型 Provider 和工具调用并发上限，并在启动时拒绝无效的 Runtime 配置。
+  constructor(provider: ModelProvider, options: AgentRunnerOptions = {}) {
+    const maxConcurrentToolCalls =
+      options.maxConcurrentToolCalls ?? DEFAULT_MAX_CONCURRENT_TOOL_CALLS;
+    if (!Number.isInteger(maxConcurrentToolCalls) || maxConcurrentToolCalls <= 0) {
+      throw new Error("maxConcurrentToolCalls must be a positive integer");
+    }
+    this.provider = provider;
+    this.maxConcurrentToolCalls = maxConcurrentToolCalls;
+  }
 
   // 执行当前 turn 的模型与工具循环，记录运行事件，并返回本轮新产生的消息。
   async run(input: AgentRunnerInput): Promise<AgentRunnerResult> {
@@ -124,51 +147,11 @@ export class AgentRunner {
         return checkpointFailed(newMessages, events, awaitingToolsError);
       }
 
-      for (const toolCall of assistantMessage.toolCalls) {
-        if (toolCall.argsParseError !== undefined) {
-          const toolMessage: ToolMessage = {
-            id: createMessageId(),
-            role: "tool",
-            toolCallId: toolCall.id,
-            content: toolCallArgsParseErrorContent(toolCall),
-          };
-          workingMessages.push(toolMessage);
-          newMessages.push(toolMessage);
-          continue;
-        }
-        events.push({
-          type: "tool.started",
-          turnId: input.turnId,
-          ts: Date.now(),
-          toolCallId: toolCall.id,
-          toolName: toolCall.name,
-        });
-        const toolOutput = await input.tools.execute(toolCall.name, toolCall.args);
-        events.push(
-          toolOutput.result.ok
-            ? {
-                type: "tool.completed",
-                turnId: input.turnId,
-                ts: Date.now(),
-                toolCallId: toolCall.id,
-                result: toolOutput.content,
-              }
-            : {
-                type: "tool.failed",
-                turnId: input.turnId,
-                ts: Date.now(),
-                toolCallId: toolCall.id,
-                message: toolOutput.result.error.message,
-              },
-        );
-        const toolMessage: ToolMessage = {
-          id: createMessageId(),
-          role: "tool",
-          toolCallId: toolCall.id,
-          content: toolOutput.content,
-        };
-        workingMessages.push(toolMessage);
-        newMessages.push(toolMessage);
+      const toolExecutions = await this.executeToolCallBatch(input, assistantMessage.toolCalls);
+      for (const execution of toolExecutions) {
+        events.push(...execution.events);
+        workingMessages.push(execution.toolMessage);
+        newMessages.push(execution.toolMessage);
       }
       const toolsCompletedError = await emitCheckpoint(input.checkpoint, {
         phase: "tools_completed",
@@ -185,6 +168,90 @@ export class AgentRunner {
       newMessages,
       stopReason: "max_iterations",
       events,
+    };
+  }
+
+  // 仅在整批调用都可解析且明确声明 safe 时使用有界并发，否则按原顺序逐个执行。
+  private async executeToolCallBatch(
+    input: AgentRunnerInput,
+    toolCalls: ToolCall[],
+  ): Promise<ToolCallExecution[]> {
+    const canRunConcurrently = toolCalls.every(
+      (toolCall) =>
+        toolCall.argsParseError === undefined &&
+        input.tools.getConcurrency(toolCall.name) === "safe",
+    );
+    if (!canRunConcurrently) {
+      const executions: ToolCallExecution[] = [];
+      for (const toolCall of toolCalls) {
+        executions.push(await this.executeToolCall(input, toolCall));
+      }
+      return executions;
+    }
+
+    return mapWithConcurrency(toolCalls, this.maxConcurrentToolCalls, (toolCall) =>
+      this.executeToolCall(input, toolCall),
+    );
+  }
+
+  // 执行单个调用并生成对应 ToolMessage 与有界观测事件；参数解析失败不会进入 Registry。
+  private async executeToolCall(
+    input: AgentRunnerInput,
+    toolCall: ToolCall,
+  ): Promise<ToolCallExecution> {
+    if (toolCall.argsParseError !== undefined) {
+      return {
+        toolMessage: {
+          id: createMessageId(),
+          role: "tool",
+          toolCallId: toolCall.id,
+          content: toolCallArgsParseErrorContent(toolCall),
+        },
+        events: [],
+      };
+    }
+
+    const startedAt = Date.now();
+    const startedEvent: RuntimeEvent = {
+      type: "tool.started",
+      turnId: input.turnId,
+      ts: startedAt,
+      toolCallId: toolCall.id,
+      toolName: toolCall.name,
+    };
+    const toolOutput = await input.tools.execute(toolCall.name, toolCall.args);
+    const completedAt = Date.now();
+    const durationMs = completedAt - startedAt;
+    const terminalEvent: RuntimeEvent = toolOutput.result.ok
+      ? {
+          type: "tool.completed",
+          turnId: input.turnId,
+          ts: completedAt,
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          durationMs,
+          outputCharacters: toolOutput.content.length,
+          resultPreview: [...toolOutput.content].slice(0, TOOL_RESULT_PREVIEW_CHARACTERS).join(""),
+          resultPreviewTruncated: [...toolOutput.content].length > TOOL_RESULT_PREVIEW_CHARACTERS,
+        }
+      : {
+          type: "tool.failed",
+          turnId: input.turnId,
+          ts: completedAt,
+          toolCallId: toolCall.id,
+          toolName: toolCall.name,
+          durationMs,
+          errorCode: toolOutput.result.error.code,
+          message: toolOutput.result.error.message,
+        };
+    return {
+      toolMessage: {
+        id: createMessageId(),
+        role: "tool",
+        toolCallId: toolCall.id,
+        content: toolOutput.content,
+      },
+      events: [startedEvent, terminalEvent],
     };
   }
 
@@ -224,6 +291,26 @@ export class AgentRunner {
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
   }
+}
+
+// 使用固定数量的 worker 消费输入，确保 mapper 从开始到完成的并发数不超过显式上限。
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(limit, items.length);
+  const workers = Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(items[index] as T);
+    }
+  });
+  await Promise.all(workers);
+  return results;
 }
 
 async function emitCheckpoint(

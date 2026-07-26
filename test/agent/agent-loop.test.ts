@@ -830,8 +830,13 @@ describe("AgentLoop.runTurn", () => {
     expect(result.events[5]).toMatchObject({
       type: "tool.completed",
       toolCallId,
-      result: '{"ok":true,"data":"result:docs"}',
+      toolName: "lookup",
+      durationMs: expect.any(Number),
+      outputCharacters: 32,
+      resultPreview: '{"ok":true,"data":"result:docs"}',
+      resultPreviewTruncated: false,
     });
+    expect(result.events[5]).not.toHaveProperty("result");
     expect(result.events[8]).toMatchObject({
       type: "turn.completed",
       sessionId: result.sessionId,
