@@ -2,7 +2,7 @@
 
 ## 1. 计划状态
 
-- 状态：开发中（Batch 7 GREEN / 等待 Review）
+- 状态：已完成（Batch 8 GREEN / 真实模型 E2E 通过）
 - 架构依据：`.agents/.design/read-only-runtime-tools-design.md`
 - 实现范围：`@byte-mentor/agent` 内的四个只读 Tool、有界并发调度以及 CLI 组装闭环
 
@@ -585,6 +585,18 @@ Review 重点：
 - CLI 是否是唯一的应用组装层，AgentLoop 是否仍不依赖具体文件系统实现。
 - workspaceRoot 是否在 Runtime 创建时固定，不会被后续 `process.cwd()` 变化影响。
 - smoke 是否经过真实 AgentLoop / AgentRunner / Registry / Tool 链路，同时保持纯本地且可重复。
+
+Batch 8 TDD 状态：
+
+- [x] Batch 7 已以 `4c165fc feat(agent): run read-only tool calls concurrently` 提交。
+- [x] RED：完成 workspaceRoot、Registry 注入、真实 Runtime Tool 暴露、完整只读闭环和安全拒绝测试。
+- [x] GREEN：完成 AgentLoop / CLI 组装闭环，并通过全量验证。
+
+开发进度：
+
+- 2026-07-26：Batch 8 RED。CLI 配置、AgentLoop 注入和 Runtime 集成定向测试 5 failed、28 passed；失败原因分别为配置未保留 workspaceRoot、Loop 忽略注入 Registry，以及 `createRuntime()` 尚未作为可测试的真实组装入口导出。未修改生产代码。
+- 2026-07-26：Batch 8 GREEN。CliConfig 固定启动 cwd 为 workspaceRoot；AgentLoop 保留注入的同一 ToolRegistry 并兼容缺省空 Registry；CLI createRuntime 组装默认 Policy、Reader、带显式序列化上限的 Registry 和四个内置 Tool，并支持注入 Provider / SessionStore 复用同一真实链路。fake provider 完成 list -> find -> search -> 分段 read 闭环，并验证工作区外、`.env`、`.git` 和 `.byte-mentor` 均结构化拒绝。全量 249 个测试、typecheck、lint 与 format check 全部通过。
+- 2026-07-26：真实模型 E2E 通过。构建后的 CLI 从隔离临时工作区启动，经真实 OpenAI-compatible 流式 Provider 完成 list / find / search / read 及基于 nextPosition 的续读；SQLite 记录 15 条消息和 10 条 ToolMessage，四个敏感或越界路径均返回 access_denied，敏感 fixture 标记泄露数为 0，会话 metadata 正常清空。
 
 ## 4. 最终验收
 

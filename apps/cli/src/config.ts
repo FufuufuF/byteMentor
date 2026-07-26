@@ -9,6 +9,7 @@ export interface CliConfig {
   model: string;
   openaiBaseURL?: string;
   dbPath: string;
+  workspaceRoot: string;
 }
 
 export class CliConfigError extends Error {
@@ -24,6 +25,7 @@ export interface LoadCliConfigInput {
   cwd: string;
 }
 
+// 解析一次启动输入并固定数据库路径与工作区根目录，供后续 Runtime 组装显式使用。
 export function loadCliConfig(input: LoadCliConfigInput): CliConfig {
   const parsed = parseArgs({
     args: input.argv,
@@ -57,6 +59,7 @@ export function loadCliConfig(input: LoadCliConfigInput): CliConfig {
       ? { openaiBaseURL: input.env.BYTE_MENTOR_OPENAI_BASE_URL }
       : {}),
     dbPath,
+    workspaceRoot: input.cwd,
   };
 }
 

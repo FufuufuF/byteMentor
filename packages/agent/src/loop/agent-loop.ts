@@ -73,6 +73,7 @@ export interface AgentLoopInput {
   sessionStore: SessionStore;
   contextBuilder: ContextBuilder;
   runner: Pick<AgentRunner, "run">;
+  tools?: ToolRegistry;
 }
 
 interface TurnContext {
@@ -95,12 +96,14 @@ export class AgentLoop {
   private readonly sessionStore: SessionStore;
   private readonly contextBuilder: ContextBuilder;
   private readonly runner: Pick<AgentRunner, "run">;
-  readonly tools = new ToolRegistry();
+  readonly tools: ToolRegistry;
 
+  // 保存应用层组装的依赖，并在未注入工具时创建兼容现有调用方的空 Registry。
   constructor(input: AgentLoopInput) {
     this.sessionStore = input.sessionStore;
     this.contextBuilder = input.contextBuilder;
     this.runner = input.runner;
+    this.tools = input.tools ?? new ToolRegistry();
   }
 
   async runTurn(

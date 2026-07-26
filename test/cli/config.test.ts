@@ -24,6 +24,7 @@ function loadConfig(input: ConfigTestInput) {
 }
 
 describe("loadCliConfig", () => {
+  // 启动目录既决定默认数据库位置，也会被原样保留为后续只读工具的固定工作区根目录。
   it("parses chat command and required env", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
     const dbPath = join(cwd, "byte-mentor.sqlite");
@@ -46,6 +47,7 @@ describe("loadCliConfig", () => {
       model: "gpt-test",
       openaiBaseURL: "https://example.test/v1",
       dbPath,
+      workspaceRoot: cwd,
     });
   });
 
