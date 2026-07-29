@@ -76,7 +76,7 @@ Hook
 
 - 后续如果做 Web App，前端、后端和 agent runtime 可以共享类型定义。
 - CLI / TUI / HTTP API 可以在同一套工程体系内演进。
-- Tool schema、记忆数据结构、Teaching Brief、Observation Log 等核心结构适合用 TypeScript 类型稳定表达。
+- Tool schema、记忆数据结构、TeachingPlan、MemoryUpdateProposal 等核心结构适合用 TypeScript 类型稳定表达。
 - 可以优先参考 openClaw 的 CLI / TUI / embedded runtime 形态，同时保留 Byte Mentor 自己的教学状态机和记忆模块。
 
 第一阶段 Node.js 运行时基线使用 Node.js 22。
@@ -180,7 +180,7 @@ packages/core
 - `@byte-mentor/cli`：本地应用入口，负责启动 CLI / TUI，并组装 agent runtime 需要的依赖。
 - `@byte-mentor/tui`：终端交互界面，负责用户输入、聊天记录、状态栏、命令面板和运行事件渲染。
 - `@byte-mentor/agent`：教学 agent runtime，负责教学状态机、上下文构建、模型调用循环、工具调用编排和运行事件产出。Provider 和 ToolRegistry 第一阶段作为该包的内部模块存在。
-- `@byte-mentor/knowledge`：知识子系统，负责 CatalogIndex、KnowledgeGraph、UserKnowledgeStatus、UserReadableNote、Teaching Brief 和 Graph Sync Plan。
+- `@byte-mentor/knowledge`：知识子系统，负责 KnowledgeTree、LearningEvidence、UserKnowledgeState、Planner、Memory Committer 和 UserReadableNote。
 - `@byte-mentor/session`：会话存储与恢复，负责消息历史、会话元数据和本地持久化。
 - `@byte-mentor/core`：共享契约和基础类型，负责跨包通用 ID、运行事件、命令协议、错误模型和基础接口。
 
@@ -195,7 +195,7 @@ Provider 和 ToolRegistry 不在第一阶段拆成独立 workspace package。
 
 `@byte-mentor/knowledge` 不命名为 `memory`。
 
-原因是 Byte Mentor 的知识子系统不是常规 agent memory。它不只是聊天历史、摘要、向量检索或长期文件记忆，而是同时包含全局知识图谱、用户知识状态、用户可读笔记、Teaching Brief 生成和会话结束后的学习状态写回。
+原因是 Byte Mentor 的知识子系统不是常规 agent memory。它不只是聊天历史、摘要、向量检索或长期文件记忆，而是同时包含知识树、可追溯学习证据、用户知识状态、教学计划编译、确定性记忆提交和用户可读笔记。
 
 import 关系图如下。
 
@@ -292,13 +292,13 @@ flowchart TD
 - 调用内部 Provider 获取模型输出。
 - 通过内部 ToolRegistry 执行工具调用。
 - 根据教学过程产出运行事件。
-- 在合适时机请求 Knowledge 子系统生成 Teaching Brief、记录观察和执行写回。
+- 在合适时机请求 Knowledge 子系统生成 TeachingPlan、提交观察结果和执行写回。
 - 在合适时机请求 Session 读取或保存会话过程。
 
 它不负责：
 
 - 长期知识状态的事实维护。
-- 知识图谱结构的内部更新规则。
+- 知识树和学习证据的正式写入规则。
 - 用户可读笔记的正式写入规则。
 - 终端界面渲染。
 - 底层持久化格式。
@@ -309,14 +309,13 @@ flowchart TD
 
 它负责：
 
-- CatalogIndex。
-- KnowledgeGraph。
-- UserKnowledgeStatus。
-- UserReadableNote。
-- Teaching Brief 生成。
-- Observation Log 的知识语义处理。
-- 会话结束后的学习状态写回。
-- Graph Sync Plan。
+- KnowledgeTree。
+- LearningEvidence。
+- UserKnowledgeState。
+- TeachingPlan 生成。
+- Observer 产出的 MemoryUpdateProposal 的语义处理。
+- Memory Committer 的校验、对齐和原子写入。
+- UserReadableNote 的区块级维护。
 
 它不负责：
 
@@ -340,8 +339,8 @@ flowchart TD
 它不负责：
 
 - 判断用户是否掌握某个知识点。
-- 生成 Teaching Brief。
-- 更新 KnowledgeGraph。
+- 生成 TeachingPlan。
+- 更新 KnowledgeTree、LearningEvidence 或 UserKnowledgeState。
 - 渲染 UI。
 - 调用模型或工具。
 
@@ -397,7 +396,7 @@ Skill
 - `ToolRegistry`：负责工具注册、工具 schema 暴露和工具执行；第一阶段属于 `@byte-mentor/agent` 内部模块。
 - `Session`：负责会话隔离、消息历史、会话元数据和持久化。
 - `ContextBuilder`：负责构建进入模型的 system prompt、历史、运行时上下文和教学上下文。
-- `Knowledge`：负责知识子系统接入，包括 Teaching Brief 生成、定点查询、Observation Log 记录和会话结束写回。
+- `Knowledge`：负责知识子系统接入，包括 TeachingPlan 生成、定点查询、MemoryUpdateProposal 提交和 checkpoint / 会话结束写回。
 - `Compact`：负责会话历史压缩和上下文窗口管理。
 - `Hook`：负责 agent 生命周期事件、流式输出、进度事件和调试观测。
 - `Command`：负责显式命令，例如新会话、清理、切换配置等。
@@ -414,30 +413,31 @@ nanobot 的 memory 更偏向：
 - 压缩摘要
 - 后台整理
 
-Byte Mentor 的 Knowledge 子系统则以知识图谱和用户知识状态为核心。
+Byte Mentor 的 Knowledge 子系统以知识树、学习证据和用户知识状态为核心。
 
-因此，知识图谱不是 agent 基座内部的普通工具，也不是简单的聊天记录摘要。
+知识树只负责定位和语义边界；前置、类比和教学顺序由 Planner 针对当前目标临时判断，不维护为持久化知识图谱。
 
-它是 Knowledge 子系统的一部分，并通过稳定接口接入 agent 基座。
+Knowledge 子系统通过稳定接口接入 agent 基座。
 
 Knowledge 子系统内部继续按照 `memory-requirements.md` 中确定的结构推进：
 
 ```text
 Knowledge Subsystem
-  -> CatalogIndex
-  -> KnowledgeGraph
-  -> UserKnowledgeStatus
+  -> KnowledgeTree
+  -> LearningEvidence
+  -> UserKnowledgeState
   -> UserReadableNote
-  -> Teaching Brief Builder
-  -> Graph Sync Plan
+  -> Planner
+  -> Memory Committer
+  -> Note Writer
 ```
 
 agent 基座只依赖 Knowledge 子系统暴露出的能力，例如：
 
-- 会话开始前生成 Teaching Brief
+- 会话开始前生成 TeachingPlan
 - 会话中按需定点查询记忆
-- 会话中记录 Observation Log
-- 会话结束后触发记忆写回
+- 会话中提交 Observer 产出的 MemoryUpdateProposal
+- 在 checkpoint 或会话结束后触发状态与笔记写回
 
 ## 9. 初始运行链路
 
@@ -446,9 +446,9 @@ agent 基座只依赖 Knowledge 子系统暴露出的能力，例如：
 ```text
 输入学习目标
   -> 建立教学会话
-  -> 调用 Knowledge 子系统生成 Teaching Brief
+  -> 调用 Knowledge 子系统生成 TeachingPlan
   -> 运行教学 agent
-  -> 记录 Observation Log
+  -> Observer 生成 MemoryUpdateProposal
   -> 会话结束后调用 Knowledge 子系统写回
 ```
 
@@ -470,8 +470,8 @@ sequenceDiagram
   Agent->>Session: 创建或恢复会话
   Session-->>Agent: 返回会话上下文
 
-  Agent->>Knowledge: 请求生成 Teaching Brief
-  Knowledge-->>Agent: 返回 Teaching Brief
+  Agent->>Knowledge: 请求生成 TeachingPlan
+  Knowledge-->>Agent: 返回 TeachingPlan
 
   Agent->>Agent: 通过内部 Provider 发起模型调用
   Agent->>Agent: 接收流式模型输出
@@ -504,10 +504,9 @@ sequenceDiagram
   Agent->>Session: 读取本轮会话过程
   Session-->>Agent: 返回消息历史与会话元数据
 
-  Agent->>Knowledge: 提交 Observation Log 与学习过程摘要
-  Knowledge->>Knowledge: 更新 UserKnowledgeStatus
-  Knowledge->>Knowledge: 更新 UserReadableNote
-  Knowledge->>Knowledge: 必要时生成 Graph Sync Plan
+  Agent->>Knowledge: 提交 MemoryUpdateProposal
+  Knowledge->>Knowledge: 提交 LearningEvidence 并更新 UserKnowledgeState
+  Knowledge->>Knowledge: 通过 Note Writer 更新 UserReadableNote
   Knowledge-->>Agent: 返回写回结果
 
   Agent->>Session: 保存会话结束状态

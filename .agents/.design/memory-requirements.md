@@ -1,992 +1,608 @@
-# Byte Mentor 记忆模块设计结论
+# Byte Mentor 学习记忆架构设计
 
-## 1. 文档原则
+## 1. 文档状态
 
-本文档只记录当前已经达成共识的记忆模块设计结论。
+本文档记录当前已经确认的学习记忆架构，并替代此前以 `KnowledgeGraph`、`KnowledgeEdge` 和 `Graph Sync Plan` 为核心的设计。
 
-尚未确定的内容不写入正式结论，后续讨论清楚后再补充。
+当前结论是：
 
-## 2. 记忆模块的核心目标
+> Byte Mentor 不维护知识图谱。系统通过知识树定位知识单元，通过学习证据维护用户状态，通过 Planner 将长期记忆编译为本轮教学计划。
 
-Byte Mentor 的记忆模块不是普通聊天记录存储，也不是简单的笔记检索。
+本文档只描述记忆和教学闭环，不展开 CLI、TUI、通用 Agent Runtime 或具体数据库选型。
 
-它的核心目标是：
+## 2. 核心目标
 
-> 把用户学习过程中的表现沉淀成 AI 可读取、可更新、可用于后续教学决策的长期知识状态。
+Byte Mentor 的核心价值不是保存聊天记录，也不是生成一套完整的计算机知识百科，而是：
 
-当前需要区分两个概念：
+> 把用户在学习过程中的真实表现沉淀为可追溯的长期状态，并让这些状态改变后续教学行为。
 
-- 全局知识图谱：为教学规划和记忆召回服务的知识节点与关系索引，不追求覆盖整个计算机知识体系。
-- 用户知识状态：某个用户对某个知识点的掌握情况，是长期记忆真正承载的内容。
+系统需要回答：
 
-因此，系统关注的不是“计算机世界中所有知识点之间的完整关系”，而是围绕用户学习状态回答：
+- 用户接触、学习和练习过哪些知识点。
+- 用户对哪些知识点掌握稳定、部分掌握或明显缺失。
+- 用户暴露过哪些误解，以及这些误解是否已经被后续证据纠正。
+- 下一次教学应该复习什么、跳过什么、诊断什么。
+- 哪些内容应该整理为用户可读的复习笔记。
 
-- 用户学过什么
-- 用户没学过什么
-- 用户在哪些知识点上存在误解
-- 用户哪些知识点掌握不稳定
-- 用户的某个薄弱点会影响哪些后续学习
-- 用户已有知识能否帮助理解新知识
-- AI 下次教学时应该参考哪些历史状态
+## 3. 明确不做的事情
 
-## 3. 当前确定的分层结构
+MVP 不做以下能力：
 
-当前记忆模块分为四个正式层：
+- 不维护全局知识图谱。
+- 不持久化 `prerequisite_of`、`mention_with`、`related_to` 等知识关系。
+- 不预先生成完整学科目录。
+- 不根据知识树中是否存在节点，直接判断用户是否掌握该知识。
+- 不让教学 Agent 直接修改正式长期记忆。
+- 不让 LLM 整篇覆盖用户可读 Markdown。
+- 不要求 Markdown 维护 wikilink 或派生关系图。
 
-1. 知识目录索引层（CatalogIndex）
-2. 知识图谱层（KnowledgeGraph）
-3. 用户知识状态层（UserKnowledgeStatus）
-4. 用户可读笔记层（UserReadableNote）
+知识之间的前置、类比和教学顺序由 Planner 根据当前学习目标临时判断，不作为长期事实维护。
 
-其中：
+## 4. 总体结构
 
-- 知识目录索引层负责通过路径稳定定位知识点 ID。
-- 知识图谱层负责描述知识点之间的全局关系，并作为召回相关知识状态的关系索引。
-- 用户知识状态层负责记录某个用户对某个知识点的长期掌握状态。
-- 用户可读笔记层主要服务用户复习。
-- 用户知识状态层和用户可读笔记层可以互相引用，但不应该混成同一个结构。
+```text
+KnowledgeTree
+  知识定位与语义边界
+        │
+        ├── UserKnowledgeState
+        │     AI 消费的当前学习状态
+        │
+        ├── LearningEvidence
+        │     支撑状态判断的不可变证据
+        │
+        └── UserReadableNote
+              用户消费的 Markdown 笔记
+```
 
-Observation Log 是会话过程中的证据记录，服务会话结束后的统一更新，不属于以上四个正式层之一。
+教学闭环由五个组件完成：
 
-## 4. 知识目录索引层（CatalogIndex）
+```text
+Planner
+  -> TeachingPlan
+  -> Actor
+  -> Messages
+  -> Observer
+  -> MemoryUpdateProposal
+  -> MemoryCommitter
+  -> CommitResult
+  -> NoteWriter
+  -> Markdown Patch
+```
 
-知识目录索引层按照类似教科书目录的方式组织知识点路径。
+职责原则：
 
-示例：
+- Planner 决定本轮应该如何教。
+- Actor 负责实际教学。
+- Observer 从用户表现中提出记忆更新建议。
+- Memory Committer 校验、对齐并原子写入正式记忆。
+- Note Writer 只根据已经提交的结果维护用户笔记。
+
+## 5. 知识树
+
+### 5.1 定位
+
+知识树是面向教学记忆的目录，不是完整知识本体。
+
+它只保存用户实际学习、测评或暴露误解时涉及的知识节点，并随用户学习过程懒创建。
 
 ```text
 JavaScript
-  异步
-    Promise
-    async/await
-    Event Loop
-  对象
-    原型链
-    this
-    继承
+└── 异步编程
+    ├── Event Loop 任务调度
+    ├── 宏任务与微任务
+    └── await 的暂停与恢复
 ```
 
-这一层的职责是提供稳定、低成本的定位入口。
-
-它回答的是：
-
-> 用户给出的学习目标，对应知识图谱中的哪个 knowledgeNodeId？
-
-知识图谱中的 `belongs_to` 关系本身可以隐含目录结构，但如果每次都从图中遍历目录，会产生额外成本，也会让 LLM 更难稳定拿到单个知识点的 ID。
-
-因此，当前确定显式维护一层 CatalogIndex，作为性能优化和稳定定位入口。
-
-CatalogIndex 只做索引，不表达复杂语义关系，也不直接表达用户掌握情况。
-
-它主要索引：
-
-- 路径到 `knowledgeNodeId` 的映射
-- 当前节点的展示路径
-- 当前节点的直接父级目录项
-- 当前节点是 `topic` 还是 `learning_unit`
-
-初版结构示例：
-
-```ts
-type CatalogEntry = {
-  id: string
-
-  knowledgeNodeId: string
-
-  path: string[]
-  pathKey: string
-
-  name: string
-  kind: "topic" | "learning_unit"
-
-  parentCatalogEntryId?: string
-
-  status: "draft" | "active" | "deprecated"
-}
-```
-
-查询用户状态时，路径是：
-
-```text
-pathKey
-  -> CatalogEntry
-  -> knowledgeNodeId
-  -> UserKnowledgeStatus(userId, knowledgeNodeId)
-```
-
-### 4.1 CatalogIndex 对 agent 的暴露方式
-
-MVP 阶段，CatalogIndex 不只作为内部索引，也会通过工具渐进式暴露给 agent。
-
-agent 不应该一次性读取完整目录树，而应该按需浏览和检索。
-
-典型方式是：
-
-```text
-root
-  -> JavaScript / 网络 / Python
-JavaScript
-  -> 异步 / 对象 / 函数
-JavaScript / 异步
-  -> Promise / async-await / Event Loop
-JavaScript / 异步 / Promise
-  -> then 回调进入微任务 / Promise 状态流转 / Promise.all
-```
-
-初版工具可以包含：
-
-```ts
-catalog.listChildren(parentCatalogEntryId?: string)
-catalog.search(query: string, parentCatalogEntryId?: string)
-catalog.getEntry(catalogEntryId: string)
-```
-
-其中：
-
-- `listChildren` 用于渐进式浏览目录。
-- `search` 用于根据名称、路径、关键词做轻量检索。
-- `getEntry` 用于读取单个目录项的完整信息。
-
-MVP 阶段暂不依赖 embedding。
-
-节点对齐优先使用：
-
-- Catalog 路径精确匹配
-- Catalog 渐进式浏览
-- 名称、关键词、路径片段的轻量文本检索
-- 类似 BM25 的关键词匹配
-- agent 对少量候选节点做最终关系判断
-
-后续可以用 JSON 文档、MongoDB、SQLite、Postgres JSONB 或其他形式维护。当前不绑定具体数据库。
-
-## 5. 知识图谱层（KnowledgeGraph）
-
-知识图谱层描述知识点本身以及知识点之间的全局教学关系。
-
-它不是用户个人状态，也不是完整百科知识图谱。
-
-它的主要作用是：
-
-- 定义知识点节点
-- 表达知识点之间的关系
-- 在生成 Teaching Brief 时决定应该读取哪些用户知识状态
-- 在会话中单节点加载时提供该节点的局部上下文
-
-当前确定采用“点和边分开维护”的方式：
-
-```text
-KnowledgeNode
-KnowledgeEdge
-```
-
-邻接表、children 列表、完整 path 等结构都可以作为派生索引或缓存，但不作为唯一事实来源。
-
-### 5.1 KnowledgeNode
-
-KnowledgeNode 只描述“这个知识点是什么”，不存用户掌握状态，也不直接存父子关系。
-
-当前确定的节点类型有两种：
-
-```ts
-type KnowledgeNodeKind = "topic" | "learning_unit"
-```
-
-`topic` 是任意深度的目录或章节节点。
-
-示例：
-
-```text
-JavaScript
-JavaScript / 异步
-JavaScript / 异步 / async/await
-计算机网络
-计算机网络 / 传输层
-计算机网络 / 传输层 / TCP协议
-```
-
-`learning_unit` 是可教学、可测评、可记录用户掌握状态的最小学习单元。
-
-示例：
-
-```text
-await 的暂停与恢复
-await 后续代码进入微任务
-TCP 三次握手过程
-this 的调用位置绑定规则
-```
-
-判断一个节点是否应该是 `learning_unit` 的标准是：
-
-> 它能否被单独教学、单独追问、单独答错、单独记录误解，并单独影响后续教学。
-
-如果一个节点下面还能自然拆出多个可独立教学和测评的单元，它更适合作为 `topic`。
-
-因此：
-
-- `函数` 通常是 `topic`
-- `this 绑定规则` 通常是 `learning_unit`
-- `TCP协议` 通常是 `topic`
-- `TCP 三次握手过程` 通常是 `learning_unit`
-
-KnowledgeNode 初版字段：
+### 5.2 节点结构
 
 ```ts
 type KnowledgeNode = {
-  id: string
+  id: string;
+  parentId?: string;
 
-  kind: "topic" | "learning_unit"
+  name: string;
+  definition: string;
+  learningGoals?: string[];
 
-  name: string
-  definition: string
+  assessable: boolean;
 
-  learningGoals?: string[]
-
-  noteRef?: {
-    type: "UserReadableNote"
-    target: string
-  }
-
-  createdAt: string
-  updatedAt: string
-}
+  createdAt: string;
+  updatedAt: string;
+};
 ```
 
-字段说明：
+字段约束：
 
-- `id`：知识节点稳定 ID，供边、用户状态和笔记引用。
-- `kind`：节点类型，区分 `topic` 和 `learning_unit`。
-- `name`：当前节点名，只表示最近一级名称，不表示完整路径。
-- `definition`：节点边界的一句话定义。
-- `learningGoals`：学习目标，主要用于 `learning_unit`。
-- `noteRef`：只在 `kind` 为 `topic` 时填写，用于指向该知识模块对应的完整用户可读笔记。`learning_unit` 通常不填写该字段，因为它是更小粒度的可教学、可测评知识点。
-- `createdAt` / `updatedAt`：创建和更新时间。
+- `id` 由程序生成并保持稳定。
+- `parentId` 只表达规范目录位置，不表达教学依赖。
+- `definition` 用于稳定知识边界和节点对齐，不保存完整讲义。
+- `learningGoals` 描述该节点可以被教学或测评的目标。
+- `assessable` 与是否拥有子节点无关。节点以后继续细分时，不需要迁移已有状态。
 
-当前确定不在 KnowledgeNode 中维护 `aliases`。
+### 5.3 渐进式访问
 
-当前也不使用自由发挥式的 `scope.includes/excludes` 作为核心字段。节点边界主要由 `definition` 和 `learningGoals` 共同约束。
-
-当前确定不在 KnowledgeNode 初版中维护以下字段：
-
-- `assessmentPrompts`：测评题或追问更像教学素材，可以由 agent 根据 `definition` 和 `learningGoals` 临时生成，不作为知识节点核心字段。
-- `commonMisconceptions`：全局常见误解容易和 UserKnowledgeStatus 中的用户个人误解混淆，初版不放入 KnowledgeNode。
-- `nonGoals`：节点边界初版先由 `definition` 和 `learningGoals` 控制，不额外维护排除范围字段。
-- `statusRef` / `statusIdRef`：KnowledgeNode 是全局知识图谱节点，不直接指向某个用户的 UserKnowledgeStatus。用户状态通过 `(userId, knowledgeNodeId)` 查询。
-- `difficulty`：当前认为该字段对知识图谱召回和教学决策帮助不大，初版不维护。
-- `status`：KnowledgeNode 初版不维护节点状态字段，先降低结构复杂度。
-
-### 5.2 KnowledgeEdge
-
-KnowledgeEdge 描述知识点之间的关系。
-
-当前确定 KnowledgeEdge 的主要目的不是表达完整知识语义，而是在教学某个知识点时，帮助系统显式提示 LLM 还应该关注哪些可以顺带提一下或需要预先检查的知识点。
-
-初版结构：
+Agent 不一次读取整棵树，只通过受限接口渐进浏览：
 
 ```ts
-type KnowledgeEdgeType =
-  | "belongs_to"
-  | "prerequisite_of"
-  | "mention_with"
-
-type KnowledgeEdge = {
-  id: string
-
-  type: KnowledgeEdgeType
-
-  sourceNodeId: string
-  targetNodeId: string
-
-  reason?: string
-
-  createdAt: string
-  updatedAt: string
-}
+catalog.listChildren(parentId?: string)
+catalog.search(query: string, parentId?: string)
+catalog.getNode(nodeId: string)
 ```
 
-字段说明：
+Skill 负责描述定位和停止浏览的流程，Tool 负责实际数据访问。
 
-- `id`：边的稳定 ID，供更新、引用和调试使用。
-- `type`：边的关系类型，决定这条边在生成 Teaching Brief 时如何影响相关知识点召回。
-- `sourceNodeId`：边的起点知识节点 ID。
-- `targetNodeId`：边的终点知识节点 ID。
-- `reason`：可选字段，用一句话说明为什么需要这条边，尤其是 `mention_with` 边需要写清楚具体教学理由。
-- `createdAt` / `updatedAt`：创建和更新时间。
+MVP 优先使用：
 
-当前确定不在 KnowledgeEdge 初版中维护以下字段：
+- 路径和名称精确匹配。
+- 规范化关键词匹配。
+- 对少量候选进行 LLM 语义判断。
 
-- `weight`：初版不做权重排序，避免过早引入复杂召回策略。
-- `status`：初版不维护边状态字段，先降低结构复杂度。
-- `source`：初版不记录边由系统、人工还是 LLM 创建；是否需要审核和溯源后续再设计。
+Embedding 检索不是 MVP 必需项。
 
-当前确定的边类型只有三种：
+### 5.4 节点创建规则
 
-- `belongs_to`：目录从属关系。表示 `sourceNodeId` 属于 `targetNodeId`。方向统一为 `child -> parent`。它用于组织知识结构，不直接表示教学依赖。
-- `prerequisite_of`：前置知识关系。表示学习 `targetNodeId` 前，最好先掌握 `sourceNodeId`。生成 Teaching Brief 时，如果目标是 `targetNodeId`，系统应该优先读取 `sourceNodeId` 的用户知识状态。
-- `mention_with`：顺带提示关系。表示教学 `sourceNodeId` 时，值得顺带提一下 `targetNodeId`。它不是泛泛的相关关系，也不表示前置依赖，而是一个有方向的教学提示边。
+Planner 可以在本轮计划中自由提出候选知识点，但候选不会直接进入正式知识树。
 
-`mention_with` 的定义是：
+只有满足以下条件的节点才允许创建：
 
-> 当教学 `sourceNodeId` 时，系统应该提示 LLM 可以顺带提一下 `targetNodeId`，因为这个提示能让当前知识点更容易理解、更不容易误解，或更容易建立边界。
+- 用户实际展示了相关的既有知识。
+- 本轮已经教学或测评了该知识。
+- 用户在该知识上暴露了误解或缺失。
 
-`mention_with` 的建边标准必须严格：
+仅被 Planner 列为“未来可能需要”的知识点不创建。
 
-- 这条边必须改变教学行为。如果加不加这条边，Teaching Brief 都不会变化，则不建边。
-- 不能只是“同属一个大类”。目录归属已经由 `belongs_to` 表达。
-- 不能只是“有共同点”。必须能说清楚教学 `sourceNodeId` 时提到 `targetNodeId` 是为了完成一个具体教学动作。
-- `reason` 必须能写成一句具体教学理由。如果写不出具体理由，则不建边。
-- 初版建议限制每个节点的 `mention_with` 出边数量，例如最多 3 条，避免图谱因为主观“相关性”而膨胀。
+创建前必须搜索已有节点并进行对齐。出现多个相似候选时，不静默创建新节点，而是保留待处理 proposal。
 
-当前确定以下原则：
+## 6. 用户知识状态
 
-- 边是独立结构，不嵌入 KnowledgeNode。
-- `belongs_to` 用于表达目录从属关系。
-- `belongs_to` 的方向统一为 `child -> parent`。
-- `prerequisite_of` 用于表达前置知识关系。
-- `mention_with` 用于表达教学时可以顺带提示的知识点。
-- 不使用 `related_to` 这类过宽泛的关系类型，避免图谱被低价值连接污染。
-
-示例：
-
-```text
-异步 -> belongs_to -> JavaScript
-async/await -> belongs_to -> 异步
-await 的暂停与恢复 -> belongs_to -> async/await
-TCP协议 -> belongs_to -> 传输层
-TCP 三次握手过程 -> belongs_to -> TCP协议
-
-Promise.then 回调进入微任务 -> prerequisite_of -> await 后续代码进入微任务
-
-并发 -> mention_with -> 并行
-await 后续代码进入微任务 -> mention_with -> Promise.then 回调进入微任务
-```
-
-KnowledgeGraph 可以隐含目录结构，但 CatalogIndex 仍然显式存在，原因是它提供更直接、更稳定的路径定位能力。
-
-## 6. 用户知识状态层（UserKnowledgeStatus）
-
-用户知识状态层是 AI 读的核心长期记忆。
-
-它不是全局知识图谱，而是围绕某个用户逐渐生长出来的个人知识掌握状态集合。
-
-一个知识点进入用户知识状态层，通常来自：
-
-- 用户主动学习了这个知识点
-- 用户在学习其他内容时暴露出这个知识点的缺失
-- 用户在问答、复述或模拟面试中暴露了相关误解
-- agent 判断该知识点是后续学习的关键前置
-
-因此，用户知识状态层不应该只包含“已经学过”的知识点，也可以包含：
-
-- 未学但已暴露为前置缺失的知识点
-- 被提到但尚未系统学习的知识点
-- 影响当前学习效果的薄弱知识点
-
-用户知识状态不是抽象知识本身，而是：
-
-> 某个用户对某个 `learning_unit` 的掌握状态。
-
-示例：
-
-```text
-状态：用户 A 对 async/await 的掌握状态
-- 对应 KnowledgeNode：JavaScript / 异步 / async/await
-- 当前状态：学过但不稳定
-- 误解：容易把 await 后续代码理解成同步继续执行
-- 证据：2026-06-11 模拟面试中跳过 async/await 输出题
-- 下次教学提示：先回顾 Promise.then 微任务，再讲 async/await 的恢复机制
-```
-
-初版按 `(userId, knowledgeNodeId)` 建立唯一状态记录。
-
-其中：
-
-- `knowledgeNodeId` 必须指向 `kind` 为 `learning_unit` 的 KnowledgeNode。
-- `topic` 不直接拥有 UserKnowledgeStatus。
-- `topic` 的整体掌握情况后续可以由其下属 `learning_unit` 的 UserKnowledgeStatus 聚合得到。
-- KnowledgeNode 不直接指向某个用户的 UserKnowledgeStatus，因为 KnowledgeNode 是全局节点，而 UserKnowledgeStatus 是用户个人状态。
-
-初版结构：
+UserKnowledgeState 是 AI 消费的核心长期记忆，按 `(userId, knowledgeNodeId)` 唯一定位。
 
 ```ts
-type UserKnowledgeStatus = {
-  id: string
+type UserKnowledgeState = {
+  id: string;
+  userId: string;
+  knowledgeNodeId: string;
 
-  userId: string
-  knowledgeNodeId: string
+  exposure: "unseen" | "mentioned" | "studied" | "practiced";
+  mastery: "unknown" | "missing" | "partial" | "unstable" | "stable";
 
-  exposure: "unseen" | "mentioned" | "studied" | "practiced"
+  misconceptions: Array<{
+    id: string;
+    description: string;
+    status: "active" | "resolved";
+    evidenceIds: string[];
+    updatedAt: string;
+  }>;
 
-  mastery: "unknown" | "missing" | "partial" | "unstable" | "stable"
+  evidenceIds: string[];
+  nextTeachingHint?: string;
 
-  misconceptions?: UserMisconception[]
-
-  evidence?: UserKnowledgeEvidence[]
-
-  nextTeachingHint?: string
-
-  lastStudiedAt?: string
-  lastAssessedAt?: string
-
-  createdAt: string
-  updatedAt: string
-}
-
-type UserMisconception = {
-  id: string
-  description: string
-  status: "active" | "resolved"
-  evidenceIds?: string[]
-  updatedAt: string
-}
-
-type UserKnowledgeEvidence = {
-  id: string
-  type: "user_answer" | "user_question" | "self_report" | "agent_observation" | "assessment"
-
-  summary: string
-
-  result?: "correct" | "partially_correct" | "incorrect" | "unclear"
-
-  observedAt: string
-}
+  lastStudiedAt?: string;
+  lastAssessedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+};
 ```
 
-字段说明：
+状态和知识节点必须分离：
 
-- `id`：这条用户知识状态记录的稳定 ID。
-- `userId`：用户 ID。
-- `knowledgeNodeId`：对应的知识节点 ID，必须指向 `kind` 为 `learning_unit` 的 KnowledgeNode。
-- `exposure`：用户是否接触过这个知识点。
-- `mastery`：用户当前对这个知识点的掌握状态。
-- `misconceptions`：用户在这个知识点上的具体误解。
-- `evidence`：支持当前状态判断的证据摘要，不存完整聊天记录。
-- `nextTeachingHint`：下次教学这个知识点时给 agent 的提示。
-- `lastStudiedAt`：最近一次学习时间。
-- `lastAssessedAt`：最近一次测评、追问或复述时间。
-- `createdAt` / `updatedAt`：创建和更新时间。
+- KnowledgeNode 描述“这个知识点是什么”。
+- UserKnowledgeState 描述“某个用户目前对它怎么样”。
 
-`exposure` 的取值含义：
+知识树中没有节点，只表示系统没有记录；不能据此判断用户不掌握。
 
-- `unseen`：尚未接触，但可能因为前置缺失被记录。
-- `mentioned`：被提到过，但没有系统学习。
-- `studied`：系统学过。
-- `practiced`：做过复述、题目、追问或模拟面试。
+## 7. 学习证据
 
-`mastery` 的取值含义：
+LearningEvidence 是状态判断的事实来源，原则上只追加、不原地覆盖。
 
-- `unknown`：无法判断。
-- `missing`：明显缺失。
-- `partial`：有部分理解，但不完整。
-- `unstable`：能说出一些内容，但容易答错或混淆。
-- `stable`：当前表现稳定。
+```ts
+type LearningEvidence = {
+  id: string;
+  observationId: string;
 
-UserKnowledgeStatus 初版不使用分数字段。掌握程度先用离散状态表达，避免过早引入不稳定的量化评分。
+  userId: string;
+  knowledgeNodeId: string;
+  sessionId: string;
+  turnId: string;
 
-## 7. 用户可读笔记层（UserReadableNote）
+  source:
+    | "prior_knowledge"
+    | "learning_outcome"
+    | "self_report"
+    | "delayed_recall";
 
-用户可读笔记单独维护。
+  summary: string;
+  result: "correct" | "partially_correct" | "incorrect" | "unclear";
+  prompted: boolean;
+  confidence: number;
 
-它面向用户复习，不直接等同于 AI 读的知识状态。
+  observedAt: string;
+};
+```
 
-用户可读笔记应该追求：
+Evidence 与 State 的关系是：
 
-- 清晰
-- 简洁
-- 适合复习
-- 适合面试或考试前快速回顾
+```text
+LearningEvidence = 历史事实
+UserKnowledgeState = 当前投影
+```
 
-示例：
+完整聊天记录继续由 Session 保存。Evidence 只保存支持状态判断的摘要和来源引用。
+
+## 8. Planner
+
+Planner 在学习目标清晰后执行一次前置规划。
+
+它负责：
+
+1. 判断学习目标包含哪些教学目标。
+2. 推断可能需要的前置知识。
+3. 渐进式搜索知识树中的对应节点。
+4. 读取已有 UserKnowledgeState 和相关 Evidence。
+5. 把外部记忆编译为本轮可执行的 TeachingPlan。
+
+```ts
+type TeachingPlan = {
+  target: KnowledgeCandidate;
+
+  prerequisites: Array<{
+    candidate: KnowledgeCandidate;
+    matchedNodeId?: string;
+    importance: "required" | "helpful";
+    userState: "known" | "weak" | "unknown";
+    action: "use" | "diagnose" | "offer_remediation";
+    reason: string;
+  }>;
+
+  teachingGoals: string[];
+  approach: string;
+  successCriteria: string[];
+};
+```
+
+如果前置知识在树中不存在，Planner 必须标记为 `unknown`，不能标记为用户不会。
+
+处理方式优先级：
+
+1. 用一个低成本问题进行诊断。
+2. 如果前置内容会显著扩大范围，再询问用户是否先补充学习。
+3. 用户确认跳过时，在计划中明确风险，但不创建虚假状态。
+
+Planner 的策略建议使用开放文本，Prompt 可以提供追问、预测、反例、类比等思考方式作为参考，但不把教学策略固定为 Tool 或封闭枚举。
+
+## 9. Actor
+
+Actor 是实际教学 Agent，由现有 Agent Runtime 承载。
+
+它接收 TeachingPlan，但保留具体教学表达的自由，包括：
+
+- 如何解释。
+- 使用什么案例。
+- 什么时候追问。
+- 是否根据用户即时反应改变本轮展开方式。
+
+Actor 可以读取记忆，但不能直接写入 KnowledgeNode、LearningEvidence 或 UserKnowledgeState。
+
+## 10. Observer
+
+Observer 观察教学过程并输出结构化 MemoryUpdateProposal。
+
+它读取：
+
+- 上次观察 checkpoint 之后的新消息。
+- 当前 TeachingPlan。
+- Actor 已执行过的教学动作及其 turn 边界。
+- 当前涉及的候选知识单元。
+
+Observer 不反复扫描完整会话，以降低成本并避免重复证据。
+
+```ts
+type MemoryUpdateProposal = {
+  observationId: string;
+
+  candidate: {
+    name: string;
+    definition: string;
+    learningGoals?: string[];
+    suggestedParentPath: string[];
+  };
+
+  source: "prior_knowledge" | "learning_outcome" | "self_report" | "delayed_recall";
+
+  evidence: {
+    sessionId: string;
+    turnId: string;
+    summary: string;
+    result: "correct" | "partially_correct" | "incorrect" | "unclear";
+    prompted: boolean;
+  };
+
+  proposedMastery: "unknown" | "missing" | "partial" | "unstable" | "stable";
+  confidence: number;
+  misconception?: string;
+};
+```
+
+Observer 需要区分两类情况：
+
+- `prior_knowledge`：用户在 Actor 教学前已经表现出的知识。
+- `learning_outcome`：用户在本轮教学后表现出的学习结果。
+
+用户自述“我会”只能产生 `self_report`，不能直接证明 `stable`。
+
+## 11. Memory Committer
+
+Memory Committer 是正式记忆的事务边界和防腐层，不负责理解原始对话。
+
+### 11.1 节点对齐
+
+对每个 candidate 执行：
+
+```text
+精确 ID / 路径 / 名称匹配
+  -> 规范化文本候选检索
+  -> 对少量候选做语义判断
+  -> 复用已有节点、创建新节点或保留待确认 proposal
+```
+
+### 11.2 结构校验
+
+创建节点前校验：
+
+- ID 由程序生成。
+- 父节点存在。
+- 不产生目录循环。
+- 名称、定义和节点边界完整。
+- 同级不存在明确重复。
+- 该知识点已经产生真实学习证据。
+
+缺失的祖先 topic 可以在同一事务中补齐，但不能顺便创建未被教学的兄弟节点。
+
+### 11.3 Evidence 幂等写入
+
+`observationId` 必须唯一。Observer 重试时，Committer 返回原提交结果，不生成重复证据。
+
+### 11.4 状态归约
+
+Committer 不直接接受 Observer 提议的 `stable`，而是根据 Evidence 保守归约：
+
+```text
+仅自述掌握                    -> unknown / mentioned
+教学前无提示答对一次          -> partial
+教学后有提示答对              -> partial
+多次独立答对                  -> unstable 或 stable
+经过延迟复测仍能独立答对      -> stable
+再次暴露相同误解              -> 降级并重新激活 misconception
+```
+
+掌握状态允许下降，以表达遗忘、误解复发或新证据推翻旧判断。
+
+具体从 `partial`、`unstable` 到 `stable` 所需的证据数量，作为实现阶段的可配置策略，不写死在领域类型中。
+
+### 11.5 原子写入
+
+一次提交事务按以下顺序完成：
+
+```text
+创建或复用 KnowledgeNode
+  -> 追加 LearningEvidence
+  -> 归约 UserKnowledgeState
+  -> 保存版本与审计信息
+  -> 发布 NoteUpdateRequested
+```
+
+任一步失败时整批回滚。
+
+```ts
+type CommitResult = {
+  resolvedNodeIds: string[];
+  createdNodeIds: string[];
+  evidenceIds: string[];
+  changedStates: UserKnowledgeState[];
+  dirtyNoteUnitIds: string[];
+};
+```
+
+## 12. Note Writer
+
+Note Writer 维护面向用户复习的 Markdown，不参与掌握状态判断。
+
+### 12.1 文件粒度
+
+一篇 Markdown 对应一个较大的 topic，可以覆盖多个 assessable 知识单元。知识单元与笔记文件的映射保存在 frontmatter：
+
+```yaml
+---
+id: note-js-async
+topicNodeId: js-async
+knowledgeUnitIds:
+  - js-event-loop
+  - js-microtask
+updatedAt: 2026-07-29
+---
+```
+
+运行时从 frontmatter 派生：
+
+```text
+knowledgeUnitId -> Markdown 文件路径
+```
+
+KnowledgeNode 不再反向保存 `noteRef`，避免双写不一致。
+
+### 12.2 更新方式
+
+Note Writer 不整篇重写，也不无限追加会话日志，而是按知识单元维护稳定区块：
 
 ```markdown
-# async/await 面试笔记
+<!-- byte-mentor:unit:js-event-loop:start -->
+## Event Loop
 
-## 一句话总结
+### 核心理解
 
-async/await 是基于 Promise 的异步控制流语法糖。
+同步代码先执行，异步回调满足条件后进入任务队列。
 
-## 核心回答
+### 我的易错点
 
-...
+- 不要把异步调度简单理解为 JavaScript 创建了新线程。
 
-## 常见误区
+### 自测
 
-- await 不会阻塞整个线程，只会暂停当前 async 函数。
-- await 后续代码会进入微任务队列。
+为什么 `setTimeout(fn, 0)` 仍不会立即执行？
+<!-- byte-mentor:unit:js-event-loop:end -->
 ```
 
-KnowledgeNode 的 `noteRef` 只在 `topic` 上使用，用于指向完整模块笔记。
-
-`learning_unit` 通常不直接引用完整笔记。教学某个 `learning_unit` 时，可以沿 `belongs_to` 找到父级 `topic`，再读取父级 `topic.noteRef` 对应的模块笔记。
-
-用户个人笔记后续可以由用户可读笔记层或 UserKnowledgeStatus 引用，不应该和 KnowledgeNode 的全局结构混在一起。
-
-## 8. 四层结构之间的关系
-
-当前确定的关系是：
-
-```text
-CatalogIndex
-  pathKey -> knowledgeNodeId
-    ↓
-KnowledgeGraph
-  KnowledgeNode + KnowledgeEdge
-    ↓
-UserKnowledgeStatus
-  userId + knowledgeNodeId
-    ↔
-UserReadableNote
-```
-
-具体含义：
-
-- CatalogIndex 负责从路径稳定定位 `knowledgeNodeId`。
-- KnowledgeGraph 负责用 `knowledgeNodeId` 描述全局知识节点和关系。
-- UserKnowledgeStatus 负责记录某个用户在某个 `knowledgeNodeId` 上的长期状态。
-- UserReadableNote 负责用户可读复习材料。
-- KnowledgeGraph 本身也能通过 `belongs_to` 推导目录结构，但 CatalogIndex 是为了性能和稳定定位而显式物化的索引层。
-- 用户知识状态层和用户可读笔记层可以互相引用，但不能混为一个结构。
-
-这样分离的原因是：
-
-- LLM 需要稳定、低成本地从学习目标定位到知识点 ID。
-- 知识图谱需要表达关系，但不应该承载具体用户状态。
-- 用户知识状态要适合检索、更新和教学决策。
-- 用户可读笔记要适合人读。
-- 如果混在一起，容易导致笔记对用户太碎、对 AI 又不够结构化。
-
-### 8.1 Agent 使用分层记忆的基本方式
-
-当前确定：agent 不应该直接自由遍历整个知识图谱。
-
-更合理的方式是：
-
-```text
-用户提出学习目标
-  ↓
-CatalogIndex 定位目标 knowledgeNodeId
-  ↓
-KnowledgeGraph 查找目标节点相关的节点集合
-  ↓
-系统批量读取这些节点对应的 UserKnowledgeStatus
-  ↓
-系统生成 Teaching Brief
-  ↓
-agent 根据 Teaching Brief 教学
-```
-
-也就是说，知识图谱不直接作为一大段上下文塞给 agent，而是作为关系索引，帮助系统决定应该读取哪些用户知识状态。
-
-最终进入 agent 上下文的是整理后的 Teaching Brief。
-
-### 8.2 目标主题不存在时的 Topic Bootstrap
-
-如果用户提出的学习目标无法直接定位到已有 `knowledgeNodeId`，系统不应该直接进入自由教学。
-
-当前确定先进入 Topic Bootstrap 流程：
-
-```text
-用户提出新的学习目标
-  ↓
-CatalogIndex 尝试定位已有节点
-  ↓
-如果不存在，agent 根据模型内部知识生成本轮 Draft Topic Graph
-  ↓
-系统用 Draft Topic Graph 中的节点去已有 CatalogIndex / KnowledgeGraph 做节点对齐
-  ↓
-系统读取对齐节点以及相关节点的 UserKnowledgeStatus
-  ↓
-系统生成 Teaching Brief
-  ↓
-agent 根据 Teaching Brief 教学
-```
-
-Draft Topic Graph 是本轮教学的局部草稿图，不等同于正式 KnowledgeGraph。
-
-它的作用是：
-
-- 把新的学习主题拆成适合教学的 `topic` 和 `learning_unit`
-- 为每个草稿节点生成可检索的节点签名
-- 帮助系统从已有知识图谱中召回相关节点
-- 帮助后续生成 Teaching Brief
-- 为会话结束后的图谱同步提供候选结构
-
-草稿节点不应该只包含名称。
-
-初版结构示例：
+Note Writer 输出结构化 patch，由程序负责替换或新增对应区块：
 
 ```ts
-type DraftKnowledgeNode = {
-  tempId: string
-
-  kind: "topic" | "learning_unit"
-
-  name: string
-  definition: string
-
-  learningGoals?: string[]
-
-  pathHint?: string[]
-  keywords?: string[]
-
-  matchedKnowledgeNodeId?: string
-}
+type NotePatch = {
+  noteId: string;
+  topicNodeId: string;
+  upsertSections: Array<{
+    knowledgeUnitId: string;
+    title: string;
+    markdown: string;
+  }>;
+};
 ```
 
-其中：
+### 12.3 内容规则
 
-- `tempId`：本轮草稿图内的临时 ID。
-- `kind`：草稿节点类型，仍然只使用 `topic` 和 `learning_unit`。
-- `name` / `definition` / `learningGoals`：用于约束节点边界。
-- `pathHint`：agent 推测的目录路径，用于 CatalogIndex 对齐。
-- `keywords`：用于轻量文本检索。
-- `matchedKnowledgeNodeId`：如果该草稿节点已经匹配到正式 KnowledgeNode，则记录正式节点 ID。
+- 只记录 Committer 已经提交的知识单元。
+- 正文以正确、简洁、适合复习为目标。
+- 用户错误回答不能被写成知识事实。
+- 已确认的个人误解可以进入“我的易错点”。
+- 每个知识单元使用幂等 upsert，不重复追加同类内容。
+- Note Writer 不修改 UserKnowledgeState。
+- 默认在教学 checkpoint 或会话结束后更新，不在每个 turn 后重写文件。
 
-示例：
+用户是否直接编辑 AI 管理区块，以及发生并发编辑时如何合并，仍需在实现前确定。无论选择哪种方式，AI 管理区块之外的用户内容都不得被覆盖。
+
+## 13. 完整运行链路
 
 ```text
-用户目标：学习 JavaScript 异步
-
-Draft Topic Graph:
-- JavaScript 异步 topic
-- Event Loop topic
-- Promise topic
-- Promise.then 回调进入微任务 learning_unit
-- async-await topic
-- await 暂停当前 async 函数 learning_unit
-- await 后续代码进入微任务 learning_unit
+用户提交清晰学习目标
+  -> Planner 推断教学目标与候选前置知识
+  -> Planner 渐进搜索 KnowledgeTree
+  -> Planner 读取命中的 UserKnowledgeState / Evidence
+  -> Planner 生成 TeachingPlan
+  -> Actor 执行教学、诊断和追问
+  -> Observer 在关键 checkpoint 提取 MemoryUpdateProposal
+  -> Memory Committer 对齐节点并原子写入 Evidence / State
+  -> Note Writer 在 checkpoint 或会话结束时更新 Markdown
+  -> 下次 Planner 重新读取状态，改变后续教学
 ```
 
-### 8.3 Draft 节点对齐和召回
+### 13.1 新知识的处理
 
-Draft Topic Graph 生成后，系统需要对每个草稿节点做节点对齐。
+Planner 可以临时规划多个知识点，但只有实际教学、测评或暴露误解的知识点才会经 Observer 和 Committer 进入正式知识树。
 
-节点对齐不是简单的关键词检索后合并，而是：
+### 13.2 已有但未记录的知识
+
+如果用户在教学前正确展示了某个知识点：
 
 ```text
-Draft 节点签名
-  ↓
-CatalogIndex / KnowledgeGraph 候选召回
-  ↓
-agent 或规则判断草稿节点与候选节点的关系
-  ↓
-选择性纳入本轮 Teaching Brief
+Observer 标记 prior_knowledge
+  -> Committer 对齐或创建节点
+  -> 追加 Evidence
+  -> 保守生成 UserKnowledgeState
 ```
 
-MVP 阶段的召回依据包括：
+如果用户只是自述“我已经会了”，只记录低强度 `self_report`，必要时由 Actor 做低成本诊断。
 
-- `pathHint`
-- `name`
-- `definition`
-- `learningGoals`
-- `keywords`
+### 13.3 教学中新获得的知识
 
-召回候选节点后，需要判断它们和草稿节点的关系：
-
-```ts
-type DraftNodeMatchType =
-  | "same_concept"
-  | "parent_topic"
-  | "child_unit"
-  | "prerequisite"
-  | "mention_with"
-  | "analogy"
-  | "irrelevant"
-```
-
-关系含义：
-
-- `same_concept`：草稿节点和已有节点表达同一个知识点，草稿节点绑定已有 `knowledgeNodeId`。
-- `parent_topic`：已有节点是草稿节点适合挂载的父级 topic。
-- `child_unit`：已有节点是草稿 topic 下已经存在的 learning_unit。
-- `prerequisite`：已有节点是本轮教学需要关注的前置知识。
-- `mention_with`：已有节点是本轮教学可以顺带提示的知识点。
-- `analogy`：已有节点可以作为类比或对比材料。
-- `irrelevant`：候选节点不进入本轮教学上下文。
-
-召回节点不应该无条件补进本轮 Draft Topic Graph。
-
-当前确定分两类使用：
+如果用户在 Actor 教学后完成追问或练习：
 
 ```text
-对齐替换：
-  Draft 节点其实已经存在于正式图谱中
-  -> draft node 绑定 existing knowledgeNodeId
-
-上下文扩展：
-  召回节点不是本轮要教的主节点，但会影响教学
-  -> 进入 Teaching Brief 的 prerequisites / relatedContext / analogies
+Observer 标记 learning_outcome
+  -> Committer 追加 Evidence
+  -> 更新 mastery / misconception
+  -> Note Writer 更新对应复习区块
 ```
 
-例如：
+一次即时答对通常不足以进入 `stable`；延迟复测是更强证据。
 
-```text
-Draft 节点：async-await
-召回节点：JavaScript / 异步 / async-await
-关系：same_concept
-结果：绑定 existing knowledgeNodeId
+## 14. Plan and Act 中的记忆消费
 
-Draft 节点：await 后续代码进入微任务
-召回节点：Promise.then 回调进入微任务
-关系：prerequisite 或 mention_with
-结果：不替换 draft 节点，但进入 Teaching Brief
+外部记忆不直接以原始记录形式全部塞进 Actor Prompt。
 
-Draft 节点：并发
-召回节点：并行
-关系：analogy
-结果：只有在用户历史状态有教学价值时才进入 Teaching Brief
+Planner 先把相关状态编译成教学决策：
+
+```yaml
+target: Event Loop 任务调度
+
+known:
+  - 用户理解调用栈
+
+misconceptions:
+  - 用户曾把异步调度理解为自动创建新线程
+
+teaching_advice:
+  - 不重复解释调用栈基础
+  - 先让用户预测执行顺序
+  - 使用反例纠正线程误解
+
+success_criteria:
+  - 用户能区分回调执行时机与底层计时器实现
 ```
 
-## 9. Teaching Brief
+Actor 根据这份计划自由完成教学。技术约束作用于计划、证据和写入过程，不限制 Agent 的具体表达方式。
 
-Teaching Brief 是会话开始前根据 CatalogIndex、KnowledgeGraph 和 UserKnowledgeStatus 生成的教学上下文。
+## 15. 写入时机
 
-它的作用类似 coding agent 中的 plan：先确定当前教学应该如何展开，再进入正式教学。
+MVP 采用分层写入：
 
-Teaching Brief 应该帮助 agent 判断：
+- 关键回答后：Observer 产生 proposal，并尽快提交重要 Evidence。
+- 教学 checkpoint：归约 UserKnowledgeState。
+- 会话结束：刷新未完成的状态投影并更新 Markdown。
 
-- 当前要教什么
-- 用户此前是否接触过相关知识
-- 用户有哪些已知薄弱点
-- 用户有哪些历史误解
-- 是否存在需要先补的前置知识
-- 是否存在可用于类比的已掌握知识
-- 本轮教学应该重点讲什么、跳过什么、追问什么
+不采用“每条消息都重写正式状态”，避免噪声和频繁抖动；也不采用“只在会话结束写全部内容”，避免异常退出后丢失关键学习证据。
 
-示例：
+## 16. 备选方案与取舍
 
-```text
-目标知识点：JavaScript / 异步 / async-await
+### 16.1 知识图谱
 
-相关用户状态：
-- Promise：学过，但链式调用细节不稳定
-- Event Loop：学过，能说宏任务/微任务，但输出题不稳定
-- async/await：曾在模拟面试中跳过输出题
-- Python asyncio：用户有一定背景，可考虑轻度类比
+已放弃。它引入节点关系维护、去重、对齐和边质量问题，但当前没有能被树与文本检索无法替代的教学收益。
 
-本次教学建议：
-- 不要从“什么是异步”开始讲
-- 先快速确认 Promise.then 和微任务
-- 可以使用 Python coroutine 做类比
-- 最后必须做一道执行顺序题
-```
+### 16.2 自动生成 Skill
 
-## 10. 会话中的记忆加载机制
+暂不采用。用户学习习惯是动态个人状态，不适合被固化为可执行 Skill。教学方式由 Planner 在 Prompt 提示下自由选择，效果可以作为 Evidence 或后续策略研究的输入。
 
-当前确定的加载机制：
+### 16.3 整篇重写 Markdown
 
-```text
-会话开始前：重加载
-会话进行中：默认不查全量记忆，只在必要时定点查询
-会话结束后：统一更新 UserKnowledgeStatus 和用户可读笔记
-```
+不采用。它容易覆盖用户编辑并导致内容漂移。当前选择按知识单元进行区块级 patch。
 
-### 10.1 会话开始前重加载
+### 16.4 只保存最终掌握状态
 
-用户提出学习目标后，系统先通过 CatalogIndex 定位目标 `knowledgeNodeId`。
+不采用。没有 Evidence 就无法解释状态来源、处理冲突或重新归约状态。
 
-如果无法定位已有节点，系统先执行 Topic Bootstrap，生成本轮 Draft Topic Graph，并用草稿节点对齐已有 CatalogIndex / KnowledgeGraph。
+## 17. MVP 验收闭环
 
-然后系统通过 KnowledgeGraph 查找相关节点集合，例如：
+第一条必须验证的跨会话闭环是：
 
-- 目标节点自身
-- 目标节点的父级 topic
-- 目标节点下的直接 learning_unit
-- 目标节点的前置节点
-- 目标节点的 `mention_with` 节点
+1. 用户第一次学习某知识点并暴露误解。
+2. Observer 提取可追溯 Evidence。
+3. Committer 创建或复用节点并更新状态。
+4. Note Writer 生成用户可读复习内容。
+5. 下一次学习时 Planner 命中历史误解。
+6. Actor 避免重复已掌握内容并进行针对性追问。
+7. 延迟复测结果再次写回，状态能够升级、保持或降级。
 
-最后系统批量读取这些节点对应的 UserKnowledgeStatus。
+评测至少比较：
 
-读取结果会被压缩成 Teaching Brief。
+- 无长期记忆的普通 Agent。
+- 只注入原始记忆的 Agent。
+- 使用 Planner 编译记忆的 Byte Mentor Agent。
 
-agent 后续主要依据 Teaching Brief 进行教学。
+关注指标包括历史误解命中率、重复讲解率、针对性诊断率和延迟复测表现。
 
-如果目标节点是 `learning_unit`，系统可以沿 `belongs_to` 找到父级 `topic`，再读取父级 `topic.noteRef` 对应的完整模块笔记。
+## 18. 实现前仍需确认
 
-但完整模块笔记不应该默认全文进入 agent 上下文。它更适合作为可查资料，在生成 Teaching Brief 时被摘要成当前教学需要的上下文。
+- 教学 checkpoint 和正式会话结束的产品定义。
+- 用户是否直接编辑 AI 管理的 Markdown 区块。
+- 节点对齐歧义何时静默暂存、何时请求用户确认。
+- 状态归约策略的具体阈值和时间衰减规则。
+- Note Writer 的并发写入与冲突恢复方式。
 
-### 10.2 会话中默认不频繁检索
-
-正常教学过程中，agent 不应该每轮回答前都检索全量知识图谱或全量用户状态。
-
-原因：
-
-- Teaching Brief 已经覆盖当前会话主要上下文
-- 每轮检索成本高
-- 每轮检索会让教学行为不稳定
-- 大量历史记忆可能污染当前教学重点
-
-### 10.3 会话中允许定点查询
-
-如果教学过程中出现明确触发条件，可以定点查询记忆。
-
-触发条件示例：
-
-- 用户主动跳到新知识点
-- 用户暴露出明显前置知识缺失
-- 用户提到自己学过某个相关知识
-- 当前 Teaching Brief 不足以支撑继续教学
-
-会话中的单节点加载路径是：
-
-```text
-目标路径或目标名称
-  -> CatalogIndex
-  -> knowledgeNodeId
-  -> KnowledgeNode / 局部 KnowledgeEdge
-  -> UserKnowledgeStatus(userId, knowledgeNodeId)
-  -> Node Brief
-```
-
-## 11. 会话中的观察日志
-
-会话过程中不应该频繁直接修改正式 KnowledgeGraph 或 UserKnowledgeStatus。
-
-但 agent 需要在关键教学事件发生时记录 Observation Log。
-
-Observation Log 是学习过程中的观察记录，用于防止重要学习证据丢失，并为会话结束后的统一更新提供材料。
-
-适合记录 Observation Log 的事件包括：
-
-- 用户完成一次复述
-- 用户答错一个关键追问
-- 用户主动表示不懂
-- 用户提出暴露认知结构的问题
-- 用户纠正了之前的误解
-- 用户跳过某个知识点
-- agent 发现用户存在前置知识缺失
-
-Observation Log 不等于正式用户知识状态。
-
-它只是会话中的过程性证据。
-
-## 12. 会话结束后的统一更新
-
-会话结束后，系统根据本轮教学过程和 Observation Log，统一更新：
-
-- UserKnowledgeStatus
-- 用户可读笔记
-- 必要时将本轮 Draft Topic Graph 中的有效节点同步到正式 KnowledgeGraph
-
-写回的内容不应该是完整聊天记录，而应该是学习状态变化。
-
-示例：
-
-```text
-async/await:
-- 本次学习完成
-- 用户能解释 await 会暂停当前 async 函数
-- 用户仍然卡在 await 后续代码进入微任务
-- 下次建议从事件循环输出题开始复测
-
-Promise:
-- 作为前置知识被复测
-- Promise.then 回调时机回答正确
-```
-
-### 12.1 Draft Topic Graph 同步到正式 KnowledgeGraph
-
-当本轮学习目标来自一个新的主题，且会话开始前生成了 Draft Topic Graph 时，会话结束后需要判断哪些草稿节点应该进入正式 KnowledgeGraph。
-
-同步的依据不是把整个草稿图直接写入正式图谱，而是基于节点对齐阶段得到的正式图谱锚点。
-
-同步流程：
-
-```text
-Draft Topic Graph
-  ↓
-节点对齐得到 anchors
-  ↓
-结合本轮 Observation Log 和实际教学过程
-  ↓
-生成 Graph Sync Plan
-  ↓
-把本轮真正教学过、粒度合适、位置明确的节点写入正式 KnowledgeGraph
-```
-
-草稿节点在同步时可以分为：
-
-```ts
-type DraftNodeSyncState =
-  | "matched_existing"
-  | "new_under_anchor"
-  | "candidate_only"
-  | "discarded"
-```
-
-含义：
-
-- `matched_existing`：草稿节点已经匹配到已有正式节点，不需要新建。
-- `new_under_anchor`：草稿节点是新节点，并且有明确父级锚点，可以写入正式图谱。
-- `candidate_only`：草稿节点本轮被提到，但没有被真正教学或粒度尚不稳定，暂不写入正式图谱。
-- `discarded`：草稿节点无关、重复或粒度不合适。
-
-锚点需要区分类型：
-
-```text
-same_concept anchor:
-  草稿节点就是已有正式节点，直接绑定 existing knowledgeNodeId
-
-parent_topic anchor:
-  草稿节点是新知识点，可以挂到该已有 topic 下
-
-related_context anchor:
-  召回节点只是前置、类比或顺带提示，不作为新节点父级
-```
-
-只有 `parent_topic anchor` 可以决定新节点挂载位置。
-
-`prerequisite`、`mention_with`、`analogy` 等相关上下文不能直接作为父级锚点。
-
-示例：
-
-```text
-用户目标：学习 JavaScript 异步
-
-召回锚点：
-- JavaScript / 异步
-- JavaScript / 异步 / Promise
-- JavaScript / 异步 / Event Loop
-
-本轮真正教学过的新节点：
-- async-await
-- await 暂停当前 async 函数
-- await 后续代码进入微任务
-
-同步结果：
-- 如果 async-await 不存在，则创建 topic：JavaScript / 异步 / async-await
-- 将两个 await 相关 learning_unit 挂到 async-await 下
-- 如果本轮只是顺带提到 Generator，则暂不写入正式图谱
-```
-
-## 13. 当前 MVP 暂不处理的中断场景
-
-当前先不处理以下 hack 场景：
-
-> 用户学习某个主题到一半后退出，然后在新会话中学习另一个相关主题，此时未完成学习产生的临时观察如何参与新会话检索。
-
-因此，当前 MVP 的简化假设是：
-
-- Observation Log 主要服务当前会话结束后的统一更新。
-- 未完成会话的跨主题弱召回暂不作为当前设计目标。
-- 当前先优先跑通完整学习会话后的状态更新闭环。
-
-## 14. 规则占位
-
-UserKnowledgeStatus 的更新规则和 KnowledgeEdge 的创建规则初版先作为占位规则处理，不作为继续推进记忆模块设计的阻塞项。
-
-当前先确定：
-
-- UserKnowledgeStatus 的写回由会话结束后的统一更新流程负责。
-- KnowledgeEdge 的新增由 Graph Sync Plan 提议，初版必须保守。
-- 具体状态迁移规则、边生成规则、审核机制和置信度机制后续单独细化。
-- 在规则细化前，MVP 可以先使用人工确认或简单启发式规则，避免 LLM 自由写入正式记忆。
-
-待后续细化的问题包括：
-
-- 哪些边可以由系统规则生成
-- 哪些边可以由 LLM 提议
-- LLM 提议的边是否需要审核或置信度
-- KnowledgeGraph 中的全局关系和 UserKnowledgeStatus 中的个人状态如何区分
-- 如何避免 LLM 自由发挥导致图谱污染
-- 如何让边真正影响 Teaching Brief
-- Observation Log 如何稳定更新 UserKnowledgeStatus
+这些问题不改变本文确定的组件边界，可以在对应模块实施前逐项决策。
