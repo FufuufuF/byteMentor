@@ -15,10 +15,11 @@
     "clean": "tsc -b --clean"
   },
   "engines": {
-    "node": ">=22.12.0",
+    "node": ">=22.19.0",
     "pnpm": ">=10.0.0"
   },
   "devDependencies": {
+    "@xterm/headless": "5.5.0",
     "@byte-mentor/agent": "workspace:*",
     "@byte-mentor/core": "workspace:*",
     "@byte-mentor/session": "workspace:*",

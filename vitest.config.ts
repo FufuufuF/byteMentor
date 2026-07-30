@@ -10,6 +10,7 @@ export default defineConfig({
       "@byte-mentor/core": resolve(rootDir, "packages/core/src/index.ts"),
       "@byte-mentor/session": resolve(rootDir, "packages/session/src/index.ts"),
       "@byte-mentor/agent": resolve(rootDir, "packages/agent/src/index.ts"),
+      "@byte-mentor/tui": resolve(rootDir, "packages/tui/src/index.ts"),
     },
   },
   test: {

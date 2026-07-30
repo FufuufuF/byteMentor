@@ -1,1 +1,17 @@
-export {};
+export { ByteMentorTui } from "./byte-mentor-tui.js";
+export type { ByteMentorTuiOptions, ToolCallView } from "./byte-mentor-tui.js";
+export { createTheme } from "./theme.js";
+export type { ByteMentorTheme, ThemeKind } from "./theme.js";
+export { HeaderComponent } from "./components/header.js";
+export { UserMessageComponent } from "./components/user-message.js";
+export { AssistantMessageComponent } from "./components/assistant-message.js";
+export { StatusComponent } from "./components/status.js";
+export type { StatusState } from "./components/status.js";
+export { FooterComponent } from "./components/footer.js";
+export type { FooterData } from "./components/footer.js";
+export { ToolExecutionComponent } from "./components/tool-execution.js";
+export type { ToolExecutionState } from "./components/tool-execution.js";
+export { ToolViewStore } from "./tool-view-store.js";
+export { ChatEditor } from "./components/chat-editor.js";
+export { visibleWidth } from "@earendil-works/pi-tui";
+export type { Terminal } from "@earendil-works/pi-tui";
