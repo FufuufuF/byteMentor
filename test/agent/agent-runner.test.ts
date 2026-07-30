@@ -849,6 +849,44 @@ describe("AgentRunner.run", () => {
     });
   });
 
+  // Holds tool execution open to prove tool.started is observed before the tool promise resolves.
+  it("observes tool start while execution is still pending", async () => {
+    const toolCallId = createToolCallId();
+    const releaseTool = deferred<void>();
+    const observed: RuntimeEvent[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "lookup",
+      description: "lookup docs",
+      async execute() {
+        await releaseTool.promise;
+        return { ok: true, data: "done" };
+      },
+    });
+    const runPromise = new AgentRunner(
+      oneBatchProvider([{ id: toolCallId, name: "lookup", args: {} }]),
+    ).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
+      tools,
+      onRuntimeEvent(event) {
+        observed.push(event);
+      },
+    });
+
+    await settleAsyncWork(() => observed.some((event) => event.type === "tool.started"));
+    try {
+      expect(observed.map((event) => event.type)).toEqual([
+        "model.requested",
+        "model.responded",
+        "tool.started",
+      ]);
+    } finally {
+      releaseTool.resolve();
+      await runPromise;
+    }
+  });
+
   // 验证模型持续请求工具时，Runner 达到迭代上限便停止，同时保留已经产生的工具消息。
   it("stops with max_iterations when provider keeps requesting tools", async () => {
     const toolCallId = createToolCallId();
@@ -894,8 +932,48 @@ describe("AgentRunner.run", () => {
     });
   });
 
-  it("forwards content deltas for a final completed stream", async () => {
-    const deltas: string[] = [];
+  // Holds the provider after its first yield so the callback must prove it observes data before run resolves.
+  it("forwards a content delta while the provider stream is still running", async () => {
+    const releaseStream = deferred<void>();
+    const providerRequestedNextEvent = deferred<void>();
+    const observed: ProviderStreamEvent[] = [];
+    const provider = streamProvider(async function* () {
+      yield { type: "content_delta", text: "hello" };
+      providerRequestedNextEvent.resolve();
+      await releaseStream.promise;
+      yield {
+        type: "done",
+        message: { role: "assistant", content: "hello" },
+        stopReason: "completed",
+      };
+    });
+    let runSettled = false;
+    const runPromise = new AgentRunner(provider)
+      .run({
+        turnId: createTurnId(),
+        messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+        tools: new ToolRegistry(),
+        onStreamEvent(event) {
+          observed.push(event);
+        },
+      })
+      .finally(() => {
+        runSettled = true;
+      });
+
+    await providerRequestedNextEvent.promise;
+    try {
+      expect(observed).toEqual([{ type: "content_delta", text: "hello" }]);
+      expect(runSettled).toBe(false);
+    } finally {
+      releaseStream.resolve();
+      await runPromise;
+    }
+  });
+
+  // Verifies callback order exactly matches all provider yields, including the terminal done event.
+  it("forwards content deltas and done in provider order", async () => {
+    const observed: ProviderStreamEvent[] = [];
     const provider = streamProvider(async function* () {
       yield { type: "content_delta", text: "hello " };
       yield { type: "content_delta", text: "world" };
@@ -911,20 +989,26 @@ describe("AgentRunner.run", () => {
       messages: [{ id: createMessageId(), role: "user", content: "hello" }],
       tools: new ToolRegistry(),
       onStreamEvent(event) {
-        if (event.type === "content_delta") {
-          deltas.push(event.text);
-        }
+        observed.push(event);
       },
     });
 
     expect(result.stopReason).toBe("completed");
-    expect(deltas).toEqual(["hello ", "world"]);
+    expect(observed).toEqual([
+      { type: "content_delta", text: "hello " },
+      { type: "content_delta", text: "world" },
+      {
+        type: "done",
+        message: { role: "assistant", content: "hello world" },
+        stopReason: "completed",
+      },
+    ]);
   });
 
-  // 验证中间工具调用响应的文本增量不会展示给用户，只有最终回答的增量会被转发。
-  it("does not forward content deltas from intermediate tool-call streams", async () => {
+  // Verifies each tool-call and final iteration exposes its deltas and done boundary in yield order.
+  it("forwards every event across tool-call and final stream iterations", async () => {
     const toolCallId = createToolCallId();
-    const deltas: string[] = [];
+    const observed: ProviderStreamEvent[] = [];
     const provider = streamProvider(async function* (req) {
       if (req.messages.length === 1) {
         yield { type: "content_delta", text: "checking tool" };
@@ -961,18 +1045,49 @@ describe("AgentRunner.run", () => {
       messages: [{ id: createMessageId(), role: "user", content: "find docs" }],
       tools,
       onStreamEvent(event) {
-        if (event.type === "content_delta") {
-          deltas.push(event.text);
-        }
+        observed.push(event);
       },
     });
 
     expect(result.stopReason).toBe("completed");
-    expect(deltas).toEqual(["final ", "answer"]);
+    expect(observed.map((event) => event.type)).toEqual([
+      "content_delta",
+      "done",
+      "content_delta",
+      "content_delta",
+      "done",
+    ]);
+    expect(
+      observed.filter((event) => event.type === "content_delta").map((event) => event.text),
+    ).toEqual(["checking tool", "final ", "answer"]);
     expect(result.newMessages[0]).toMatchObject({
       role: "assistant",
       content: "checking tool",
       toolCalls: [{ id: toolCallId, name: "lookup", args: { query: "docs" } }],
+    });
+  });
+
+  // Verifies a partial response remains observable even when the provider throws before its done event.
+  it("forwards partial content before returning a provider failure", async () => {
+    const observed: ProviderStreamEvent[] = [];
+    const provider = streamProvider(async function* () {
+      yield { type: "content_delta", text: "partial" };
+      throw new Error("provider disconnected");
+    });
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      onStreamEvent(event) {
+        observed.push(event);
+      },
+    });
+
+    expect(observed).toEqual([{ type: "content_delta", text: "partial" }]);
+    expect(result).toMatchObject({
+      stopReason: "failed",
+      error: { message: "provider disconnected" },
     });
   });
 
@@ -1230,6 +1345,7 @@ describe("AgentRunner.run", () => {
     const started: string[] = [];
     const providerRequests: Message[][] = [];
     const checkpoints: RuntimeCheckpoint[] = [];
+    const observed: RuntimeEvent[] = [];
     const tools = new ToolRegistry();
     tools.register({
       name: "safe_read",
@@ -1257,6 +1373,9 @@ describe("AgentRunner.run", () => {
       async checkpoint(payload) {
         checkpoints.push(payload);
       },
+      onRuntimeEvent(event) {
+        observed.push(event);
+      },
     });
 
     await settleAsyncWork(() => started.length >= 2);
@@ -1268,6 +1387,11 @@ describe("AgentRunner.run", () => {
         error: { code: "path_not_found", message: "second failed" },
       });
       await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(
+        observed
+          .filter((event) => event.type === "tool.completed" || event.type === "tool.failed")
+          .map((event) => [event.type, event.toolCallId]),
+      ).toEqual([["tool.failed", secondId]]);
       completions.first.resolve({ ok: true, data: "first result" });
       result = await runPromise;
     } finally {
@@ -1296,6 +1420,15 @@ describe("AgentRunner.run", () => {
     expect(toolsCompleted?.newMessages.slice(1, 3)).toEqual(result.newMessages.slice(1, 3));
     expect(result.events.filter((event) => event.type === "tool.completed")).toHaveLength(1);
     expect(result.events.filter((event) => event.type === "tool.failed")).toHaveLength(1);
+    expect(
+      result.events
+        .filter((event) => event.type === "tool.completed" || event.type === "tool.failed")
+        .map((event) => [event.type, event.toolCallId]),
+    ).toEqual([
+      ["tool.failed", secondId],
+      ["tool.completed", firstId],
+    ]);
+    expect(observed).toEqual(result.events);
   });
 
   // 长 emoji 结果按 Unicode code point 截取前 500 个字符，并仅在 ToolMessage 保留完整 JSON。

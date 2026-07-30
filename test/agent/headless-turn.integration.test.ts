@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMessageId, createToolCallId } from "@byte-mentor/core";
-import type { Message, StopReason } from "@byte-mentor/core";
+import type { Message, RuntimeEvent, StopReason } from "@byte-mentor/core";
 import { AgentLoop, AgentRunner, ContextBuilder } from "@byte-mentor/agent";
 import type {
   AgentTool,
@@ -55,6 +55,64 @@ function invokeProvider(
 }
 
 describe("headless turn public API integration", () => {
+  // Verifies a no-tool turn observes every lifecycle event in the same order returned to the caller.
+  it("observes the complete runtime event sequence for a simple turn", async () => {
+    const provider = invokeProvider(async () => ({
+      message: { role: "assistant", content: "Hello." },
+      stopReason: "completed",
+    }));
+    const observed: RuntimeEvent[] = [];
+    const loop = new AgentLoop({
+      sessionStore: new InMemorySessionStore(),
+      contextBuilder: new ContextBuilder(),
+      runner: new AgentRunner(provider),
+    });
+
+    const result = await loop.runTurn(
+      { userMessage: "Hello" },
+      {
+        onRuntimeEvent(event) {
+          observed.push(event);
+        },
+      },
+    );
+
+    expect(observed).toEqual(result.events);
+    expect(observed.map((event) => event.type)).toEqual([
+      "turn.started",
+      "context.built",
+      "model.requested",
+      "model.responded",
+      "turn.completed",
+    ]);
+  });
+
+  // Verifies provider failure still emits turn.failed and preserves observer/result order.
+  it("observes a failed turn through its terminal runtime event", async () => {
+    const provider = invokeProvider(async () => {
+      throw new Error("provider unavailable");
+    });
+    const observed: RuntimeEvent[] = [];
+    const loop = new AgentLoop({
+      sessionStore: new InMemorySessionStore(),
+      contextBuilder: new ContextBuilder(),
+      runner: new AgentRunner(provider),
+    });
+
+    const result = await loop.runTurn(
+      { userMessage: "Hello" },
+      {
+        onRuntimeEvent(event) {
+          observed.push(event);
+        },
+      },
+    );
+
+    expect(result.status).toBe("failed");
+    expect(observed).toEqual(result.events);
+    expect(observed.at(-1)?.type).toBe("turn.failed");
+  });
+
   // 验证外部调用方只通过包公开 API 即可完成模型请求、工具执行、JSON 回传和会话持久化。
   it("runs a tool-using headless turn through public package exports", async () => {
     const toolCallId = createToolCallId();
