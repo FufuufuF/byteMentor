@@ -1,9 +1,9 @@
 # Byte Mentor
 
-Byte Mentor 目前处在 agent runtime bring-up 阶段。当前代码提供一个最小本地 smoke 闭环：
+Byte Mentor 当前提供一个本地多轮交互闭环：
 
 ```text
-CLI 输入 -> SQLite session -> OpenAI Chat provider -> AgentLoop / AgentRunner -> 保存消息 -> 输出 assistant 回复
+交互式 TUI -> SQLite session -> AgentLoop / AgentRunner -> OpenAI-compatible provider / tools -> 实时渲染并保存消息
 ```
 
 ## 安装
@@ -17,7 +17,7 @@ pnpm build
 
 ## 配置
 
-Smoke 命令从环境变量读取配置：
+交互命令从环境变量读取配置：
 
 | 变量                          | 必填 | 说明                                                                         |
 | ----------------------------- | ---- | ---------------------------------------------------------------------------- |
@@ -38,11 +38,17 @@ set +a
 
 CLI 不会自动加载 `.env`，环境变量必须已经存在于当前进程环境中。
 
-## 运行 Smoke
+## 运行交互式 TUI
 
 建议在 repo 根目录运行。默认 SQLite 数据库会生成在 `.byte-mentor/byte-mentor.sqlite`。
 
-如果使用 `.env.example` 中的配置形态，可以直接导出 `.env` 后运行：
+不带初始消息时，TUI 启动后等待输入：
+
+```bash
+pnpm exec node apps/cli/dist/index.js chat
+```
+
+也可以提供一条自动提交的 initial message；首轮完成后仍会停留在同一个 TUI 中：
 
 ```bash
 pnpm exec node apps/cli/dist/index.js chat "解释一下 Promise"
@@ -58,7 +64,9 @@ OPENAI_API_KEY=sk-... BYTE_MENTOR_MODEL=deepseek-v4-pro BYTE_MENTOR_OPENAI_BASE_
 
 这里直接用 `node apps/cli/dist/index.js` 是因为本地 workspace 中 `@byte-mentor/cli` 的 `bin.byte-mentor` 还没有被安装成可执行命令；`pnpm --filter @byte-mentor/cli exec byte-mentor ...` 在当前包内部找不到这个 bin。直接从 repo 根执行 dist 入口可以保证 `process.cwd()` 是 repo 根目录，默认数据库路径也会保持为 `.byte-mentor/byte-mentor.sqlite`。
 
-预期结果：终端流式打印 assistant 回复，结束后本轮消息写入 SQLite。
+普通 Enter 提交，Shift+Enter 或 Ctrl+J 换行。空闲时 Ctrl+C，或空输入时 Ctrl+D，正常退出。生成期间按 Ctrl+C 会显示延迟退出状态，并在当前 turn 完成、SQLite 关闭后退出。
+
+同一进程中的后续问题复用同一个 sessionId；每次重新启动进程会创建新 session。当前不支持跨进程 resume 或 session picker。
 
 ## Smoke 验证
 
@@ -71,17 +79,11 @@ sqlite3 .byte-mentor/byte-mentor.sqlite "SELECT seq, role FROM messages"
 
 应能看到一条 session，并且 `messages` 中至少有一条 `user` 和一条 `assistant`，按 `seq` 递增。
 
-不要删除 `.byte-mentor/`，再次运行：
-
-```bash
-pnpm exec node apps/cli/dist/index.js chat "换个方式解释"
-```
-
-当前阶段还没有实现 `--session`，所以 CLI 每次启动都会创建新 session。同一个 SQLite 文件中此时应该能看到两条 session。
+在同一个 TUI 中连续提交多个问题，数据库应仍只有本次进程创建的一条 session，并按顺序包含多轮 user、assistant 和 tool 消息。退出后重新运行命令会创建另一条 session。
 
 每次运行结束后，`.byte-mentor/byte-mentor.sqlite` 不应残留 `-journal` 或 `-wal` 文件。如果进程退出后这些文件仍然存在，需要检查 store close 路径。
 
-也可以用错误 API key 或断网验证失败路径。CLI 应打印清晰错误，不泄露 key，并且 SQLite store 仍应被关闭。
+也可以用错误 API key 或断网验证失败路径。单轮失败会显示在 transcript 中，TUI 保持运行并允许继续提交；启动或终端初始化失败才返回非零退出码。
 
 ## 当前范围
 
@@ -89,16 +91,18 @@ pnpm exec node apps/cli/dist/index.js chat "换个方式解释"
 
 - SQLite-backed session 和 message 存储。
 - OpenAI Chat Completions provider。
-- 最终 assistant content 的 provider streaming。
-- 非 TUI 的 CLI smoke command。
+- assistant content 的真实逐事件 streaming。
+- RuntimeEvent 与工具 pending/running/success/error 卡片。
+- 基于 pi-tui 的 Markdown、多行 Editor、响应式 Footer 和 CJK/emoji 安全布局。
+- 进程内多轮对话与同一 sessionId 复用。
 
 当前阶段不实现：
 
 - Knowledge、Teaching Brief 或 Observation Log。
-- TUI。
 - Responses API。
 - 多 provider 注册中心。
 - session compact 或 summary。
 - SQLite 迁移框架。
 - 真实 OpenAI API 集成测试。
-- `--session`、session 列表、标题生成或多轮交互 shell。
+- `--session`、session 列表、跨进程恢复或标题生成。
+- 生成期间取消、steer/follow-up queue、session/model/theme selector。
