@@ -11,6 +11,7 @@ import type {
 } from "@byte-mentor/core";
 import type {
   ModelProvider,
+  ProviderRequest,
   ProviderResponse,
   ProviderStreamEvent,
 } from "../providers/provider.js";
@@ -79,11 +80,13 @@ export class AgentRunner {
         messageCount: workingMessages.length,
         toolCount: toolDefinitions.length,
       });
-      const providerResult = await this.invokeProvider({
-        messages: workingMessages,
-        tools: toolDefinitions,
-        onStreamEvent: input.onStreamEvent,
-      });
+      const providerResult = await this.invokeProvider(
+        {
+          messages: workingMessages,
+          tools: toolDefinitions,
+        },
+        input.onStreamEvent,
+      );
       if (!providerResult.ok) {
         return {
           newMessages,
@@ -256,12 +259,11 @@ export class AgentRunner {
     };
   }
 
-  // Consumes one provider iteration, forwarding each yielded event before requesting the next one.
-  private async invokeProvider(input: {
-    messages: Message[];
-    tools: ReturnType<ToolRegistry["list"]>;
-    onStreamEvent?: (event: ProviderStreamEvent) => void;
-  }): Promise<
+  // Consumes one provider request while keeping the stream observer outside the provider-facing payload.
+  private async invokeProvider(
+    request: ProviderRequest,
+    onStreamEvent?: (event: ProviderStreamEvent) => void,
+  ): Promise<
     | {
         ok: true;
         response: ProviderResponse;
@@ -270,9 +272,9 @@ export class AgentRunner {
   > {
     try {
       let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
-      for await (const event of this.provider.invokeStream(input)) {
+      for await (const event of this.provider.invokeStream(request)) {
         try {
-          input.onStreamEvent?.(event);
+          onStreamEvent?.(event);
         } catch (cause) {
           throw new StreamObserverError(cause);
         }

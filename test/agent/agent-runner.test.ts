@@ -1005,6 +1005,28 @@ describe("AgentRunner.run", () => {
     ]);
   });
 
+  // Keeps AgentRunner's stream observer private while exposing only the declared request fields to providers.
+  it("does not include the stream observer in the provider request", async () => {
+    let providerRequestKeys: string[] = [];
+    const provider = streamProvider(async function* (request) {
+      providerRequestKeys = Object.keys(request).sort();
+      yield {
+        type: "done",
+        message: { role: "assistant", content: "hello" },
+        stopReason: "completed",
+      };
+    });
+
+    await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      onStreamEvent() {},
+    });
+
+    expect(providerRequestKeys).toEqual(["messages", "tools"]);
+  });
+
   // Verifies each tool-call and final iteration exposes its deltas and done boundary in yield order.
   it("forwards every event across tool-call and final stream iterations", async () => {
     const toolCallId = createToolCallId();
