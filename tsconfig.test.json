@@ -9,13 +9,15 @@
     "paths": {
       "@byte-mentor/core": ["./packages/core/src/index.ts"],
       "@byte-mentor/session": ["./packages/session/src/index.ts"],
-      "@byte-mentor/agent": ["./packages/agent/src/index.ts"]
+      "@byte-mentor/agent": ["./packages/agent/src/index.ts"],
+      "@byte-mentor/tui": ["./packages/tui/src/index.ts"]
     }
   },
   "include": ["test/**/*.ts"],
   "references": [
     { "path": "./packages/core" },
     { "path": "./packages/session" },
-    { "path": "./packages/agent" }
+    { "path": "./packages/agent" },
+    { "path": "./packages/tui" }
   ]
 }

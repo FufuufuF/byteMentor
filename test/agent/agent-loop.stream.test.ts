@@ -1,4 +1,5 @@
 import { describe, expectTypeOf, it } from "vitest";
+import type { RuntimeEvent } from "@byte-mentor/core";
 import type { AgentLoop, AgentRunnerInput, ProviderStreamEvent } from "@byte-mentor/agent";
 
 describe("AgentLoop streaming contract", () => {
@@ -10,6 +11,7 @@ describe("AgentLoop streaming contract", () => {
     expectTypeOf<RunTurnOptions>().toEqualTypeOf<
       | {
           onStreamEvent?: (event: ProviderStreamEvent) => void;
+          onRuntimeEvent?: (event: RuntimeEvent) => void;
         }
       | undefined
     >();
@@ -21,5 +23,15 @@ describe("AgentLoop streaming contract", () => {
     type StreamCallback = NonNullable<AgentRunnerInput["onStreamEvent"]>;
 
     expectTypeOf<Parameters<StreamCallback>[0]>().toEqualTypeOf<ProviderStreamEvent>();
+  });
+
+  // Verifies runtime lifecycle events can be observed through the same public turn and runner boundaries.
+  it("accepts an optional runtime event callback throughout the agent stack", () => {
+    type RunTurnOptions = NonNullable<Parameters<AgentLoop["runTurn"]>[1]>;
+    type TurnCallback = NonNullable<RunTurnOptions["onRuntimeEvent"]>;
+    type RunnerCallback = NonNullable<AgentRunnerInput["onRuntimeEvent"]>;
+
+    expectTypeOf<Parameters<TurnCallback>[0]>().toEqualTypeOf<RuntimeEvent>();
+    expectTypeOf<Parameters<RunnerCallback>[0]>().toEqualTypeOf<RuntimeEvent>();
   });
 });

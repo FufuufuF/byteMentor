@@ -42,7 +42,7 @@ describe("loadCliConfig", () => {
 
     expect(config).toEqual({
       command: "chat",
-      userMessage: "解释一下 Promise",
+      initialMessage: "解释一下 Promise",
       openaiApiKey: "sk-test",
       model: "gpt-test",
       openaiBaseURL: "https://example.test/v1",
@@ -73,21 +73,24 @@ describe("loadCliConfig", () => {
         env: { BYTE_MENTOR_MODEL: undefined },
       }),
     ).toThrow(/BYTE_MENTOR_MODEL/);
+  });
 
-    expect(() =>
-      loadConfig({
-        cwd,
-        argv: ["chat"],
-        env: { OPENAI_API_KEY: "sk-secret-value" },
-      }),
-    ).toThrow(/usage/i);
-    expect(() =>
-      loadConfig({
-        cwd,
-        argv: ["chat"],
-        env: { OPENAI_API_KEY: "sk-secret-value" },
-      }),
-    ).not.toThrow(/sk-secret-value/);
+  // Allows an empty chat prompt for interactive mode and joins all remaining positionals as one prompt.
+  it("parses optional multi-word initial messages", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+
+    expect(loadConfig({ cwd, argv: ["chat"] }).initialMessage).toBeUndefined();
+    expect(loadConfig({ cwd, argv: ["chat", "explain", "Promise"] }).initialMessage).toBe(
+      "explain Promise",
+    );
+  });
+
+  // Rejects every command other than chat before runtime assembly begins.
+  it("rejects unknown commands", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+
+    expect(() => loadConfig({ cwd, argv: ["ask", "hello"] })).toThrowError(CliConfigError);
+    expect(() => loadConfig({ cwd, argv: ["ask", "hello"] })).toThrow(/chat/);
   });
 
   it("resolves db path and creates its directory", async () => {

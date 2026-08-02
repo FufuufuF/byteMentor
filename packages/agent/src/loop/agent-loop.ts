@@ -38,6 +38,7 @@ export interface HeadlessTurnInput {
 
 export interface HeadlessTurnOptions {
   onStreamEvent?: (event: ProviderStreamEvent) => void;
+  onRuntimeEvent?: (event: RuntimeEvent) => void;
 }
 
 interface HeadlessTurnResultBase {
@@ -188,7 +189,7 @@ export class AgentLoop {
     if (!restoredRuntimeCheckpoint) {
       await this.restorePendingUserTurn(session);
     }
-    ctx.events.push({
+    emitRuntimeEvent(ctx, {
       type: "turn.started",
       turnId: ctx.turnId,
       ts: Date.now(),
@@ -223,7 +224,7 @@ export class AgentLoop {
       history: ctx.history,
       userMessage,
     });
-    ctx.events.push({
+    emitRuntimeEvent(ctx, {
       type: "context.built",
       turnId: ctx.turnId,
       ts: Date.now(),
@@ -239,6 +240,7 @@ export class AgentLoop {
       messages: ctx.initialMessages,
       tools: this.tools,
       onStreamEvent: ctx.options?.onStreamEvent,
+      onRuntimeEvent: ctx.options?.onRuntimeEvent,
       checkpoint: async (payload) => {
         session.metadata = await this.sessionStore.updateMetadata(session.id, (metadata) => ({
           ...metadata,
@@ -313,7 +315,8 @@ export class AgentLoop {
     const runnerResult = requireRunnerResult(ctx);
     if (runnerResult.stopReason === "failed") {
       const message = runnerResult.error?.message ?? failureMessageFor(runnerResult.stopReason);
-      ctx.events.push(...runnerResult.events, {
+      ctx.events.push(...runnerResult.events);
+      emitRuntimeEvent(ctx, {
         type: "turn.failed",
         turnId: ctx.turnId,
         ts: Date.now(),
@@ -333,7 +336,8 @@ export class AgentLoop {
     }
     if (runnerResult.stopReason === "max_iterations") {
       const message = failureMessageFor(runnerResult.stopReason);
-      ctx.events.push(...runnerResult.events, {
+      ctx.events.push(...runnerResult.events);
+      emitRuntimeEvent(ctx, {
         type: "turn.failed",
         turnId: ctx.turnId,
         ts: Date.now(),
@@ -358,7 +362,8 @@ export class AgentLoop {
     if (!isAssistantMessageWithId(finalMessage)) {
       throw new Error("runner final message missing id");
     }
-    ctx.events.push(...runnerResult.events, {
+    ctx.events.push(...runnerResult.events);
+    emitRuntimeEvent(ctx, {
       type: "turn.completed",
       turnId: ctx.turnId,
       ts: Date.now(),
@@ -377,6 +382,12 @@ export class AgentLoop {
     };
     return "ok";
   }
+}
+
+// Records an AgentLoop-owned lifecycle event before synchronously notifying the turn observer.
+function emitRuntimeEvent(ctx: TurnContext, event: RuntimeEvent): void {
+  ctx.events.push(event);
+  ctx.options?.onRuntimeEvent?.(event);
 }
 
 function requireSession(ctx: TurnContext): Session {

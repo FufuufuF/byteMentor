@@ -4,7 +4,7 @@ import { parseArgs } from "node:util";
 
 export interface CliConfig {
   command: "chat";
-  userMessage: string;
+  initialMessage?: string;
   openaiApiKey: string;
   model: string;
   openaiBaseURL?: string;
@@ -32,9 +32,13 @@ export function loadCliConfig(input: LoadCliConfigInput): CliConfig {
     allowPositionals: true,
     strict: false,
   });
-  const [command, userMessage] = parsed.positionals;
+  const [command, ...messageParts] = parsed.positionals;
   const openaiApiKey = input.env.OPENAI_API_KEY;
   const model = input.env.BYTE_MENTOR_MODEL;
+
+  if (command !== "chat") {
+    throw new CliConfigError("Usage: byte-mentor chat [message]");
+  }
 
   if (openaiApiKey === undefined || openaiApiKey.length === 0) {
     throw new CliConfigError("Missing required environment variable: OPENAI_API_KEY");
@@ -42,17 +46,15 @@ export function loadCliConfig(input: LoadCliConfigInput): CliConfig {
   if (model === undefined || model.length === 0) {
     throw new CliConfigError("Missing required environment variable: BYTE_MENTOR_MODEL");
   }
-  if (userMessage === undefined || userMessage.length === 0) {
-    throw new CliConfigError('Usage: byte-mentor chat "<message>"');
-  }
+  const initialMessage = messageParts.join(" ").trim() || undefined;
 
   const dbPath = resolveDbPath(input);
 
   mkdirSync(dirname(dbPath), { recursive: true });
 
   return {
-    command: command as "chat",
-    userMessage,
+    command,
+    ...(initialMessage !== undefined ? { initialMessage } : {}),
     openaiApiKey,
     model,
     ...(input.env.BYTE_MENTOR_OPENAI_BASE_URL !== undefined

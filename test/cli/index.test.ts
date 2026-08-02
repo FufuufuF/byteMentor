@@ -17,7 +17,7 @@ describe("CLI main", () => {
       stdout: output.io.stdout,
       stderr: output.io.stderr,
     };
-    const config = createConfig({ userMessage: "hello" });
+    const config = createConfig({ initialMessage: "hello" });
     const loadConfig = vi.fn<NonNullable<CliMainDeps["loadConfig"]>>(() => config);
     const runChat = vi.fn<NonNullable<CliMainDeps["runChat"]>>(async () => 0);
 
@@ -58,10 +58,10 @@ describe("CLI main", () => {
   });
 });
 
-function createConfig(input: { userMessage: string }): CliConfig {
+function createConfig(input: { initialMessage?: string }): CliConfig {
   return {
     command: "chat",
-    userMessage: input.userMessage,
+    ...(input.initialMessage !== undefined ? { initialMessage: input.initialMessage } : {}),
     openaiApiKey: "sk-test",
     model: "gpt-test",
     dbPath: "/tmp/byte-mentor-test.sqlite",

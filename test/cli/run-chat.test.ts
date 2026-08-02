@@ -34,65 +34,100 @@ type CreateRuntime = (
 ) => RunChatRuntime;
 
 describe("runChat", () => {
-  it("streams completed content deltas to stdout in order", async () => {
-    const config = createConfig({ userMessage: "解释一下 Promise" });
+  // Starts an input-only interactive view and keeps runChat pending until the user requests exit.
+  it("waits for input when no initial message is configured", async () => {
+    const config = createConfig({});
     const output = createOutput();
     const close = vi.fn(async () => undefined);
-    const runTurn: AgentLoop["runTurn"] = async (input, options) => {
-      expect(input).toEqual({ userMessage: "解释一下 Promise" });
-      options?.onStreamEvent?.({ type: "content_delta", text: "Promise " });
-      options?.onStreamEvent?.({ type: "content_delta", text: "代表一个" });
-      options?.onStreamEvent?.({ type: "content_delta", text: "未来结果。" });
-      return completedTurn("Promise 代表一个未来结果。");
-    };
+    const runTurn = vi.fn<AgentLoop["runTurn"]>(async () => completedTurn("unused"));
     const createLoop = vi.fn<NonNullable<RunChatDeps["createLoop"]>>(() => ({
       loop: { runTurn },
       close,
     }));
+    let viewOptions!: Parameters<NonNullable<RunChatDeps["createView"]>>[0];
+    const view = createViewRecorder();
+    const createView: NonNullable<RunChatDeps["createView"]> = (options) => {
+      viewOptions = options;
+      return view.port;
+    };
 
-    const exitCode = await runChat(config, output.io, { createLoop });
+    const resultPromise = runChat(config, output.io, { createLoop, createView });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runTurn).not.toHaveBeenCalled();
+    expect(view.calls).toContainEqual(["start"]);
+    viewOptions.onExit();
+    const exitCode = await resultPromise;
 
     expect(exitCode).toBe(0);
     expect(createLoop).toHaveBeenCalledWith(config);
-    expect(output.stdout()).toBe("Promise 代表一个未来结果。\n");
+    expect(output.stdout()).toBe("");
     expect(output.stderr()).toBe("");
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  it("reports non-completed turns to stderr and closes the runtime", async () => {
-    const config = createConfig({ userMessage: "继续解释" });
+  // Auto-submits the optional prompt, renders through view callbacks, and remains interactive afterward.
+  it("submits an initial message without exiting after the turn", async () => {
+    const config = createConfig({ initialMessage: "解释 Promise" });
     const output = createOutput();
     const close = vi.fn(async () => undefined);
-    const runTurn: AgentLoop["runTurn"] = async () =>
-      failedTurn("provider request failed before final answer");
-    const createLoop = vi.fn<NonNullable<RunChatDeps["createLoop"]>>(() => ({
-      loop: { runTurn },
-      close,
-    }));
-
-    const exitCode = await runChat(config, output.io, { createLoop });
-
-    expect(exitCode).toBe(1);
-    expect(output.stderr()).toMatch(/provider request failed before final answer/);
-    expect(close).toHaveBeenCalledTimes(1);
-  });
-
-  it("closes the runtime when runTurn throws", async () => {
-    const config = createConfig({ userMessage: "解释 async await" });
-    const output = createOutput();
-    const close = vi.fn(async () => undefined);
-    const runTurn: AgentLoop["runTurn"] = async () => {
-      throw new Error("OpenAI request failed");
+    const runTurn: AgentLoop["runTurn"] = async (input, options) => {
+      expect(input).toEqual({ userMessage: "解释 Promise" });
+      options?.onStreamEvent?.({ type: "content_delta", text: "Promise" });
+      options?.onStreamEvent?.({
+        type: "done",
+        message: { role: "assistant", content: "Promise answer" },
+        stopReason: "completed",
+      });
+      return completedTurn("Promise answer");
     };
     const createLoop = vi.fn<NonNullable<RunChatDeps["createLoop"]>>(() => ({
       loop: { runTurn },
       close,
     }));
+    let viewOptions!: Parameters<NonNullable<RunChatDeps["createView"]>>[0];
+    const view = createViewRecorder();
+    const createView: NonNullable<RunChatDeps["createView"]> = (options) => {
+      viewOptions = options;
+      return view.port;
+    };
+    let settled = false;
 
-    const exitCode = await runChat(config, output.io, { createLoop });
+    const resultPromise = runChat(config, output.io, { createLoop, createView }).finally(() => {
+      settled = true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(settled).toBe(false);
+    expect(view.calls).toContainEqual(["appendUserMessage", "解释 Promise"]);
+    expect(view.calls).toContainEqual(["appendAssistantDelta", "Promise"]);
+    viewOptions.onExit();
+    expect(await resultPromise).toBe(0);
+    expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  // Reports terminal startup failure through stderr and still closes runtime/view once.
+  it("returns one when view startup fails", async () => {
+    const config = createConfig({});
+    const output = createOutput();
+    const close = vi.fn(async () => undefined);
+    const createLoop = vi.fn<NonNullable<RunChatDeps["createLoop"]>>(() => ({
+      loop: { runTurn: async () => completedTurn("unused") },
+      close,
+    }));
+    const stop = vi.fn();
+    const createView: NonNullable<RunChatDeps["createView"]> = () => ({
+      ...createViewRecorder().port,
+      start() {
+        throw new Error("terminal unavailable");
+      },
+      stop,
+    });
+
+    const exitCode = await runChat(config, output.io, { createLoop, createView });
 
     expect(exitCode).toBe(1);
-    expect(output.stderr()).toMatch(/OpenAI request failed/);
+    expect(output.stderr()).toMatch(/terminal unavailable/);
+    expect(stop).toHaveBeenCalledTimes(1);
     expect(close).toHaveBeenCalledTimes(1);
   });
 
@@ -108,7 +143,7 @@ describe("runChat", () => {
       };
     });
     const runtime = (await loadCreateRuntime())(
-      createConfig({ userMessage: "inspect tools", workspaceRoot }),
+      createConfig({ initialMessage: "inspect tools", workspaceRoot }),
       { provider, sessionStore: new InMemorySessionStore() },
     );
     try {
@@ -199,7 +234,7 @@ describe("runChat", () => {
     });
     const sessionStore = new InMemorySessionStore();
     const runtime = (await loadCreateRuntime())(
-      createConfig({ userMessage: "inspect workspace", workspaceRoot }),
+      createConfig({ initialMessage: "inspect workspace", workspaceRoot }),
       { provider, sessionStore },
     );
     let result: Awaited<ReturnType<AgentLoop["runTurn"]>>;
@@ -244,7 +279,7 @@ describe("runChat", () => {
       };
     });
     const runtime = (await loadCreateRuntime())(
-      createConfig({ userMessage: "read denied files", workspaceRoot }),
+      createConfig({ initialMessage: "read denied files", workspaceRoot }),
       { provider, sessionStore: new InMemorySessionStore() },
     );
     try {
@@ -265,14 +300,40 @@ describe("runChat", () => {
   });
 });
 
-function createConfig(input: { userMessage: string; workspaceRoot?: string }): CliConfig {
+function createConfig(input: { initialMessage?: string; workspaceRoot?: string }): CliConfig {
   return {
     command: "chat",
-    userMessage: input.userMessage,
+    ...(input.initialMessage !== undefined ? { initialMessage: input.initialMessage } : {}),
     openaiApiKey: "sk-test",
     model: "gpt-test",
     dbPath: "/tmp/byte-mentor-test.sqlite",
     workspaceRoot: input.workspaceRoot ?? "/tmp/byte-mentor-workspace",
+  };
+}
+
+function createViewRecorder(): {
+  calls: Array<[string, ...unknown[]]>;
+  port: ReturnType<NonNullable<RunChatDeps["createView"]>>;
+} {
+  const calls: Array<[string, ...unknown[]]> = [];
+  return {
+    calls,
+    port: {
+      start: () => calls.push(["start"]),
+      stop: () => calls.push(["stop"]),
+      appendUserMessage: (text) => calls.push(["appendUserMessage", text]),
+      beginAssistantMessage: () => calls.push(["beginAssistantMessage"]),
+      appendAssistantDelta: (text) => calls.push(["appendAssistantDelta", text]),
+      completeAssistantMessage: (content) => calls.push(["completeAssistantMessage", content]),
+      addToolCall: (toolCall) => calls.push(["addToolCall", toolCall]),
+      startToolCall: (id) => calls.push(["startToolCall", id]),
+      completeToolCall: (id, output) => calls.push(["completeToolCall", id, output]),
+      failToolCall: (id, message) => calls.push(["failToolCall", id, message]),
+      showError: (message) => calls.push(["showError", message]),
+      setBusy: (busy) => calls.push(["setBusy", busy]),
+      setSessionId: (sessionId) => calls.push(["setSessionId", sessionId]),
+      setExitAfterTurn: (pending) => calls.push(["setExitAfterTurn", pending]),
+    },
   };
 }
 
@@ -349,18 +410,6 @@ function completedTurn(content: string): HeadlessTurnResult {
     finalMessage,
     newMessages: [finalMessage],
     stopReason: "completed",
-    events: [],
-    trace: [],
-  };
-}
-
-function failedTurn(message: string): HeadlessTurnResult {
-  return {
-    status: "failed",
-    sessionId: createSessionId(),
-    error: { message },
-    newMessages: [],
-    stopReason: "failed",
     events: [],
     trace: [],
   };

@@ -11,6 +11,7 @@ import type {
 } from "@byte-mentor/core";
 import type {
   ModelProvider,
+  ProviderRequest,
   ProviderResponse,
   ProviderStreamEvent,
 } from "../providers/provider.js";
@@ -33,6 +34,7 @@ export interface AgentRunnerInput {
   tools: ToolRegistry;
   maxIterations?: number;
   onStreamEvent?: (event: ProviderStreamEvent) => void;
+  onRuntimeEvent?: (event: RuntimeEvent) => void;
   checkpoint?: (payload: RuntimeCheckpoint) => Promise<void>;
 }
 
@@ -45,7 +47,6 @@ export interface AgentRunnerResult {
 
 interface ToolCallExecution {
   toolMessage: ToolMessage;
-  events: RuntimeEvent[];
 }
 
 export class AgentRunner {
@@ -72,17 +73,20 @@ export class AgentRunner {
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
       const toolDefinitions = input.tools.list();
-      events.push({
+      emitRuntimeEvent(events, input.onRuntimeEvent, {
         type: "model.requested",
         turnId: input.turnId,
         ts: Date.now(),
         messageCount: workingMessages.length,
         toolCount: toolDefinitions.length,
       });
-      const providerResult = await this.invokeProvider({
-        messages: workingMessages,
-        tools: toolDefinitions,
-      });
+      const providerResult = await this.invokeProvider(
+        {
+          messages: workingMessages,
+          tools: toolDefinitions,
+        },
+        input.onStreamEvent,
+      );
       if (!providerResult.ok) {
         return {
           newMessages,
@@ -93,7 +97,7 @@ export class AgentRunner {
       }
       const response = providerResult.response;
       const assistantMessage = withMessageId(response.message);
-      events.push({
+      emitRuntimeEvent(events, input.onRuntimeEvent, {
         type: "model.responded",
         turnId: input.turnId,
         ts: Date.now(),
@@ -102,11 +106,6 @@ export class AgentRunner {
       });
 
       if (!hasToolCalls(assistantMessage)) {
-        if (response.stopReason === "completed") {
-          for (const event of providerResult.contentDeltas) {
-            input.onStreamEvent?.(event);
-          }
-        }
         newMessages.push(assistantMessage);
         if (response.stopReason === "completed") {
           const checkpointError = await emitCheckpoint(input.checkpoint, {
@@ -147,9 +146,12 @@ export class AgentRunner {
         return checkpointFailed(newMessages, events, awaitingToolsError);
       }
 
-      const toolExecutions = await this.executeToolCallBatch(input, assistantMessage.toolCalls);
+      const toolExecutions = await this.executeToolCallBatch(
+        input,
+        assistantMessage.toolCalls,
+        events,
+      );
       for (const execution of toolExecutions) {
-        events.push(...execution.events);
         workingMessages.push(execution.toolMessage);
         newMessages.push(execution.toolMessage);
       }
@@ -175,6 +177,7 @@ export class AgentRunner {
   private async executeToolCallBatch(
     input: AgentRunnerInput,
     toolCalls: ToolCall[],
+    events: RuntimeEvent[],
   ): Promise<ToolCallExecution[]> {
     const canRunConcurrently = toolCalls.every(
       (toolCall) =>
@@ -184,13 +187,13 @@ export class AgentRunner {
     if (!canRunConcurrently) {
       const executions: ToolCallExecution[] = [];
       for (const toolCall of toolCalls) {
-        executions.push(await this.executeToolCall(input, toolCall));
+        executions.push(await this.executeToolCall(input, toolCall, events));
       }
       return executions;
     }
 
     return mapWithConcurrency(toolCalls, this.maxConcurrentToolCalls, (toolCall) =>
-      this.executeToolCall(input, toolCall),
+      this.executeToolCall(input, toolCall, events),
     );
   }
 
@@ -198,6 +201,7 @@ export class AgentRunner {
   private async executeToolCall(
     input: AgentRunnerInput,
     toolCall: ToolCall,
+    events: RuntimeEvent[],
   ): Promise<ToolCallExecution> {
     if (toolCall.argsParseError !== undefined) {
       return {
@@ -207,7 +211,6 @@ export class AgentRunner {
           toolCallId: toolCall.id,
           content: toolCallArgsParseErrorContent(toolCall),
         },
-        events: [],
       };
     }
 
@@ -219,6 +222,7 @@ export class AgentRunner {
       toolCallId: toolCall.id,
       toolName: toolCall.name,
     };
+    emitRuntimeEvent(events, input.onRuntimeEvent, startedEvent);
     const toolOutput = await input.tools.execute(toolCall.name, toolCall.args);
     const completedAt = Date.now();
     const durationMs = completedAt - startedAt;
@@ -244,6 +248,7 @@ export class AgentRunner {
           errorCode: toolOutput.result.error.code,
           message: toolOutput.result.error.message,
         };
+    emitRuntimeEvent(events, input.onRuntimeEvent, terminalEvent);
     return {
       toolMessage: {
         id: createMessageId(),
@@ -251,28 +256,29 @@ export class AgentRunner {
         toolCallId: toolCall.id,
         content: toolOutput.content,
       },
-      events: [startedEvent, terminalEvent],
     };
   }
 
-  private async invokeProvider(input: {
-    messages: Message[];
-    tools: ReturnType<ToolRegistry["list"]>;
-  }): Promise<
+  // Consumes one provider request while keeping the stream observer outside the provider-facing payload.
+  private async invokeProvider(
+    request: ProviderRequest,
+    onStreamEvent?: (event: ProviderStreamEvent) => void,
+  ): Promise<
     | {
         ok: true;
         response: ProviderResponse;
-        contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>>;
       }
     | { ok: false; message: string }
   > {
     try {
       let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
-      const contentDeltas: Array<Extract<ProviderStreamEvent, { type: "content_delta" }>> = [];
-      for await (const event of this.provider.invokeStream(input)) {
-        if (event.type === "content_delta") {
-          contentDeltas.push(event);
-        } else {
+      for await (const event of this.provider.invokeStream(request)) {
+        try {
+          onStreamEvent?.(event);
+        } catch (cause) {
+          throw new StreamObserverError(cause);
+        }
+        if (event.type === "done") {
           done = event;
         }
       }
@@ -285,11 +291,30 @@ export class AgentRunner {
           message: done.message,
           stopReason: done.stopReason,
         },
-        contentDeltas,
       };
     } catch (e) {
+      if (e instanceof StreamObserverError) {
+        throw e.observerCause;
+      }
       return { ok: false, message: e instanceof Error ? e.message : String(e) };
     }
+  }
+}
+
+// Records a runtime event before synchronously notifying observers at the exact occurrence point.
+function emitRuntimeEvent(
+  events: RuntimeEvent[],
+  observer: AgentRunnerInput["onRuntimeEvent"],
+  event: RuntimeEvent,
+): void {
+  events.push(event);
+  observer?.(event);
+}
+
+class StreamObserverError extends Error {
+  // Preserves a callback failure so provider error folding cannot consume application-layer errors.
+  constructor(readonly observerCause: unknown) {
+    super("stream observer failed");
   }
 }
 

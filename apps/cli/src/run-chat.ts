@@ -14,7 +14,13 @@ import {
 import type { ModelProvider } from "@byte-mentor/agent";
 import { SqliteSessionStore } from "@byte-mentor/session";
 import type { SessionStore } from "@byte-mentor/session";
+import { ByteMentorTui } from "@byte-mentor/tui";
+import type { ByteMentorTuiOptions } from "@byte-mentor/tui";
 import type { CliConfig } from "./config.js";
+import {
+  InteractiveChatController,
+  type InteractiveChatView,
+} from "./interactive-chat-controller.js";
 
 export interface RunChatIO {
   stdout: {
@@ -32,6 +38,7 @@ export interface RunChatRuntime {
 
 export interface RunChatDeps {
   createLoop?: (config: CliConfig) => RunChatRuntime;
+  createView?: (options: ByteMentorTuiOptions) => InteractiveChatView;
 }
 
 export interface CreateRuntimeDeps {
@@ -45,30 +52,34 @@ export async function runChat(
   deps: RunChatDeps = {},
 ): Promise<number> {
   let runtime: RunChatRuntime | undefined;
+  let controller: InteractiveChatController | undefined;
   try {
     runtime = (deps.createLoop ?? createRuntime)(config);
-    const result = await runtime.loop.runTurn(
-      { userMessage: config.userMessage },
-      {
-        onStreamEvent(event) {
-          if (event.type === "content_delta") {
-            io.stdout.write(event.text);
-          }
-        },
+    const createView = deps.createView ?? ((options) => new ByteMentorTui(options));
+    const view = createView({
+      model: config.model,
+      workspaceRoot: config.workspaceRoot,
+      onSubmit(text) {
+        void controller?.submit(text);
       },
-    );
-    io.stdout.write("\n");
-
-    if (result.status !== "completed") {
-      io.stderr.write(`Agent turn did not complete: ${result.error.message}\n`);
-      return 1;
-    }
-    return 0;
+      onExit() {
+        controller?.requestExit();
+      },
+    });
+    controller = new InteractiveChatController({
+      loop: runtime.loop,
+      view,
+      close: runtime.close,
+    });
+    await controller.start(config.initialMessage);
+    return await controller.waitForExit();
   } catch (error) {
     io.stderr.write(`${errorMessage(error)}\n`);
-    return 1;
-  } finally {
+    if (controller !== undefined) {
+      return await controller.waitForExit();
+    }
     await runtime?.close();
+    return 1;
   }
 }
 
