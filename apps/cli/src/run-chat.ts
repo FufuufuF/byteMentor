@@ -2,6 +2,7 @@ import {
   AgentLoop,
   AgentRunner,
   ContextBuilder,
+  editFileTool,
   findFilesTool,
   listDirectoryTool,
   OpenAIChatProvider,
@@ -9,6 +10,7 @@ import {
   searchTextTool,
   ToolRegistry,
   WorkspaceAccessPolicy,
+  WorkspaceEditor,
   WorkspaceReader,
 } from "@byte-mentor/agent";
 import type { ModelProvider } from "@byte-mentor/agent";
@@ -98,14 +100,19 @@ export function createRuntime(config: CliConfig, deps: CreateRuntimeDeps = {}): 
     workspaceRoot: config.workspaceRoot,
     policy,
   });
+  const workspaceEditor = new WorkspaceEditor({
+    workspaceRoot: config.workspaceRoot,
+    policy,
+  });
   const tools = new ToolRegistry({
-    context: { workspaceReader },
+    context: { workspaceReader, workspaceEditor },
     maxSerializedToolResultCharacters: policy.limits.maxSerializedToolResultCharacters,
   });
   tools.register(listDirectoryTool);
   tools.register(findFilesTool);
   tools.register(searchTextTool);
   tools.register(readFileTool);
+  tools.register(editFileTool);
   const runner = new AgentRunner(provider);
   const loop = new AgentLoop({
     sessionStore,

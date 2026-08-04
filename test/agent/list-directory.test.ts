@@ -6,6 +6,7 @@ import * as agentExports from "@byte-mentor/agent";
 import {
   ToolRegistry,
   WorkspaceAccessPolicy,
+  WorkspaceEditor,
   WorkspaceReader,
   type AgentTool,
   type ToolExecutionOutput,
@@ -71,8 +72,9 @@ function createRegistry(
 ): ToolRegistry {
   const policy = new WorkspaceAccessPolicy(overrides);
   const workspaceReader = new WorkspaceReader({ workspaceRoot, policy });
+  const workspaceEditor = new WorkspaceEditor({ workspaceRoot, policy });
   const registry = new ToolRegistry({
-    context: { workspaceReader },
+    context: { workspaceReader, workspaceEditor },
     maxSerializedToolResultCharacters: policy.limits.maxSerializedToolResultCharacters,
   });
   registry.register(getListDirectoryTool());

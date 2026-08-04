@@ -48,7 +48,10 @@ describe("ToolRegistry.execute known tool", () => {
 describe("ToolRegistry execution context", () => {
   // Registry 负责持有统一运行环境；这里使用完整的 context 形状作为不透明值，验证同一对象原样传给 Tool。
   it("injects the configured context into tool execution", async () => {
-    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    const context = {
+      workspaceReader: {} as never,
+      workspaceEditor: {} as never,
+    } satisfies ToolExecutionContext;
     const registry = new ToolRegistry({ context });
     let receivedContext: ToolExecutionContext | undefined;
     registry.register({

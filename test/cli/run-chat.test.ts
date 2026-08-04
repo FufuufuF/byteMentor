@@ -131,8 +131,8 @@ describe("runChat", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  // 真实 CLI 组装必须向首个模型请求暴露四个按名称排序的内置只读工具。
-  it("assembles four sorted workspace tool definitions", async () => {
+  // 真实 CLI 组装必须向首个模型请求暴露五个按名称排序的内置工作区工具，包含写工具 edit_file。
+  it("assembles five sorted workspace tool definitions", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runtime-tools-"));
     const requests: ProviderRequest[] = [];
     const provider = invokeProvider(async (request) => {
@@ -154,6 +154,7 @@ describe("runChat", () => {
     }
 
     expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual([
+      "edit_file",
       "find_files",
       "list_directory",
       "read_file",

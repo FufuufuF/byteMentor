@@ -1,4 +1,5 @@
 import type { ToolDefinition } from "../providers/provider.js";
+import type { WorkspaceEditor } from "./workspace/workspace-editor.js";
 import type { WorkspaceReader } from "./workspace/workspace-reader.js";
 
 export type JsonPrimitive = string | number | boolean | null;
@@ -17,7 +18,11 @@ export type ToolErrorCode =
   | "wrong_path_type"
   | "unsupported_content"
   | "resource_limit"
-  | "execution_failed";
+  | "execution_failed"
+  | "edit_target_not_found"
+  | "edit_target_not_unique"
+  | "edit_targets_overlap"
+  | "edit_no_change";
 
 export interface ToolError {
   code: ToolErrorCode;
@@ -34,6 +39,7 @@ export interface ToolExecutionOutput {
 
 export interface ToolExecutionContext {
   workspaceReader: WorkspaceReader;
+  workspaceEditor: WorkspaceEditor;
 }
 
 export interface AgentTool extends ToolDefinition {
