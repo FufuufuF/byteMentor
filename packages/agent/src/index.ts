@@ -11,6 +11,8 @@ export * from "./tools/builtins/list-directory.js";
 export * from "./tools/builtins/read-file.js";
 export * from "./tools/builtins/search-text.js";
 export * from "./tools/workspace/workspace-policy.js";
+export * from "./tools/workspace/workspace-path-resolver.js";
 export * from "./tools/workspace/workspace-reader.js";
+export * from "./tools/workspace/workspace-editor.js";
 export { AgentLoopStateError } from "./loop/turn-state.js";
 export type { StateTraceEntry, TurnState, TurnStateEvent } from "./loop/turn-state.js";
