@@ -13,8 +13,8 @@
 | 2 | `edit_file` 纵向切片 | ✅ 完成 | `5510492 feat(agent): add workspace file edit tool` |
 | 3 | turn 级取消链路 | ✅ 完成 | `97ac75f feat(agent): propagate turn cancellation` |
 | 4 | 受控 Shell 环境 + 一次性进程执行器 | ✅ 完成 | `d644826 feat(agent): add managed shell executor` |
-| 5 | Shell 输出累加 + 完整日志生命周期 | ⬜ 待实现 | — |
-| 6 | `bash` Tool 与 CLI 闭环 | ⬜ 待实现 | — |
+| 5 | Shell 输出累加 + 完整日志生命周期 | ✅ 完成 | `38221ee feat(agent): capture bounded shell output` |
+| 6 | `bash` Tool 与 CLI 闭环 | ✅ 完成 | `d536827 feat(agent): add bash execution tool` |
 
 分支：`feat/agent-write-tools`。
 
@@ -97,3 +97,41 @@
 ## 下一步
 
 Batch 5：Shell 输出累加与完整日志生命周期（`shell-output.ts` 流式 UTF-8 解码 + ANSI/控制字符清理 + 2,000 行尾部累加 + JSON 预算 + `shell-log-store.ts` session 临时目录/100 MiB 日志/幂等清理）。实现前先读 plan 该 batch 细节并确认跨包决策。
+
+## Batch 5 已交付（`38221ee`）
+
+范围：`shell-output.ts` / `shell-log-store.ts` / index.ts 公共导出，为 bash 提供有界输出捕获与完整日志生命周期。
+
+- **`shell-output.ts`（新）**：
+  - `ShellOutputAccumulator({ maxLines? })`：stdout/stderr 各自独立流式 `TextDecoder` + 跨 chunk ANSI 状态机（CSI/OSC/DCS）；保留 LF/tab，移除 CR、DEL、其余 C0/C1 与 escape sequence；`push(chunk)` 返回本次清理文本；tail 只保留最近 maxLines 行（内存有界），`totalLines()` 精确统计（空输出 0 行、末尾 LF 不新增空行、无末尾 LF 最后一段计一行）；`extractFullText()` 首次接管返回全部已清理文本并清空；`maxLines` 注入超 2,000 协议上限抛 TypeError。
+  - `computeShellTail({ text, totalLines?, fields, maxLines?, maxSerializedCharacters? })`：先 2,000 行尾部限制，再按实际 `JSON.stringify()` 预算二分缩短 output 尾部（`truncatedBy: "lines"|"output_limit"` + total/returned 元数据），Unicode scalar 边界（无孤立 surrogate）。
+- **`shell-log-store.ts`（新）**：`ShellLogStore({ sessionTempDirectory, maxLogBytes? })` 懒创建 mode 0700 session 临时目录 + 随机 mode 0600 日志；`backfill`/`append` 经单一异步写链串行并背压，返回 `{ fullOutputPath, limitReached }`（恰好达到上限允许、下一段超限写 UTF-8 scalar 前缀并置位）；create/chmod/写失败抛 `ShellLogError`；`close()` 幂等清理整个 session 目录；`maxLogBytes` 注入超 100 MiB 协议上限抛 TypeError。
+- 测试：`shell-output.test.ts` 20 个（跨 chunk UTF-8/双流独立解码/交错合并/跨 chunk CSI/OSC/控制字符/行数边界/tail 有界/extract 接管/行与预算截断/surrogate）；`shell-log-store.test.ts` 12 个（权限/随机名/写链顺序/limitReached 边界/scalar 前缀/失败路径/close 幂等/懒创建）。
+- 过程中确认的决策（全选推荐项）：类 + 纯函数分离；`extractFullText` 接管式保证内存有界；写操作返回 `limitReached` + 抛 `ShellLogError`；`close` 清理整个 session 目录；push 调用序即 seq 序。
+- 修复：`keepLastLines` 尾空串占位多丢一行；单字节 C1 CSI（`0x9B`）参数序列未清理；预算测试的 truncation 元数据固定部分约 160 字符需留余量。
+
+## Batch 6 已交付（`d536827`）
+
+范围：`contracts` shell 错误码与 context 扩展 / `builtins/bash.ts` / index.ts / CLI config 与 Runtime 组装，完成 bash 的模型可调用闭环。
+
+- **contracts**：`ToolErrorCode` 增加 `shell_unavailable`/`command_timed_out`；`ToolExecutionContext` 增加可选 `shell?: ToolShellContext`（shellPath/shellEnv），Registry 注入。
+- **`builtins/bash.ts`（新）**：`createBashTool({ sessionTempDirectory, runtimeCloseSignal? })` 薄适配层：
+  - schema `{ command, timeout? }`（command ≤ 32,768 Unicode 字符、非空白、原字符串保留；timeout 有限正数 ≤ 2,147,483.647 秒；`additionalProperties: false`）。
+  - spawn 前用 command + 最小成功 payload 预检序列化预算，超限返回 `resource_limit` 不启动进程。
+  - 每次执行前 `resolveShellPath(explicit)` 校验 shell 可用，失败返回 `shell_unavailable`。
+  - 流式日志：`onChunk` 轻量检测（totalLines>2000 或 tailText 超预算）触发 `backfill(extractFullText())`，之后每 chunk `append`；`limitReached`/`ShellLogError` → consumer 抛错 → `runCommand` 返回 consumer-failed → `resource_limit`。
+  - 结果：自然退出任意 exitCode 成功 payload；外部 signal → `execution_failed` + details.signal + 终止前输出；timeout/turn/runtime → `command_timed_out`/`command_cancelled` + `cancelledBy`；均保留 output/truncation/fullOutputPath 且遵守预算。
+- **CLI config**：`CliConfig` 加可选 `bashPath`/`bashEnvAllowlist`；`BYTE_MENTOR_BASH_PATH` 只要设置就必须非空绝对路径否则 `CliConfigError`；`BYTE_MENTOR_BASH_ENV_ALLOWLIST` 逗号分隔 trim/删空/首次去重/`[A-Za-z_][A-Za-z0-9_]*` 校验。
+- **run-chat**：`createRuntime` 用 `config.bashPath ?? resolveShellPath` 选 shell、`createShellEnvironment` 构造受控环境、注入 context.shell、注册 `createBashTool`；`close` 按「abort runtime signal → 关 session store → rm 日志目录」收尾。
+- 测试：`bash.test.ts` 22 个（参数校验/成功执行/终止语义/预算与日志）；`agent-runner.test.ts` 追加非 safe bash 混合批次串行（真实 bash 输出进 ToolMessage）；`config.test.ts` 追加 bashPath/allowlist 解析与非法配置；`run-chat.test.ts` 工具断言 5→6、bash 非零退出 + close 清理日志、端到端验收。
+- 修复：`ShellTruncation` interface → type alias（兼容 JsonObject index signature，连锁解决 agent dist 未构建导致 cli 找不到导出）；runner 混合批次 provider 需第二轮 completed 防无限循环。
+
+## 整体验收（`6531c86`）
+
+- 自动化（`run-chat.test.ts` 新增用例）：fake-provider 驱动 `read_file → edit_file（两个不相交替换，diff/patch）→ bash cat+exit 7（非零退出码成功 payload）→ bash seq 1 3000（截断 + fullOutputPath）` 完整闭环，验证单文件原子性与完整日志生命周期。
+- 计划 316-325 的第 5-6 项（Ctrl+C 取消、跨 session 恢复）依赖交互式 CLI 与真实模型，已由 Batch 3 的 turn 取消测试与 checkpoint 持久化测试覆盖；受控人工 smoke 留待真实环境执行。
+- 当前全量：**41 测试文件 / 484 测试** + typecheck/lint/format 全绿。
+
+## 下一步
+
+受控人工 smoke（真实模型 + 交互式 CLI）：验证长命令 Ctrl+C 取消的进程树/checkpoint/日志收敛，以及重进 session 后取消前消息可恢复。之后可将此计划标记为完结。
