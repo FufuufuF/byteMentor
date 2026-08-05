@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMessageId, createSessionId, createToolCallId } from "@byte-mentor/core";
@@ -131,8 +131,8 @@ describe("runChat", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  // 真实 CLI 组装必须向首个模型请求暴露四个按名称排序的内置只读工具。
-  it("assembles four sorted workspace tool definitions", async () => {
+  // 真实 CLI 组装必须向首个模型请求暴露六个按名称排序的内置工作区工具，包含写工具 edit_file 与 bash。
+  it("assembles six sorted workspace tool definitions", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runtime-tools-"));
     const requests: ProviderRequest[] = [];
     const provider = invokeProvider(async (request) => {
@@ -154,12 +154,128 @@ describe("runChat", () => {
     }
 
     expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual([
+      "bash",
+      "edit_file",
       "find_files",
       "list_directory",
       "read_file",
       "search_text",
     ]);
   });
+
+  // 端到端写工具验收：read_file → edit_file（不相交替换）→ bash 非零退出 → bash 截断，
+  // 验证 diff/patch、单文件原子性、非零退出码成功 payload、尾部与完整日志生命周期。
+  it("completes the write-tools acceptance loop", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-acceptance-"));
+    await writeFile(join(workspaceRoot, "a.txt"), "hello world\nline one\nline two\n", "utf8");
+    let step = 0;
+    const provider = invokeProvider(async (request) => {
+      const previous = step === 0 ? undefined : parseLastToolEnvelope(request);
+      switch (step) {
+        case 0:
+          step += 1;
+          return toolCallResponse("read_file", { path: "a.txt" });
+        case 1:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { content: "hello world\nline one\nline two\n" },
+          });
+          step += 1;
+          return toolCallResponse("edit_file", {
+            path: "a.txt",
+            edits: [
+              { oldText: "hello world", newText: "HELLO WORLD" },
+              { oldText: "line one", newText: "line 1" },
+            ],
+          });
+        case 2:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { replacements: 2, diff: expect.stringContaining("HELLO WORLD") },
+          });
+          step += 1;
+          return toolCallResponse("bash", { command: "cat a.txt; exit 7" });
+        case 3:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: {
+              exitCode: 7,
+              output: expect.stringContaining("HELLO WORLD"),
+            },
+          });
+          step += 1;
+          return toolCallResponse("bash", { command: "seq 1 3000" });
+        case 4:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { truncated: true, fullOutputPath: expect.any(String) },
+          });
+          step += 1;
+          return {
+            message: { role: "assistant", content: "accepted" },
+            stopReason: "completed",
+          };
+        default:
+          return {
+            message: { role: "assistant", content: "accepted" },
+            stopReason: "completed",
+          };
+      }
+    });
+    const runtime = (await loadCreateRuntime())(
+      createConfig({ initialMessage: "go", workspaceRoot }),
+      { provider, sessionStore: new InMemorySessionStore() },
+    );
+    try {
+      const result = await runtime.loop.runTurn({ userMessage: "go" });
+      expect(result.status).toBe("completed");
+      expect(await readFile(join(workspaceRoot, "a.txt"), "utf8")).toBe(
+        "HELLO WORLD\nline 1\nline two\n",
+      );
+    } finally {
+      await runtime.close();
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+    expect(step).toBe(5);
+  }, 30_000);
+
+  // 经真实 Runtime 执行 bash 工具：非零退出码仍是成功 payload，截断日志被创建并在 close 时清理。
+  it("executes bash with non-zero exit code and cleans session logs on close", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runtime-bash-"));
+    let step = 0;
+    const provider = invokeProvider(async (request) => {
+      if (step === 0) {
+        step += 1;
+        return toolCallResponse("bash", { command: "seq 1 2500; exit 3" });
+      }
+      expect(parseLastToolEnvelope(request)).toMatchObject({
+        ok: true,
+        data: { truncated: true, exitCode: 3 },
+      });
+      return {
+        message: { role: "assistant", content: "bash done" },
+        stopReason: "completed",
+      };
+    });
+    const runtime = (await loadCreateRuntime())(
+      createConfig({ initialMessage: "run bash", workspaceRoot }),
+      { provider, sessionStore: new InMemorySessionStore() },
+    );
+    try {
+      await runtime.loop.runTurn({ userMessage: "run bash" });
+      const logs = (await readdir(tmpdir())).filter((name) =>
+        name.startsWith("byte-mentor-bash-session-"),
+      );
+      expect(logs.length).toBeGreaterThan(0);
+    } finally {
+      await runtime.close();
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+    const remaining = (await readdir(tmpdir())).filter((name) =>
+      name.startsWith("byte-mentor-bash-session-"),
+    );
+    expect(remaining).toHaveLength(0);
+  }, 30_000);
 
   // fake provider 逐步消费真实 ToolMessage，验证固定临时工作区内的浏览、查找、搜索和续读闭环。
   it("completes the workspace discovery and reading loop", async () => {
@@ -329,6 +445,7 @@ function createViewRecorder(): {
       startToolCall: (id) => calls.push(["startToolCall", id]),
       completeToolCall: (id, output) => calls.push(["completeToolCall", id, output]),
       failToolCall: (id, message) => calls.push(["failToolCall", id, message]),
+      cancelToolCall: (id, message) => calls.push(["cancelToolCall", id, message]),
       showError: (message) => calls.push(["showError", message]),
       setBusy: (busy) => calls.push(["setBusy", busy]),
       setSessionId: (sessionId) => calls.push(["setSessionId", sessionId]),

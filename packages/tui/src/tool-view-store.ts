@@ -35,6 +35,11 @@ export class ToolViewStore implements Component {
     this.getOrCreate(id).fail(message);
   }
 
+  // Converges a cancelled tool call into a terminal cancelled card without changing card order.
+  cancel(id: string, message: string): void {
+    this.getOrCreate(id).cancel(message);
+  }
+
   // Renders cards in assistant tool-call order regardless of completion order.
   render(width: number): string[] {
     return this.ordered.flatMap((card) => card.render(width));

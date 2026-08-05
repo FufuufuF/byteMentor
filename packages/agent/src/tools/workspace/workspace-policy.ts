@@ -21,6 +21,8 @@ export interface WorkspaceResourceLimits {
   maxTraversalEntries: number;
   /** 单次最多返回的跳过文件详情条数，实际跳过总数仍通过 `skippedFileCount` 完整暴露。 */
   maxSkippedFileDetails: number;
+  /** 单个可编辑文件的原始字节协议硬上限，WorkspaceEditor 在 stat 与读取后各检查一次，Runtime 只能降低。 */
+  maxEditableFileBytes: number;
 }
 
 export interface WorkspaceAccessPolicyOverrides {
@@ -49,6 +51,7 @@ const DEFAULT_LIMITS: Readonly<WorkspaceResourceLimits> = {
   maxSearchTotalBytes: 50 * 1024 * 1024,
   maxTraversalEntries: 50_000,
   maxSkippedFileDetails: 20,
+  maxEditableFileBytes: 2 * 1024 * 1024,
 };
 
 export class WorkspaceAccessPolicy {

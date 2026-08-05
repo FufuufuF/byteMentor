@@ -28,7 +28,7 @@ interface FakeChunk {
 interface FakeOpenAIClient {
   chat: {
     completions: {
-      create(req: unknown): AsyncIterable<FakeChunk>;
+      create(req: unknown, options?: unknown): AsyncIterable<FakeChunk>;
     };
   };
 }
@@ -36,15 +36,19 @@ interface FakeOpenAIClient {
 function createStreamingClient(chunks: FakeChunk[]): {
   client: FakeOpenAIClient;
   requests: unknown[];
+  requestOptions: unknown[];
 } {
   const requests: unknown[] = [];
+  const requestOptions: unknown[] = [];
   return {
     requests,
+    requestOptions,
     client: {
       chat: {
         completions: {
-          async *create(req) {
+          async *create(req, options) {
             requests.push(req);
+            requestOptions.push(options);
             yield* chunks;
           },
         },
@@ -246,5 +250,45 @@ describe("OpenAIChatProvider.invokeStream", () => {
       },
       stopReason: "tool_calls",
     });
+  });
+
+  // 验证 turn signal 通过独立 invocation options 而不是 ProviderRequest 透传：
+  // SDK 调用边界必须能收到同一个 AbortSignal，供模型生成阶段中止流。
+  it("passes the invocation signal to the SDK request options", async () => {
+    const { client, requests, requestOptions } = createStreamingClient([
+      chunk({ role: "assistant", content: "ok" }, "stop"),
+    ]);
+    const provider = createProvider(client);
+    const controller = new AbortController();
+    const events: ProviderStreamEvent[] = [];
+    for await (const event of provider.invokeStream(
+      { messages: [{ role: "user", content: "hello" }] },
+      { signal: controller.signal },
+    )) {
+      events.push(event);
+    }
+
+    expect(events.at(-1)).toEqual({
+      type: "done",
+      message: { role: "assistant", content: "ok" },
+      stopReason: "completed",
+    });
+    expect(requests[0]).toMatchObject({ model: "gpt-test", stream: true });
+    expect(requests[0]).not.toHaveProperty("signal");
+    expect(requestOptions[0]).toEqual({ signal: controller.signal });
+  });
+
+  // 验证不传 options 时 SDK 调用仍以空 options 兼容，且 invoke 折叠同样透传 signal。
+  it("passes the signal through the non-streaming invoke fold", async () => {
+    const { client, requestOptions } = createStreamingClient([chunk({ content: "hi" }, "stop")]);
+    const provider = createProvider(client);
+    const controller = new AbortController();
+
+    await provider.invoke(
+      { messages: [{ role: "user", content: "hello" }] },
+      { signal: controller.signal },
+    );
+
+    expect(requestOptions[0]).toEqual({ signal: controller.signal });
   });
 });

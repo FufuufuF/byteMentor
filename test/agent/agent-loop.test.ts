@@ -1090,4 +1090,82 @@ describe("AgentLoop.runTurn", () => {
     expect(receivedCallbacks[0]).toBeTypeOf("function");
     expect(deltas).toEqual(["hello ", "world"]);
   });
+
+  it("passes the turn signal option to runner", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const controller = new AbortController();
+    const assistantMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "done",
+    };
+    const receivedSignals: Array<AbortSignal | undefined> = [];
+    const runner = {
+      async run(input: { messages: Message[]; signal?: AbortSignal }) {
+        receivedSignals.push(input.signal);
+        return {
+          newMessages: [assistantMessage],
+          stopReason: "completed" as StopReason,
+          events: [],
+        };
+      },
+    };
+
+    await new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner,
+    }).runTurn({ userMessage: "hello" }, { signal: controller.signal });
+
+    expect(receivedSignals).toEqual([controller.signal]);
+  });
+
+  // 取消终态返回 status/stopReason cancelled，不携带 error，并把合成 AssistantMessage
+  // 持久化到 session，同时发出指向该消息的 turn.cancelled 事件。
+  it("returns structured cancelled result with the synthetic assistant message", async () => {
+    const sessionStore = new InMemorySessionStore();
+    const cancelledMessage: Message = {
+      id: createMessageId(),
+      role: "assistant",
+      content: "[Assistant reply cancelled.]",
+    };
+    const loop = new AgentLoop({
+      sessionStore,
+      contextBuilder: new ContextBuilder(),
+      runner: {
+        async run() {
+          return {
+            newMessages: [cancelledMessage],
+            stopReason: "cancelled" as StopReason,
+            events: [],
+          };
+        },
+      },
+    });
+
+    const result = await loop.runTurn({ userMessage: "stop this" });
+
+    const history = await sessionStore.getHistory(result.sessionId);
+    expect(result.status).toBe("cancelled");
+    if (result.status !== "cancelled") {
+      throw new Error(`expected cancelled result, got ${result.status}`);
+    }
+    expect(result.stopReason).toBe("cancelled");
+    expect("finalMessage" in result).toBe(false);
+    expect("error" in result).toBe(false);
+    expect(result.newMessages).toEqual(history);
+    expect(history.map((message) => message.role)).toEqual(["user", "assistant"]);
+    expect(history.at(-1)).toEqual(cancelledMessage);
+    expect(result.events.map((event) => event.type)).toEqual([
+      "turn.started",
+      "context.built",
+      "turn.cancelled",
+    ]);
+    expect(result.events.at(-1)).toMatchObject({
+      type: "turn.cancelled",
+      sessionId: result.sessionId,
+      messageId: cancelledMessage.id,
+      stopReason: "cancelled",
+    });
+  });
 });

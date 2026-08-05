@@ -8,6 +8,7 @@ import type {
 } from "@byte-mentor/core";
 import type {
   ModelProvider,
+  ProviderInvocationOptions,
   ProviderRequest,
   ProviderResponse,
   ProviderStreamEvent,
@@ -35,9 +36,12 @@ export class OpenAIChatProvider implements ModelProvider {
       });
   }
 
-  async invoke(req: ProviderRequest): Promise<ProviderResponse> {
+  async invoke(
+    req: ProviderRequest,
+    options?: ProviderInvocationOptions,
+  ): Promise<ProviderResponse> {
     let done: Extract<ProviderStreamEvent, { type: "done" }> | undefined;
-    for await (const event of this.invokeStream(req)) {
+    for await (const event of this.invokeStream(req, options)) {
       if (event.type === "done") {
         done = event;
       }
@@ -51,14 +55,19 @@ export class OpenAIChatProvider implements ModelProvider {
     };
   }
 
-  async *invokeStream(req: ProviderRequest): AsyncIterable<ProviderStreamEvent> {
+  async *invokeStream(
+    req: ProviderRequest,
+    options?: ProviderInvocationOptions,
+  ): AsyncIterable<ProviderStreamEvent> {
     const request: OpenAI.ChatCompletionCreateParamsStreaming = {
       model: this.model,
       messages: req.messages.map(toOpenAIMessage),
       stream: true,
       ...toolsRequestPart(req.tools),
     };
-    const stream = await this.client.chat.completions.create(request);
+    const stream = await this.client.chat.completions.create(request, {
+      signal: options?.signal,
+    });
     let content = "";
     const toolCalls = new Map<number, StreamingToolCall>();
 

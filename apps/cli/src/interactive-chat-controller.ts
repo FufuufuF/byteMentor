@@ -16,6 +16,7 @@ export interface InteractiveChatView {
   startToolCall(id: string): void;
   completeToolCall(id: string, output: string): void;
   failToolCall(id: string, message: string): void;
+  cancelToolCall(id: string, message: string): void;
   showError(message: string): void;
   setBusy(busy: boolean): void;
   setSessionId(sessionId: string): void;
@@ -50,6 +51,8 @@ export class InteractiveChatController {
   private resolveExit!: (code: number) => void;
   private cleanupPromise?: Promise<void>;
   private fatalViewError?: unknown;
+  private turnController?: AbortController;
+  private readonly cancelledToolCallIds = new Set<string>();
 
   // Stores the runtime and view ports and prepares a completion promise that resolves only after cleanup.
   constructor(private readonly input: InteractiveChatControllerInput) {
@@ -75,6 +78,9 @@ export class InteractiveChatController {
     if (userMessage.length === 0 || this.state.busy || this.state.stopped) return;
     this.state.busy = true;
     let streamingAssistant = false;
+    const turnController = new AbortController();
+    this.turnController = turnController;
+    this.cancelledToolCallIds.clear();
 
     try {
       this.mutateView(() => this.input.view.appendUserMessage(userMessage));
@@ -85,6 +91,7 @@ export class InteractiveChatController {
           ...(this.state.sessionId !== undefined ? { sessionId: this.state.sessionId } : {}),
         },
         {
+          signal: turnController.signal,
           onStreamEvent: (event) => {
             streamingAssistant = this.handleStreamEvent(event, streamingAssistant);
           },
@@ -94,7 +101,12 @@ export class InteractiveChatController {
       this.state.sessionId = result.sessionId;
       this.mutateView(() => this.input.view.setSessionId(result.sessionId));
       this.reconcileToolMessages(result.newMessages);
-      if (result.status !== "completed") {
+      if (result.status === "cancelled") {
+        if (streamingAssistant) {
+          this.mutateView(() => this.input.view.completeAssistantMessage());
+          streamingAssistant = false;
+        }
+      } else if (result.status !== "completed") {
         if (streamingAssistant) {
           this.mutateView(() => this.input.view.completeAssistantMessage());
           streamingAssistant = false;
@@ -116,6 +128,7 @@ export class InteractiveChatController {
         }
       }
     } finally {
+      this.turnController = undefined;
       this.state.busy = false;
       if (!this.state.stopped) {
         try {
@@ -128,11 +141,12 @@ export class InteractiveChatController {
     }
   }
 
-  // Requests immediate idle exit or marks a busy turn for cleanup after it settles.
+  // Requests immediate idle exit or aborts a busy turn and waits for it to converge before cleanup.
   requestExit(): void {
     if (this.state.stopped) return;
     if (this.state.busy) {
       this.state.exitAfterTurn = true;
+      this.turnController?.abort();
       try {
         this.mutateView(() => this.input.view.setExitAfterTurn(true));
       } catch {
@@ -179,16 +193,26 @@ export class InteractiveChatController {
       );
     } else if (event.type === "tool.failed") {
       this.mutateView(() => this.input.view.failToolCall(event.toolCallId, event.message));
+    } else if (event.type === "tool.cancelled") {
+      this.cancelledToolCallIds.add(event.toolCallId);
+      this.mutateView(() => this.input.view.cancelToolCall(event.toolCallId, event.message));
     }
   }
 
-  // Replaces runtime previews with complete persisted ToolMessage content after the turn returns.
+  // Replaces runtime previews with complete persisted ToolMessage content after the turn returns;
+  // cancelled tool calls stay in the cancelled terminal state with their full cancellation message.
   private reconcileToolMessages(messages: Message[]): void {
     for (const message of messages) {
       if (message.role === "tool") {
-        this.mutateView(() =>
-          this.input.view.completeToolCall(message.toolCallId, message.content),
-        );
+        if (this.cancelledToolCallIds.has(message.toolCallId)) {
+          this.mutateView(() =>
+            this.input.view.cancelToolCall(message.toolCallId, message.content),
+          );
+        } else {
+          this.mutateView(() =>
+            this.input.view.completeToolCall(message.toolCallId, message.content),
+          );
+        }
       }
     }
   }

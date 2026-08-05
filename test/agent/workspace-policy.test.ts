@@ -72,6 +72,7 @@ describe("WorkspaceAccessPolicy defaults", () => {
       maxSearchTotalBytes: 50 * 1024 * 1024,
       maxTraversalEntries: 50_000,
       maxSkippedFileDetails: 20,
+      maxEditableFileBytes: 2 * 1024 * 1024,
     });
   });
 });

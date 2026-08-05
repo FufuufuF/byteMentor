@@ -124,4 +124,45 @@ describe("loadCliConfig", () => {
     expect(absoluteConfig.dbPath).toBe(absoluteDbPath);
     expect((await stat(join(cwd, "absolute"))).isDirectory()).toBe(true);
   });
+
+  it("parses optional absolute bash path", async () => {
+    // 验证合法绝对 BYTE_MENTOR_BASH_PATH 进入配置，未设置时省略字段。
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+    const config = loadConfig({ cwd, env: { BYTE_MENTOR_BASH_PATH: "/usr/local/bin/bash" } });
+    expect(config.bashPath).toBe("/usr/local/bin/bash");
+    expect(loadConfig({ cwd }).bashPath).toBeUndefined();
+  });
+
+  it("rejects empty or relative bash path", async () => {
+    // 验证变量只要已设置就必须是非空绝对路径，否则启动前抛 CliConfigError。
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+    expect(() => loadConfig({ cwd, env: { BYTE_MENTOR_BASH_PATH: "" } })).toThrowError(
+      CliConfigError,
+    );
+    expect(() => loadConfig({ cwd, env: { BYTE_MENTOR_BASH_PATH: "bin/bash" } })).toThrowError(
+      CliConfigError,
+    );
+    expect(() => loadConfig({ cwd, env: { BYTE_MENTOR_BASH_PATH: "" } })).toThrow(/absolute/);
+  });
+
+  it("parses, trims and deduplicates env allowlist", async () => {
+    // 验证逗号分隔白名单按首次出现 trim、去重，并保留合法名称。
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+    const config = loadConfig({
+      cwd,
+      env: { BYTE_MENTOR_BASH_ENV_ALLOWLIST: " FOO , BAR , foo ,  , BAR " },
+    });
+    expect(config.bashEnvAllowlist).toEqual(["FOO", "BAR", "foo"]);
+    expect(loadConfig({ cwd }).bashEnvAllowlist).toBeUndefined();
+  });
+
+  it("rejects invalid allowlist names", async () => {
+    // 验证非法环境变量名在启动前抛 CliConfigError。
+    const cwd = await mkdtemp(join(tmpdir(), "byte-mentor-config-"));
+    for (const value of ["FOO-BAR", "1FOO", "FOO.BAR"]) {
+      expect(() =>
+        loadConfig({ cwd, env: { BYTE_MENTOR_BASH_ENV_ALLOWLIST: value } }),
+      ).toThrowError(CliConfigError);
+    }
+  });
 });

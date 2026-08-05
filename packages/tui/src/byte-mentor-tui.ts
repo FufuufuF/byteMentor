@@ -159,6 +159,12 @@ export class ByteMentorTui {
     this.tui.requestRender();
   }
 
+  // Converges a cancelled tool call into a terminal cancelled card without allowing a missing ID to crash the view.
+  cancelToolCall(id: string, message: string): void {
+    this.getOrCreateToolCard(id).cancel(message);
+    this.tui.requestRender();
+  }
+
   // Appends a transcript error and switches status metadata to the error state.
   showError(message: string): void {
     this.transcript.addChild(new Text(this.theme.foreground.error(`Error: ${message}`), 1, 1));

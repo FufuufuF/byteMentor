@@ -99,10 +99,17 @@ describe("core messages", () => {
 
 describe("StopReason", () => {
   it("accepts each declared variant", () => {
-    const reasons: StopReason[] = ["completed", "failed", "max_iterations", "tool_calls"];
+    const reasons: StopReason[] = [
+      "completed",
+      "failed",
+      "max_iterations",
+      "tool_calls",
+      "cancelled",
+    ];
     expect(reasons).toContain("completed");
     expect(reasons).toContain("failed");
     expect(reasons).toContain("max_iterations");
     expect(reasons).toContain("tool_calls");
+    expect(reasons).toContain("cancelled");
   });
 });

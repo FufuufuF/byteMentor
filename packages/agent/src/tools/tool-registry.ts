@@ -4,6 +4,7 @@ import type {
   AgentTool,
   JsonValue,
   ToolExecutionContext,
+  ToolExecutionOptions,
   ToolExecutionOutput,
   ToolResult,
 } from "./contracts.js";
@@ -88,7 +89,11 @@ export class ToolRegistry {
   }
 
   // 执行一个已注册工具，同时返回供 Runtime 判断状态的对象结果和供 ToolMessage 使用的 JSON 字符串。
-  async execute(name: string, args: unknown): Promise<ToolExecutionOutput> {
+  async execute(
+    name: string,
+    args: unknown,
+    options?: ToolExecutionOptions,
+  ): Promise<ToolExecutionOutput> {
     const tool = this.tools.get(name);
     if (tool === undefined) {
       return toExecutionOutput(
@@ -111,7 +116,7 @@ export class ToolRegistry {
     }
     try {
       return toExecutionOutput(
-        await tool.execute(args, this.context as ToolExecutionContext),
+        await tool.execute(args, this.context as ToolExecutionContext, options),
         this.maxSerializedToolResultCharacters,
       );
     } catch (e) {

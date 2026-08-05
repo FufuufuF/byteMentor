@@ -20,6 +20,12 @@ export type RuntimeCheckpoint =
       iteration: number;
       newMessages: Message[];
       pendingToolCalls: [];
+    }
+  | {
+      phase: "cancelled";
+      iteration: number;
+      newMessages: Message[];
+      pendingToolCalls: [];
     };
 
 export function isRuntimeCheckpoint(value: unknown): value is RuntimeCheckpoint {
@@ -36,7 +42,9 @@ export function isRuntimeCheckpoint(value: unknown): value is RuntimeCheckpoint 
     return value.pendingToolCalls.length > 0;
   }
   return (
-    (value.phase === "tools_completed" || value.phase === "final_response") &&
+    (value.phase === "tools_completed" ||
+      value.phase === "final_response" ||
+      value.phase === "cancelled") &&
     value.pendingToolCalls.length === 0
   );
 }

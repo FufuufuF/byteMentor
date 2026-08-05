@@ -39,6 +39,7 @@ export interface HeadlessTurnInput {
 export interface HeadlessTurnOptions {
   onStreamEvent?: (event: ProviderStreamEvent) => void;
   onRuntimeEvent?: (event: RuntimeEvent) => void;
+  signal?: AbortSignal;
 }
 
 interface HeadlessTurnResultBase {
@@ -67,8 +68,16 @@ export interface MaxIterationsHeadlessTurnResult extends HeadlessTurnResultBase 
   stopReason: "max_iterations";
 }
 
+export interface CancelledHeadlessTurnResult extends HeadlessTurnResultBase {
+  status: "cancelled";
+  stopReason: "cancelled";
+}
+
 export type HeadlessTurnResult =
-  CompletedHeadlessTurnResult | FailedHeadlessTurnResult | MaxIterationsHeadlessTurnResult;
+  | CompletedHeadlessTurnResult
+  | FailedHeadlessTurnResult
+  | MaxIterationsHeadlessTurnResult
+  | CancelledHeadlessTurnResult;
 
 export interface AgentLoopInput {
   sessionStore: SessionStore;
@@ -239,6 +248,7 @@ export class AgentLoop {
       turnId: ctx.turnId,
       messages: ctx.initialMessages,
       tools: this.tools,
+      signal: ctx.options?.signal,
       onStreamEvent: ctx.options?.onStreamEvent,
       onRuntimeEvent: ctx.options?.onRuntimeEvent,
       checkpoint: async (payload) => {
@@ -350,6 +360,30 @@ export class AgentLoop {
         error: { message },
         newMessages: ctx.newMessages,
         stopReason: "max_iterations",
+        events: ctx.events,
+        trace: [],
+      };
+      return "ok";
+    }
+    if (runnerResult.stopReason === "cancelled") {
+      const finalMessage = runnerResult.newMessages.at(-1);
+      if (!isAssistantMessageWithId(finalMessage)) {
+        throw new Error("runner cancelled result missing synthetic assistant message");
+      }
+      ctx.events.push(...runnerResult.events);
+      emitRuntimeEvent(ctx, {
+        type: "turn.cancelled",
+        turnId: ctx.turnId,
+        ts: Date.now(),
+        sessionId: session.id,
+        messageId: finalMessage.id,
+        stopReason: "cancelled",
+      });
+      ctx.result = {
+        status: "cancelled",
+        sessionId: session.id,
+        newMessages: ctx.newMessages,
+        stopReason: "cancelled",
         events: ctx.events,
         trace: [],
       };

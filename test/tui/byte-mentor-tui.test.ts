@@ -119,6 +119,22 @@ describe("ByteMentorTui", () => {
     view.stop();
   });
 
+  // Cancelled tool calls converge into terminal cancelled cards with their cancellation message.
+  test("renders a cancelled tool card", async () => {
+    const terminal = new VirtualTerminal(80, 24);
+    const view = createView(terminal);
+    view.start();
+    view.addToolCall({ id: "call-1", name: "edit_file", args: { path: "f.txt" } });
+    view.startToolCall("call-1");
+    view.cancelToolCall("call-1", "cancelled before start");
+    await terminal.waitForRender();
+
+    const screen = terminal.getScrollBuffer().join("\n");
+    expect(screen).toContain("cancelled");
+    expect(screen).toContain("cancelled before start");
+    view.stop();
+  });
+
   // Re-renders the complete layout at narrow and wide sizes without crashing or terminal overflow.
   test.each([
     [40, 12],

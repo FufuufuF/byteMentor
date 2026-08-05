@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import * as agentExports from "@byte-mentor/agent";
 import type {
   WorkspaceAccessPolicy,
+  WorkspacePathResolver,
   WorkspaceReader,
   WorkspaceResolvedPath,
 } from "@byte-mentor/agent";
@@ -14,6 +15,10 @@ type WorkspaceReaderConstructor = new (input: {
   workspaceRoot: string;
   policy: WorkspaceAccessPolicy;
 }) => WorkspaceReader;
+type WorkspacePathResolverConstructor = new (input: {
+  workspaceRoot: string;
+  policy: WorkspaceAccessPolicy;
+}) => WorkspacePathResolver;
 
 const temporaryPaths = new Set<string>();
 
@@ -52,6 +57,19 @@ function createReader(workspaceRoot: string): WorkspaceReader {
     throw new Error("WorkspaceReader is not exported");
   }
   return new (candidate as WorkspaceReaderConstructor)({
+    workspaceRoot,
+    policy: createPolicy(),
+  });
+}
+
+// 从包公共入口创建共享路径解析器，与 Reader 使用同一套工作区与策略。
+function createResolver(workspaceRoot: string): WorkspacePathResolver {
+  const candidate = (agentExports as Record<string, unknown>)["WorkspacePathResolver"];
+  expect(candidate).toBeTypeOf("function");
+  if (typeof candidate !== "function") {
+    throw new Error("WorkspacePathResolver is not exported");
+  }
+  return new (candidate as WorkspacePathResolverConstructor)({
     workspaceRoot,
     policy: createPolicy(),
   });
@@ -160,5 +178,21 @@ describe("WorkspaceReader.resolvePath", () => {
       type: "file",
       isSymbolicLink: false,
     });
+  });
+});
+
+describe("WorkspacePathResolver", () => {
+  // 共享解析器应从包公共入口可用，并解析工作区内普通文件，
+  // 返回可直接使用的相对别名、目标类型与真实目标相对路径。
+  it("resolves an allowed workspace file with full path metadata", async () => {
+    const root = await createWorkspace();
+    await writeFile(join(root, "inside.txt"), "inside");
+    const resolver = createResolver(root);
+
+    const resolved = await resolver.resolveAccessiblePath("inside.txt");
+    expect(resolved.relativePath).toBe("inside.txt");
+    expect(resolved.type).toBe("file");
+    expect(resolved.isSymbolicLink).toBe(false);
+    expect(resolved.canonicalRelativePath).toBe("inside.txt");
   });
 });

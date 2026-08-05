@@ -1,6 +1,6 @@
 import type { MessageId, ToolCallId } from "./ids.js";
 
-export type StopReason = "completed" | "failed" | "max_iterations" | "tool_calls";
+export type StopReason = "completed" | "failed" | "max_iterations" | "tool_calls" | "cancelled";
 
 export interface ToolCall {
   id: ToolCallId;

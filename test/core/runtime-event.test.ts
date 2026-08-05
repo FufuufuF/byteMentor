@@ -5,9 +5,11 @@ import {
   createToolCallId,
   createTurnId,
   type RuntimeEvent,
+  type TurnCancelledEvent,
   type TurnCompletedEvent,
   type TurnFailedEvent,
   type TurnStartedEvent,
+  type ToolCancelledEvent,
   type ContextBuiltEvent,
   type ModelRequestedEvent,
   type ModelRespondedEvent,
@@ -50,15 +52,34 @@ describe("RuntimeEvent common base", () => {
         errorCode: "path_not_found",
         message: "m",
       },
-      { type: "turn.completed", turnId, ts: 8, sessionId, messageId, stopReason: "completed" },
-      { type: "turn.failed", turnId, ts: 9, sessionId, message: "m" },
+      {
+        type: "tool.cancelled",
+        turnId,
+        ts: 8,
+        toolCallId,
+        toolName: "edit_file",
+        started: false,
+        durationMs: 0,
+        errorCode: "tool_cancelled",
+        message: "cancelled",
+      },
+      { type: "turn.completed", turnId, ts: 9, sessionId, messageId, stopReason: "completed" },
+      { type: "turn.failed", turnId, ts: 10, sessionId, message: "m" },
+      {
+        type: "turn.cancelled",
+        turnId,
+        ts: 11,
+        sessionId,
+        messageId,
+        stopReason: "cancelled",
+      },
     ];
     for (const e of events) {
       expect(typeof e.type).toBe("string");
       expect(e.turnId).toBe(turnId);
       expect(typeof e.ts).toBe("number");
     }
-    expect(events.length).toBe(9);
+    expect(events.length).toBe(11);
   });
 });
 
@@ -189,6 +210,57 @@ describe("RuntimeEvent variant-specific fields", () => {
     expect(e.sessionId).toBe(sessionId);
     expect(e.message).toBe("provider down");
   });
+
+  // 未启动调用 durationMs 固定为 0；已启动调用记录真实耗时，errorCode 只允许取消错误码。
+  it("tool.cancelled carries started, durationMs, and cancellation error code", () => {
+    const pending: ToolCancelledEvent = {
+      type: "tool.cancelled",
+      turnId,
+      ts: 1,
+      toolCallId,
+      toolName: "edit_file",
+      started: false,
+      durationMs: 0,
+      errorCode: "tool_cancelled",
+      message: "cancelled before start",
+    };
+    const started: ToolCancelledEvent = {
+      type: "tool.cancelled",
+      turnId,
+      ts: 1,
+      toolCallId,
+      toolName: "bash",
+      started: true,
+      durationMs: 42,
+      errorCode: "command_cancelled",
+      message: "command interrupted",
+    };
+    expect(pending).toMatchObject({
+      started: false,
+      durationMs: 0,
+      errorCode: "tool_cancelled",
+    });
+    expect(started).toMatchObject({
+      started: true,
+      durationMs: 42,
+      errorCode: "command_cancelled",
+    });
+  });
+
+  it("turn.cancelled carries sessionId, messageId, and stopReason cancelled", () => {
+    const e: TurnCancelledEvent = {
+      type: "turn.cancelled",
+      turnId,
+      ts: 1,
+      sessionId,
+      messageId,
+      stopReason: "cancelled",
+    };
+    expect(e.sessionId).toBe(sessionId);
+    expect(e.messageId).toBe(messageId);
+    expect(e.stopReason).toBe("cancelled");
+    expect(e).not.toHaveProperty("error");
+  });
 });
 
 describe("RuntimeEvent discriminated union narrowing", () => {
@@ -227,6 +299,8 @@ function runtimeEventTypeLabel(e: RuntimeEvent): string {
       return "turn.completed";
     case "turn.failed":
       return "turn.failed";
+    case "turn.cancelled":
+      return "turn.cancelled";
     case "context.built":
       return "context.built";
     case "model.requested":
@@ -239,5 +313,7 @@ function runtimeEventTypeLabel(e: RuntimeEvent): string {
       return "tool.completed";
     case "tool.failed":
       return "tool.failed";
+    case "tool.cancelled":
+      return "tool.cancelled";
   }
 }

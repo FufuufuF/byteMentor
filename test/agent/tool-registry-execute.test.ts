@@ -48,7 +48,10 @@ describe("ToolRegistry.execute known tool", () => {
 describe("ToolRegistry execution context", () => {
   // Registry 负责持有统一运行环境；这里使用完整的 context 形状作为不透明值，验证同一对象原样传给 Tool。
   it("injects the configured context into tool execution", async () => {
-    const context = { workspaceReader: {} as never } satisfies ToolExecutionContext;
+    const context = {
+      workspaceReader: {} as never,
+      workspaceEditor: {} as never,
+    } satisfies ToolExecutionContext;
     const registry = new ToolRegistry({ context });
     let receivedContext: ToolExecutionContext | undefined;
     registry.register({
@@ -73,6 +76,25 @@ describe("ToolRegistry execution context", () => {
     await expect(registry.execute("missing", {})).resolves.toMatchObject({
       result: { ok: false, error: { code: "unknown_tool" } },
     });
+  });
+
+  // turn signal 属于单次执行控制信息，不进入静态 context；这里验证 Registry 把 execution options 透传给工具。
+  it("passes execution options signal through to tool.execute", async () => {
+    const registry = new ToolRegistry();
+    let receivedOptions: unknown;
+    registry.register({
+      name: "capture_options",
+      description: "captures execution options",
+      async execute(_args: unknown, _context: ToolExecutionContext, options?: unknown) {
+        receivedOptions = options;
+        return { ok: true, data: "captured" };
+      },
+    });
+
+    const controller = new AbortController();
+    await registry.execute("capture_options", {}, { signal: controller.signal });
+
+    expect(receivedOptions).toEqual({ signal: controller.signal });
   });
 });
 
