@@ -12,7 +12,7 @@
 | 1 | 共享路径边界 + 原子编辑能力 | ✅ 完成 | `2981678 refactor(agent): establish workspace edit boundary` |
 | 2 | `edit_file` 纵向切片 | ✅ 完成 | `5510492 feat(agent): add workspace file edit tool` |
 | 3 | turn 级取消链路 | ✅ 完成 | `97ac75f feat(agent): propagate turn cancellation` |
-| 4 | 受控 Shell 环境 + 一次性进程执行器 | ⬜ 待实现 | — |
+| 4 | 受控 Shell 环境 + 一次性进程执行器 | ✅ 完成 | `d644826 feat(agent): add managed shell executor` |
 | 5 | Shell 输出累加 + 完整日志生命周期 | ⬜ 待实现 | — |
 | 6 | `bash` Tool 与 CLI 闭环 | ⬜ 待实现 | — |
 
@@ -77,6 +77,23 @@
 - 测试：core 2 文件、provider signal、registry 第三参、editor/edit-file 取消、runner 8 个取消用例、loop cancelled 分支、controller 忙碌退出、TUI cancelled 渲染；`agent-loop.stream.test.ts` 契约补 `signal`。全量 **36 文件 / 382 测试** + typecheck/lint/format 通过。
 - 修复：`RuntimeCheckpoint`/`ToolErrorCode` 缺 `cancelled`/`command_cancelled` 类型；`cancelledToolCall`/`terminalToolEvent` 从私有方法改为模块级纯函数；`agent-loop.stream.test.ts` 契约测试补 `signal` 字段。
 
+## Batch 4 已交付（`d644826`）
+
+范围：`shell-environment.ts` / `shell-executor.ts` / index.ts 公共导出，为 Batch 6 的 `bash` 提供受控环境与一次性进程执行器（不组装 ToolResult）。
+
+- **`shell-environment.ts`（新）**：
+  - `ShellError`（`code` 仅 `shell_unavailable`，Batch 6 bash.ts 直接映射 ToolError）。
+  - `resolveShellPath({ parentEnv, explicitShellPath?, defaultShellPath? })`：按「显式配置 → 默认 `/bin/bash` → 受控 PATH 查找 `bash`」选路径，绝不降级 `sh`；校验存在/普通文件/`X_OK`；**显式配置不可用即报错不回退**，默认路径「不存在」才走 PATH 查找、「存在但不可用」也报错。
+  - `createShellEnvironment({ parentEnv, allowlist, shellPath })`：基础集合 `PATH/HOME/USER/LOGNAME/TMPDIR/LANG` + 全部 `LC_*` → 白名单（denylist 优先：`OPENAI_API_KEY`、全部 `BYTE_MENTOR_*`、`PWD/OLDPWD/BASH_ENV/ENV/CDPATH/PROMPT_COMMAND`）→ 固定值 `SHELL=shellPath/TERM=dumb/NO_COLOR=1`；不复制 `PWD`、不设 `CI`。
+- **`shell-executor.ts`（新）**：
+  - `ShellChunk { stream, seq, data: Buffer }` / `ShellChunkConsumer`（可等待异步边界）/ `ShellExit` 判别联合：`{kind:"exit",exitCode}`、`{kind:"signal",signal}`（外部 signal，不虚构 128+signal）、`{kind:"killed",reason:"timeout"|"turn"|"runtime",termSignal:"SIGTERM"|"SIGKILL"}`、`{kind:"consumer-failed"}`。
+  - `runCommand({ command, cwd, env, shellPath, timeoutMs?, turnSignal?, runtimeCloseSignal?, onChunk? })`：`spawn(--noprofile --norc -c, detached, cwd, ignore/pipe/pipe)`；背压式 pipe 消费（consumer 未完成暂停流，全局单调 `seq`）；spawn 失败抛 `ShellError("shell_unavailable")`。
+  - 终止状态机：**用 `exit` 事件触发裁决**（`close` 会被后台后代持有的 pipe 阻塞）；统一 `terminateProcessGroup` = SIGTERM → 250ms → SIGKILL；`exitSettled`/`termination`/`naturalExitLocked` 三重防护保证第一个终止原因获胜、自然退出后的迟到 timeout/abort 不改写；自然退出后 best-effort 清理同进程组后台后代，等 stdio 与 consumer 收敛才 resolve。
+- **index.ts**：`export * from "./tools/shell/shell-environment.js"` / `shell-executor.js`。
+- 测试：`shell-environment.test.ts` 21 个（环境三层覆盖、denylist、路径解析与各类不可用失败）+ `shell-executor.test.ts` 20 个（自然退出/分流/seq/背压、外部 signal、timeout SIGTERM 与 SIGKILL 升级、turn/runtime 取消、后台后代清理）。全量 **38 文件 / 423 测试** + typecheck/lint/format 通过。
+- 过程中确认的签名决策（Phase 1 提问全选推荐项）：纯函数集 vs 类 → 纯函数；`runCommand` 单函数 vs 类实例 → 单函数；consumer 收原始 `Buffer`+序号（解码留给 Batch 5）；`ShellExit` 判别联合；两个 signal 分开传 + 内部推导 `cancelledBy`；resolve 失败抛 `ShellError`；`shellPath` 必填（调用方先 resolve）；consumer 抛错 → `{kind:"consumer-failed"}`；`ShellErrorCode` 仅 `shell_unavailable`。
+- 修复：后台后代持 pipe 导致 `close` 永不触发 → 改用 `exit` 事件 + 先清理进程组；自然退出后迟到终止的竞态 → `naturalExitLocked`；macOS `/var`→`/private/var` 链接使 `pwd` 断言失败 → 测试期望改 `realpath(cwd)`；`kill(-pgid, 0)` 类型 → `NodeJS.Signals | number`。
+
 ## 下一步
 
-Batch 4：受控 Shell 环境与一次性进程执行器（`shell-environment.ts` / `shell-executor.ts` / 公共导出；`WorkspaceAccessPolicy` 不约束任意 Shell 命令，`bash` 参数 `{ command, timeout? }`）。实现前先读 plan 该 batch 细节并确认跨包决策。
+Batch 5：Shell 输出累加与完整日志生命周期（`shell-output.ts` 流式 UTF-8 解码 + ANSI/控制字符清理 + 2,000 行尾部累加 + JSON 预算 + `shell-log-store.ts` session 临时目录/100 MiB 日志/幂等清理）。实现前先读 plan 该 batch 细节并确认跨包决策。
