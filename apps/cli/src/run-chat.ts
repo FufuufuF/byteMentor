@@ -1,12 +1,19 @@
+import { randomBytes } from "node:crypto";
+import { rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   AgentLoop,
   AgentRunner,
   ContextBuilder,
+  createBashTool,
+  createShellEnvironment,
   editFileTool,
   findFilesTool,
   listDirectoryTool,
   OpenAIChatProvider,
   readFileTool,
+  resolveShellPath,
   searchTextTool,
   ToolRegistry,
   WorkspaceAccessPolicy,
@@ -104,8 +111,23 @@ export function createRuntime(config: CliConfig, deps: CreateRuntimeDeps = {}): 
     workspaceRoot: config.workspaceRoot,
     policy,
   });
+  const shellPath = config.bashPath ?? resolveShellPath({ parentEnv: process.env });
+  const shellEnv = createShellEnvironment({
+    parentEnv: process.env,
+    allowlist: config.bashEnvAllowlist ?? [],
+    shellPath,
+  });
+  const sessionTempDirectory = join(
+    tmpdir(),
+    `byte-mentor-bash-session-${randomBytes(8).toString("hex")}`,
+  );
+  const runtimeCloseController = new AbortController();
   const tools = new ToolRegistry({
-    context: { workspaceReader, workspaceEditor },
+    context: {
+      workspaceReader,
+      workspaceEditor,
+      shell: { shellPath, shellEnv },
+    },
     maxSerializedToolResultCharacters: policy.limits.maxSerializedToolResultCharacters,
   });
   tools.register(listDirectoryTool);
@@ -113,6 +135,9 @@ export function createRuntime(config: CliConfig, deps: CreateRuntimeDeps = {}): 
   tools.register(searchTextTool);
   tools.register(readFileTool);
   tools.register(editFileTool);
+  tools.register(
+    createBashTool({ sessionTempDirectory, runtimeCloseSignal: runtimeCloseController.signal }),
+  );
   const runner = new AgentRunner(provider);
   const loop = new AgentLoop({
     sessionStore,
@@ -123,7 +148,11 @@ export function createRuntime(config: CliConfig, deps: CreateRuntimeDeps = {}): 
 
   return {
     loop,
-    close: () => sessionStore.close(),
+    close: async () => {
+      runtimeCloseController.abort();
+      await sessionStore.close();
+      await rm(sessionTempDirectory, { recursive: true, force: true }).catch(() => undefined);
+    },
   };
 }
 

@@ -33,10 +33,12 @@ export class ShellOutputAccumulator {
   }
 
   // 每条流使用独立流式 decoder 与 ANSI 清理状态；chunk 顺序即合并顺序。
-  push(chunk: ShellChunk): void {
+  // 返回本次 chunk 解码并清理后的文本，供调用方补写完整日志。
+  push(chunk: ShellChunk): string {
     const text = this.decoders[chunk.stream].decode(chunk.data, { stream: true });
     const cleaned = this.cleaners[chunk.stream].clean(text);
     this.appendText(cleaned);
+    return cleaned;
   }
 
   // 未接管前的完整已清理文本（接管后为空）。
@@ -89,11 +91,11 @@ export interface ShellTailFields {
   fullOutputPath?: string;
 }
 
-export interface ShellTruncation {
+export type ShellTruncation = {
   truncatedBy: "lines" | "output_limit";
   totalLines: number;
   returnedLines: number;
-}
+};
 
 export interface ShellTailResult {
   output: string;
@@ -103,6 +105,8 @@ export interface ShellTailResult {
 
 export interface ComputeShellTailInput {
   text: string;
+  /** 完整清理文本的精确行数；缺省时从 text 推导，供 text 已被截断为尾部时使用。 */
+  totalLines?: number;
   fields: ShellTailFields;
   maxLines?: number;
   maxSerializedCharacters?: number;
@@ -122,7 +126,7 @@ export function computeShellTail(input: ComputeShellTailInput): ShellTailResult 
     );
   }
 
-  const totalLines = countLines(input.text);
+  const totalLines = input.totalLines ?? countLines(input.text);
   const tail = keepLastLines(input.text, maxLines);
   const lineTruncation: ShellTruncation | undefined =
     totalLines > maxLines

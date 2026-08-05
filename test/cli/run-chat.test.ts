@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMessageId, createSessionId, createToolCallId } from "@byte-mentor/core";
@@ -131,8 +131,8 @@ describe("runChat", () => {
     expect(close).toHaveBeenCalledTimes(1);
   });
 
-  // 真实 CLI 组装必须向首个模型请求暴露五个按名称排序的内置工作区工具，包含写工具 edit_file。
-  it("assembles five sorted workspace tool definitions", async () => {
+  // 真实 CLI 组装必须向首个模型请求暴露六个按名称排序的内置工作区工具，包含写工具 edit_file 与 bash。
+  it("assembles six sorted workspace tool definitions", async () => {
     const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runtime-tools-"));
     const requests: ProviderRequest[] = [];
     const provider = invokeProvider(async (request) => {
@@ -154,6 +154,7 @@ describe("runChat", () => {
     }
 
     expect(requests[0]?.tools?.map((tool) => tool.name)).toEqual([
+      "bash",
       "edit_file",
       "find_files",
       "list_directory",
@@ -161,6 +162,44 @@ describe("runChat", () => {
       "search_text",
     ]);
   });
+
+  // 经真实 Runtime 执行 bash 工具：非零退出码仍是成功 payload，截断日志被创建并在 close 时清理。
+  it("executes bash with non-zero exit code and cleans session logs on close", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runtime-bash-"));
+    let step = 0;
+    const provider = invokeProvider(async (request) => {
+      if (step === 0) {
+        step += 1;
+        return toolCallResponse("bash", { command: "seq 1 2500; exit 3" });
+      }
+      expect(parseLastToolEnvelope(request)).toMatchObject({
+        ok: true,
+        data: { truncated: true, exitCode: 3 },
+      });
+      return {
+        message: { role: "assistant", content: "bash done" },
+        stopReason: "completed",
+      };
+    });
+    const runtime = (await loadCreateRuntime())(
+      createConfig({ initialMessage: "run bash", workspaceRoot }),
+      { provider, sessionStore: new InMemorySessionStore() },
+    );
+    try {
+      await runtime.loop.runTurn({ userMessage: "run bash" });
+      const logs = (await readdir(tmpdir())).filter((name) =>
+        name.startsWith("byte-mentor-bash-session-"),
+      );
+      expect(logs.length).toBeGreaterThan(0);
+    } finally {
+      await runtime.close();
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+    const remaining = (await readdir(tmpdir())).filter((name) =>
+      name.startsWith("byte-mentor-bash-session-"),
+    );
+    expect(remaining).toHaveLength(0);
+  }, 30_000);
 
   // fake provider 逐步消费真实 ToolMessage，验证固定临时工作区内的浏览、查找、搜索和续读闭环。
   it("completes the workspace discovery and reading loop", async () => {

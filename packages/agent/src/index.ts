@@ -12,6 +12,7 @@ export * from "./tools/builtins/read-file.js";
 export * from "./tools/builtins/search-text.js";
 export * from "./tools/builtins/edit-diff.js";
 export * from "./tools/builtins/edit-file.js";
+export * from "./tools/builtins/bash.js";
 export * from "./tools/workspace/workspace-policy.js";
 export * from "./tools/workspace/workspace-path-resolver.js";
 export * from "./tools/workspace/workspace-reader.js";

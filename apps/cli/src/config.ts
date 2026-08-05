@@ -10,6 +10,8 @@ export interface CliConfig {
   openaiBaseURL?: string;
   dbPath: string;
   workspaceRoot: string;
+  bashPath?: string;
+  bashEnvAllowlist?: string[];
 }
 
 export class CliConfigError extends Error {
@@ -60,9 +62,41 @@ export function loadCliConfig(input: LoadCliConfigInput): CliConfig {
     ...(input.env.BYTE_MENTOR_OPENAI_BASE_URL !== undefined
       ? { openaiBaseURL: input.env.BYTE_MENTOR_OPENAI_BASE_URL }
       : {}),
+    ...(input.env.BYTE_MENTOR_BASH_PATH !== undefined
+      ? { bashPath: resolveBashPath(input.env.BYTE_MENTOR_BASH_PATH) }
+      : {}),
+    ...(input.env.BYTE_MENTOR_BASH_ENV_ALLOWLIST !== undefined
+      ? { bashEnvAllowlist: resolveBashEnvAllowlist(input.env.BYTE_MENTOR_BASH_ENV_ALLOWLIST) }
+      : {}),
     dbPath,
     workspaceRoot: input.cwd,
   };
+}
+
+// 解析可选显式 Bash 路径：变量只要已设置就必须是非空绝对路径，否则在启动前报配置错误。
+function resolveBashPath(value: string): string {
+  if (value.length === 0 || !isAbsolute(value)) {
+    throw new CliConfigError("BYTE_MENTOR_BASH_PATH must be a non-empty absolute path when set");
+  }
+  return value;
+}
+
+// 解析逗号分隔的额外环境变量白名单：trim、删空、按首次出现去重并校验名称。
+function resolveBashEnvAllowlist(value: string): string[] {
+  const names: string[] = [];
+  for (const raw of value.split(",")) {
+    const name = raw.trim();
+    if (name.length === 0) {
+      continue;
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new CliConfigError(`BYTE_MENTOR_BASH_ENV_ALLOWLIST contains invalid name: ${name}`);
+    }
+    if (!names.includes(name)) {
+      names.push(name);
+    }
+  }
+  return names;
 }
 
 function resolveDbPath(input: LoadCliConfigInput): string {

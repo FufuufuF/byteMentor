@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createMessageId, createToolCallId, createTurnId } from "@byte-mentor/core";
 import type {
   AssistantMessage,
@@ -8,7 +11,16 @@ import type {
   ToolCall,
   ToolMessage,
 } from "@byte-mentor/core";
-import { AgentRunner, ToolRegistry } from "@byte-mentor/agent";
+import {
+  AgentRunner,
+  createBashTool,
+  createShellEnvironment,
+  resolveShellPath,
+  ToolRegistry,
+  WorkspaceAccessPolicy,
+  WorkspaceEditor,
+  WorkspaceReader,
+} from "@byte-mentor/agent";
 import type {
   ModelProvider,
   ProviderRequest,
@@ -1934,4 +1946,71 @@ describe("AgentRunner.run cancellation", () => {
     expect(result.stopReason).toBe("failed");
     expect(result.error?.message).toContain("checkpoint storage unavailable");
   });
+});
+
+describe("AgentRunner.run bash 混合批次", () => {
+  // 真实 bash 工具未声明 concurrency: "safe"，包含它的批次按模型顺序串行执行，
+  // 验证 bash 输出进入 ToolMessage 且后续工具严格在其副作用之后运行。
+  it("executes a non-safe bash call in model order with real output", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-runner-bash-"));
+    const sessionTempDirectory = join(workspaceRoot, "logs");
+    const policy = new WorkspaceAccessPolicy();
+    const reader = new WorkspaceReader({ workspaceRoot, policy });
+    const editor = new WorkspaceEditor({ workspaceRoot, policy });
+    const shellPath = resolveShellPath({ parentEnv: process.env });
+    const shellEnv = createShellEnvironment({ parentEnv: process.env, allowlist: [], shellPath });
+    const tools = new ToolRegistry({
+      context: {
+        workspaceReader: reader,
+        workspaceEditor: editor,
+        shell: { shellPath, shellEnv },
+      },
+    });
+    const order: string[] = [];
+    tools.register({
+      name: "after_bash",
+      description: "run after bash",
+      async execute() {
+        order.push("after_bash");
+        return { ok: true, data: "after done" };
+      },
+    });
+    tools.register(createBashTool({ sessionTempDirectory }));
+
+    let step = 0;
+    const provider = invokeProvider(async () => {
+      if (step === 0) {
+        step += 1;
+        return {
+          message: {
+            role: "assistant",
+            toolCalls: [
+              { id: createToolCallId(), name: "bash", args: { command: "echo from-bash" } },
+              { id: createToolCallId(), name: "after_bash", args: {} },
+            ],
+          },
+          stopReason: "tool_calls",
+        };
+      }
+      return { message: { role: "assistant", content: "done" }, stopReason: "completed" };
+    });
+
+    try {
+      const result = await new AgentRunner(provider).run({
+        turnId: createTurnId(),
+        messages: [{ id: createMessageId(), role: "user", content: "run bash" }],
+        tools,
+      });
+      const toolMessages = result.newMessages.filter((message) => message.role === "tool");
+      expect(toolMessages).toHaveLength(2);
+      const [bashMessage] = toolMessages;
+      expect(JSON.parse((bashMessage as ToolMessage).content)).toMatchObject({
+        ok: true,
+        data: { exitCode: 0, output: "from-bash\n" },
+      });
+      expect(order).toEqual(["after_bash"]);
+    } finally {
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+  }, 20_000);
 });

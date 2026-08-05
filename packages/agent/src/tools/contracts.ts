@@ -24,7 +24,9 @@ export type ToolErrorCode =
   | "edit_targets_overlap"
   | "edit_no_change"
   | "tool_cancelled"
-  | "command_cancelled";
+  | "command_cancelled"
+  | "shell_unavailable"
+  | "command_timed_out";
 
 export interface ToolError {
   code: ToolErrorCode;
@@ -39,9 +41,16 @@ export interface ToolExecutionOutput {
   content: string;
 }
 
+// Bash 工具执行所需的受控 Shell 配置，由 Runtime 组装时注入，模型参数不能覆盖。
+export interface ToolShellContext {
+  shellPath: string;
+  shellEnv: Record<string, string>;
+}
+
 export interface ToolExecutionContext {
   workspaceReader: WorkspaceReader;
   workspaceEditor: WorkspaceEditor;
+  shell?: ToolShellContext;
 }
 
 // 单次工具调用的动态控制信息；signal 是只读单向通知，不进入由 Registry 静态持有的 context。
