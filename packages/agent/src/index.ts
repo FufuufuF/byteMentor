@@ -16,5 +16,7 @@ export * from "./tools/workspace/workspace-policy.js";
 export * from "./tools/workspace/workspace-path-resolver.js";
 export * from "./tools/workspace/workspace-reader.js";
 export * from "./tools/workspace/workspace-editor.js";
+export * from "./tools/shell/shell-environment.js";
+export * from "./tools/shell/shell-executor.js";
 export { AgentLoopStateError } from "./loop/turn-state.js";
 export type { StateTraceEntry, TurnState, TurnStateEvent } from "./loop/turn-state.js";
