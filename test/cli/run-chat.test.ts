@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMessageId, createSessionId, createToolCallId } from "@byte-mentor/core";
@@ -162,6 +162,82 @@ describe("runChat", () => {
       "search_text",
     ]);
   });
+
+  // 端到端写工具验收：read_file → edit_file（不相交替换）→ bash 非零退出 → bash 截断，
+  // 验证 diff/patch、单文件原子性、非零退出码成功 payload、尾部与完整日志生命周期。
+  it("completes the write-tools acceptance loop", async () => {
+    const workspaceRoot = await mkdtemp(join(tmpdir(), "byte-mentor-acceptance-"));
+    await writeFile(join(workspaceRoot, "a.txt"), "hello world\nline one\nline two\n", "utf8");
+    let step = 0;
+    const provider = invokeProvider(async (request) => {
+      const previous = step === 0 ? undefined : parseLastToolEnvelope(request);
+      switch (step) {
+        case 0:
+          step += 1;
+          return toolCallResponse("read_file", { path: "a.txt" });
+        case 1:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { content: "hello world\nline one\nline two\n" },
+          });
+          step += 1;
+          return toolCallResponse("edit_file", {
+            path: "a.txt",
+            edits: [
+              { oldText: "hello world", newText: "HELLO WORLD" },
+              { oldText: "line one", newText: "line 1" },
+            ],
+          });
+        case 2:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { replacements: 2, diff: expect.stringContaining("HELLO WORLD") },
+          });
+          step += 1;
+          return toolCallResponse("bash", { command: "cat a.txt; exit 7" });
+        case 3:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: {
+              exitCode: 7,
+              output: expect.stringContaining("HELLO WORLD"),
+            },
+          });
+          step += 1;
+          return toolCallResponse("bash", { command: "seq 1 3000" });
+        case 4:
+          expect(previous).toMatchObject({
+            ok: true,
+            data: { truncated: true, fullOutputPath: expect.any(String) },
+          });
+          step += 1;
+          return {
+            message: { role: "assistant", content: "accepted" },
+            stopReason: "completed",
+          };
+        default:
+          return {
+            message: { role: "assistant", content: "accepted" },
+            stopReason: "completed",
+          };
+      }
+    });
+    const runtime = (await loadCreateRuntime())(
+      createConfig({ initialMessage: "go", workspaceRoot }),
+      { provider, sessionStore: new InMemorySessionStore() },
+    );
+    try {
+      const result = await runtime.loop.runTurn({ userMessage: "go" });
+      expect(result.status).toBe("completed");
+      expect(await readFile(join(workspaceRoot, "a.txt"), "utf8")).toBe(
+        "HELLO WORLD\nline 1\nline two\n",
+      );
+    } finally {
+      await runtime.close();
+      await rm(workspaceRoot, { recursive: true, force: true });
+    }
+    expect(step).toBe(5);
+  }, 30_000);
 
   // 经真实 Runtime 执行 bash 工具：非零退出码仍是成功 payload，截断日志被创建并在 close 时清理。
   it("executes bash with non-zero exit code and cleans session logs on close", async () => {
