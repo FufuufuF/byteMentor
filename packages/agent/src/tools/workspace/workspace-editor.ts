@@ -10,6 +10,10 @@ export interface WorkspaceEditableSnapshot {
   bom: boolean;
 }
 
+export interface WorkspaceWriteOptions {
+  signal?: AbortSignal;
+}
+
 // 可编辑文件原始字节的协议硬上限，运行时只能通过 Policy 降低、不能提高。
 const PROTOCOL_MAX_EDITABLE_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -80,7 +84,12 @@ export class WorkspaceEditor {
   }
 
   // 原子替换一个工作区内文本文件的完整内容：同目录临时文件加 rename，成功保留原文件权限。
-  async writeTextAtomically(path: string, content: string): Promise<void> {
+  // signal 只在提交点之前检查：创建临时文件前与 rename 前；rename 成功即视为已提交，之后不再检查。
+  async writeTextAtomically(
+    path: string,
+    content: string,
+    options: WorkspaceWriteOptions = {},
+  ): Promise<void> {
     const resolved = await this.resolver.resolveAccessiblePath(path);
     if (resolved.type !== "file") {
       throw new WorkspaceError(
@@ -118,14 +127,19 @@ export class WorkspaceEditor {
 
     let tempPath: string | undefined;
     try {
+      throwIfCancelled(options.signal);
       tempPath = await createExclusiveTempFile(dirname(writeTarget));
       await writeFile(tempPath, content);
       await chmod(tempPath, targetMode);
+      throwIfCancelled(options.signal);
       await rename(tempPath, writeTarget);
       tempPath = undefined;
     } catch (error) {
       if (tempPath !== undefined) {
         await rm(tempPath, { force: true }).catch(() => undefined);
+      }
+      if (error instanceof WorkspaceError) {
+        throw error;
       }
       throw normalizeEditorError(error);
     }
@@ -178,4 +192,11 @@ function normalizeEditorError(error: unknown): unknown {
 // 识别 exclusive create 的目标已存在错误，使临时文件命名碰撞时换名重试而不覆盖既有文件。
 function isFileExistsError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST";
+}
+
+// 在提交点之前检查取消；已取消时抛出 tool_cancelled，由调用方清理临时文件。
+function throwIfCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new WorkspaceError("tool_cancelled", "workspace edit cancelled before commit");
+  }
 }

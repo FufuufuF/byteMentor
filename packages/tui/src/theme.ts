@@ -18,6 +18,7 @@ export interface ByteMentorTheme {
     toolPending(text: string): string;
     toolSuccess(text: string): string;
     toolError(text: string): string;
+    toolCancelled(text: string): string;
   };
   markdown: MarkdownTheme;
   editor: EditorTheme;
@@ -35,6 +36,7 @@ interface Palette {
   toolPendingBg: string;
   toolSuccessBg: string;
   toolErrorBg: string;
+  toolCancelledBg: string;
   heading: string;
   link: string;
   code: string;
@@ -53,6 +55,7 @@ const PALETTES: Record<ThemeKind, Palette> = {
     toolPendingBg: "#282832",
     toolSuccessBg: "#283228",
     toolErrorBg: "#3c2828",
+    toolCancelledBg: "#3c3830",
     heading: "#f0c674",
     link: "#81a2be",
     code: "#b5bd68",
@@ -69,6 +72,7 @@ const PALETTES: Record<ThemeKind, Palette> = {
     toolPendingBg: "#e8e8f0",
     toolSuccessBg: "#e8f0e8",
     toolErrorBg: "#f0e8e8",
+    toolCancelledBg: "#f0e8d8",
     heading: "#9a7326",
     link: "#547da7",
     code: "#588458",
@@ -119,6 +123,7 @@ export function createTheme(kind: ThemeKind): ByteMentorTheme {
       toolPending: (text) => chalk.bgHex(palette.toolPendingBg)(text),
       toolSuccess: (text) => chalk.bgHex(palette.toolSuccessBg)(text),
       toolError: (text) => chalk.bgHex(palette.toolErrorBg)(text),
+      toolCancelled: (text) => chalk.bgHex(palette.toolCancelledBg)(text),
     },
     markdown,
     editor: {

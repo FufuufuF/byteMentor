@@ -321,6 +321,43 @@ describe("edit_file resource limits", () => {
   });
 });
 
+describe("edit_file cancellation", () => {
+  // 预取消的 turn signal 在读取文件前即返回 tool_cancelled，目标文件保持不变且不落盘。
+  it("returns tool_cancelled without modifying the file when cancelled up front", async () => {
+    const root = await createWorkspace();
+    await writeFile(join(root, "f.txt"), "original\n");
+    const controller = new AbortController();
+    controller.abort();
+
+    const output = await createRegistry(root).execute(
+      "edit_file",
+      { path: "f.txt", edits: [{ oldText: "original", newText: "updated" }] },
+      { signal: controller.signal },
+    );
+
+    expect(output.result).toMatchObject({ ok: false, error: { code: "tool_cancelled" } });
+    expect(await readFile(join(root, "f.txt"), "utf8")).toBe("original\n");
+  });
+
+  // rename 成功即视为修改已提交；之后到达的迟到 abort 不得把成功结果改写为 tool_cancelled。
+  it("keeps the committed edit when the signal aborts after writing", async () => {
+    const root = await createWorkspace();
+    await writeFile(join(root, "f.txt"), "original\n");
+    const registry = createRegistry(root);
+    const controller = new AbortController();
+
+    const output = await registry.execute(
+      "edit_file",
+      { path: "f.txt", edits: [{ oldText: "original", newText: "updated" }] },
+      { signal: controller.signal },
+    );
+    controller.abort();
+
+    expect(output.result).toMatchObject({ ok: true });
+    expect(await readFile(join(root, "f.txt"), "utf8")).toBe("updated\n");
+  });
+});
+
 describe("edit_file runtime scheduling", () => {
   // edit_file 不声明 safe 并发，Registry 应将其归类为串行以保证写副作用按模型顺序发生。
   it("is not declared concurrency safe", () => {

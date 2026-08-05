@@ -54,6 +54,23 @@ export interface ToolFailedEvent extends RuntimeEventBase {
   message: string;
 }
 
+export interface ToolCancelledEvent extends RuntimeEventBase {
+  type: "tool.cancelled";
+  toolCallId: ToolCallId;
+  toolName: string;
+  started: boolean;
+  durationMs: number;
+  errorCode: "tool_cancelled" | "command_cancelled";
+  message: string;
+}
+
+export interface TurnCancelledEvent extends RuntimeEventBase {
+  type: "turn.cancelled";
+  sessionId: SessionId;
+  messageId: MessageId;
+  stopReason: "cancelled";
+}
+
 export interface TurnCompletedEvent extends RuntimeEventBase {
   type: "turn.completed";
   sessionId: SessionId;
@@ -71,9 +88,11 @@ export type RuntimeEvent =
   | TurnStartedEvent
   | TurnCompletedEvent
   | TurnFailedEvent
+  | TurnCancelledEvent
   | ContextBuiltEvent
   | ModelRequestedEvent
   | ModelRespondedEvent
   | ToolStartedEvent
   | ToolCompletedEvent
-  | ToolFailedEvent;
+  | ToolFailedEvent
+  | ToolCancelledEvent;

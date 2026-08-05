@@ -330,6 +330,7 @@ function createViewRecorder(): {
       startToolCall: (id) => calls.push(["startToolCall", id]),
       completeToolCall: (id, output) => calls.push(["completeToolCall", id, output]),
       failToolCall: (id, message) => calls.push(["failToolCall", id, message]),
+      cancelToolCall: (id, message) => calls.push(["cancelToolCall", id, message]),
       showError: (message) => calls.push(["showError", message]),
       setBusy: (busy) => calls.push(["setBusy", busy]),
       setSessionId: (sessionId) => calls.push(["setSessionId", sessionId]),

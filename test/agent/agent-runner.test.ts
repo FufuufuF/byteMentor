@@ -1538,3 +1538,400 @@ describe("AgentRunner.run", () => {
     });
   });
 });
+
+// 等待 AbortSignal 触发后以错误结束，模拟 Provider 在模型生成阶段因 signal 被中止。
+function waitForAbort(signal?: AbortSignal): Promise<never> {
+  return new Promise((_resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error("stream aborted"));
+      return;
+    }
+    signal?.addEventListener("abort", () => reject(new Error("stream aborted")), { once: true });
+  });
+}
+
+describe("AgentRunner.run cancellation", () => {
+  // 模型请求前 signal 已取消时不得启动新工作：不调用 Provider，返回 cancelled 且不含工具调用。
+  it("returns cancelled without invoking the provider when already aborted", async () => {
+    let providerInvoked = false;
+    const provider = invokeProvider(async () => {
+      providerInvoked = true;
+      return { message: { role: "assistant", content: "done" }, stopReason: "completed" };
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      signal: controller.signal,
+    });
+
+    expect(providerInvoked).toBe(false);
+    expect(result.stopReason).toBe("cancelled");
+    expect(result.error).toBeUndefined();
+    expect(result.events).toEqual([]);
+    expect(result.newMessages).toEqual([
+      {
+        id: expect.any(String),
+        role: "assistant",
+        content: "[Assistant reply cancelled.]",
+      },
+    ]);
+  });
+
+  // 模型流期间取消会中止 Provider 且不进入 Tool 阶段；signal 必须通过独立 invocation options 传递。
+  it("cancels a provider stream in progress and never enters the tool phase", async () => {
+    let receivedSignal: AbortSignal | undefined;
+    const provider: ModelProvider = {
+      async invoke() {
+        throw new Error("unused");
+      },
+      async *invokeStream(_req, options) {
+        receivedSignal = options?.signal;
+        yield { type: "content_delta", text: "partial " };
+        await waitForAbort(options?.signal);
+      },
+    };
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+    });
+
+    await settleAsyncWork(() => receivedSignal !== undefined);
+    controller.abort();
+    const result = await pending;
+
+    expect(receivedSignal).toBe(controller.signal);
+    expect(result.stopReason).toBe("cancelled");
+    expect(events.map((event) => event.type)).toEqual(["model.requested"]);
+    expect(result.newMessages).toEqual([
+      {
+        id: expect.any(String),
+        role: "assistant",
+        content: "[Assistant reply cancelled.]",
+      },
+    ]);
+  });
+
+  // 最终 done 已提交后到达的迟到 abort 不得把 completed 改写为取消。
+  it("keeps completed when the signal aborts after the final done", async () => {
+    const controller = new AbortController();
+    const provider = invokeProvider(async () => ({
+      message: { role: "assistant", content: "done" },
+      stopReason: "completed",
+    }));
+
+    const result = await new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "hello" }],
+      tools: new ToolRegistry(),
+      signal: controller.signal,
+    });
+    controller.abort();
+
+    expect(result.stopReason).toBe("completed");
+    expect(result.newMessages).toHaveLength(1);
+    expect(result.newMessages[0]).toMatchObject({ role: "assistant", content: "done" });
+  });
+
+  // 串行批次取消时，已启动调用等待真实 I/O 收敛并保留真实结果，未启动调用获得 tool_cancelled ToolMessage。
+  it("cancels unstarted serial calls while keeping the started call's real result", async () => {
+    const firstToolCallId = createToolCallId();
+    const secondToolCallId = createToolCallId();
+    const provider = invokeProvider(async () => ({
+      message: {
+        role: "assistant",
+        toolCalls: [
+          { id: firstToolCallId, name: "slow", args: {} },
+          { id: secondToolCallId, name: "never", args: {} },
+        ],
+      },
+      stopReason: "tool_calls",
+    }));
+    const gate = deferred<void>();
+    let neverExecuted = false;
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "slow",
+      description: "slow tool",
+      async execute() {
+        await gate.promise;
+        return { ok: true, data: "slow done" };
+      },
+    });
+    tools.register({
+      name: "never",
+      description: "never runs",
+      async execute() {
+        neverExecuted = true;
+        return { ok: true, data: "never" };
+      },
+    });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "batch" }],
+      tools,
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+    });
+
+    await settleAsyncWork(() => events.some((event) => event.type === "tool.started"));
+    controller.abort();
+    gate.resolve();
+    const result = await pending;
+
+    expect(neverExecuted).toBe(false);
+    expect(result.stopReason).toBe("cancelled");
+    expect(result.newMessages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "[Assistant reply cancelled.]",
+    });
+    expect(events.filter((event) => event.type === "tool.completed")).toEqual([
+      expect.objectContaining({ toolCallId: firstToolCallId }),
+    ]);
+    expect(events.filter((event) => event.type === "tool.cancelled")).toEqual([
+      expect.objectContaining({
+        toolCallId: secondToolCallId,
+        started: false,
+        durationMs: 0,
+        errorCode: "tool_cancelled",
+      }),
+    ]);
+    const toolMessages = result.newMessages.filter((message) => message.role === "tool");
+    expect(toolMessages).toHaveLength(2);
+    expect(toolMessages[1]).toMatchObject({ toolCallId: secondToolCallId });
+    expect(JSON.parse((toolMessages[1] as ToolMessage).content)).toMatchObject({
+      ok: false,
+      error: { code: "tool_cancelled" },
+    });
+  });
+
+  // 已启动调用只有在真实错误码为 tool_cancelled 时产生 tool.cancelled { started: true }；
+  // 未启动调用始终使用 started: false 且 durationMs 为 0。
+  it("maps a started tool_cancelled result to a started tool.cancelled event", async () => {
+    const firstToolCallId = createToolCallId();
+    const secondToolCallId = createToolCallId();
+    const provider = invokeProvider(async () => ({
+      message: {
+        role: "assistant",
+        toolCalls: [
+          { id: firstToolCallId, name: "cancel_me", args: {} },
+          { id: secondToolCallId, name: "never", args: {} },
+        ],
+      },
+      stopReason: "tool_calls",
+    }));
+    const gate = deferred<void>();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "cancel_me",
+      description: "returns a cancellation error",
+      async execute() {
+        await gate.promise;
+        return {
+          ok: false,
+          error: { code: "tool_cancelled", message: "cancelled during write" },
+        };
+      },
+    });
+    tools.register({
+      name: "never",
+      description: "never runs",
+      async execute() {
+        return { ok: true, data: "never" };
+      },
+    });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "batch" }],
+      tools,
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+    });
+
+    await settleAsyncWork(() => events.some((event) => event.type === "tool.started"));
+    controller.abort();
+    gate.resolve();
+    const result = await pending;
+
+    expect(result.stopReason).toBe("cancelled");
+    expect(events.filter((event) => event.type === "tool.cancelled")).toEqual([
+      expect.objectContaining({
+        toolCallId: firstToolCallId,
+        started: true,
+        errorCode: "tool_cancelled",
+      }),
+      expect.objectContaining({
+        toolCallId: secondToolCallId,
+        started: false,
+        durationMs: 0,
+        errorCode: "tool_cancelled",
+      }),
+    ]);
+  });
+
+  // 并发 safe 批次取消后停止领取新任务，等待已领取调用结束，再按原始顺序组装全部 ToolMessage。
+  it("stops claiming new calls in a concurrent safe batch after cancellation", async () => {
+    const toolCalls = Array.from({ length: 3 }, (_, index) => ({
+      id: createToolCallId(),
+      name: "safe_read",
+      args: { index },
+    }));
+    const release = deferred<void>();
+    const started: number[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "safe_read",
+      description: "read safely",
+      concurrency: "safe",
+      async execute(args) {
+        const { index } = args as { index: number };
+        started.push(index);
+        await release.promise;
+        return { ok: true, data: index };
+      },
+    });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(oneBatchProvider(toolCalls), {
+      maxConcurrentToolCalls: 2,
+    }).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "read all" }],
+      tools,
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+    });
+
+    await settleAsyncWork(() => started.length >= 2);
+    controller.abort();
+    release.resolve();
+    const result = await pending;
+
+    expect(started).toEqual([0, 1]);
+    expect(result.stopReason).toBe("cancelled");
+    expect(events.filter((event) => event.type === "tool.cancelled")).toEqual([
+      expect.objectContaining({ toolCallId: toolCalls[2].id, started: false }),
+    ]);
+    const toolMessages = result.newMessages.filter((message) => message.role === "tool");
+    expect(toolMessages).toHaveLength(3);
+    expect(toolMessages[2]).toMatchObject({ toolCallId: toolCalls[2].id });
+  });
+
+  // 取消终态写入 pendingToolCalls 为空的 cancelled checkpoint，
+  // 合成 AssistantMessage 同时出现在 checkpoint 与最终 newMessages 中。
+  it("persists a cancelled checkpoint with the synthetic assistant message", async () => {
+    const firstToolCallId = createToolCallId();
+    const secondToolCallId = createToolCallId();
+    const provider = invokeProvider(async () => ({
+      message: {
+        role: "assistant",
+        toolCalls: [
+          { id: firstToolCallId, name: "slow", args: {} },
+          { id: secondToolCallId, name: "never", args: {} },
+        ],
+      },
+      stopReason: "tool_calls",
+    }));
+    const gate = deferred<void>();
+    const checkpoints: RuntimeCheckpoint[] = [];
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "slow",
+      description: "slow tool",
+      async execute() {
+        await gate.promise;
+        return { ok: true, data: "slow done" };
+      },
+    });
+    tools.register({
+      name: "never",
+      description: "never runs",
+      async execute() {
+        return { ok: true, data: "never" };
+      },
+    });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "batch" }],
+      tools,
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+      async checkpoint(payload) {
+        checkpoints.push(payload);
+      },
+    });
+
+    await settleAsyncWork(() => events.some((event) => event.type === "tool.started"));
+    controller.abort();
+    gate.resolve();
+    const result = await pending;
+
+    expect(checkpoints.map((checkpoint) => checkpoint.phase)).toEqual([
+      "awaiting_tools",
+      "cancelled",
+    ]);
+    const cancelledCheckpoint = checkpoints.at(-1) as RuntimeCheckpoint & { phase: "cancelled" };
+    expect(cancelledCheckpoint.pendingToolCalls).toEqual([]);
+    expect(cancelledCheckpoint.newMessages.at(-1)).toMatchObject({
+      role: "assistant",
+      content: "[Assistant reply cancelled.]",
+    });
+    expect(result.newMessages.at(-1)).toEqual(cancelledCheckpoint.newMessages.at(-1));
+  });
+
+  // 取消并不跳过 checkpoint 持久化；cancelled checkpoint 保存失败时数据完整性优先于取消。
+  it("returns failed when the cancelled checkpoint persistence fails", async () => {
+    const toolCallId = createToolCallId();
+    const provider = invokeProvider(async () => ({
+      message: {
+        role: "assistant",
+        toolCalls: [{ id: toolCallId, name: "slow", args: {} }],
+      },
+      stopReason: "tool_calls",
+    }));
+    const gate = deferred<void>();
+    const tools = new ToolRegistry();
+    tools.register({
+      name: "slow",
+      description: "slow tool",
+      async execute() {
+        await gate.promise;
+        return { ok: true, data: "slow done" };
+      },
+    });
+    const controller = new AbortController();
+    const events: RuntimeEvent[] = [];
+    const pending = new AgentRunner(provider).run({
+      turnId: createTurnId(),
+      messages: [{ id: createMessageId(), role: "user", content: "batch" }],
+      tools,
+      signal: controller.signal,
+      onRuntimeEvent: (event) => events.push(event),
+      async checkpoint() {
+        throw new Error("checkpoint storage unavailable");
+      },
+    });
+
+    await settleAsyncWork(() => events.some((event) => event.type === "tool.started"));
+    controller.abort();
+    gate.resolve();
+    const result = await pending;
+
+    expect(result.stopReason).toBe("failed");
+    expect(result.error?.message).toContain("checkpoint storage unavailable");
+  });
+});

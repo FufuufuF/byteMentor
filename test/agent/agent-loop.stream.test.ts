@@ -12,6 +12,7 @@ describe("AgentLoop streaming contract", () => {
       | {
           onStreamEvent?: (event: ProviderStreamEvent) => void;
           onRuntimeEvent?: (event: RuntimeEvent) => void;
+          signal?: AbortSignal;
         }
       | undefined
     >();

@@ -59,13 +59,20 @@ export const editFileTool: AgentTool = {
   ].join("\n"),
   parametersJsonSchema,
 
-  // 校验协议字符上限后读取快照，先完成全部匹配与预算检查，再通过 Editor 原子写回。
-  async execute(args, context): Promise<ToolResult> {
+  // 校验协议字符上限后读取快照，先完成全部匹配与预算检查，再通过 Editor 原子写回；
+  // 取消检查发生在提交点之前，rename 成功后的迟到 abort 不追溯改写成功结果。
+  async execute(args, context, options): Promise<ToolResult> {
     const input = args as EditFileArguments;
     const editor = context.workspaceEditor;
     const invalidMessage = validateEditArguments(input);
     if (invalidMessage !== undefined) {
       return { ok: false, error: { code: "invalid_arguments", message: invalidMessage } };
+    }
+    if (options?.signal?.aborted) {
+      return {
+        ok: false,
+        error: { code: "tool_cancelled", message: "edit cancelled before any file I/O" },
+      };
     }
 
     try {
@@ -86,7 +93,7 @@ export const editFileTool: AgentTool = {
         };
       }
       const content = snapshot.bom ? `\uFEFF${applied.text}` : applied.text;
-      await editor.writeTextAtomically(input.path, content);
+      await editor.writeTextAtomically(input.path, content, { signal: options?.signal });
       return { ok: true, data: payload };
     } catch (error) {
       if (error instanceof WorkspaceError) {

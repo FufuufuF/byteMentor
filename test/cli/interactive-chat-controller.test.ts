@@ -58,6 +58,9 @@ class RecordingView implements InteractiveChatView {
   failToolCall(id: string, message: string): void {
     this.calls.push(["failToolCall", id, message]);
   }
+  cancelToolCall(id: string, message: string): void {
+    this.calls.push(["cancelToolCall", id, message]);
+  }
   showError(message: string): void {
     this.calls.push(["showError", message]);
   }
@@ -239,6 +242,117 @@ describe("InteractiveChatController", () => {
   });
 });
 
+describe("InteractiveChatController cancellation", () => {
+  // 忙碌时请求退出应 abort 当前 turn 的 signal、标记退出意图，并在 turn 收敛后关闭 Runtime。
+  test("aborts the active turn signal when exit is requested while busy", async () => {
+    const pending = deferred<HeadlessTurnResult>();
+    const signals: Array<AbortSignal | undefined> = [];
+    const view = new RecordingView();
+    let closeCount = 0;
+    const controller = new InteractiveChatController({
+      loop: {
+        async runTurn(_input, options) {
+          signals.push(options?.signal);
+          return pending.promise;
+        },
+      },
+      view,
+      close: async () => {
+        closeCount += 1;
+      },
+    });
+    await controller.start();
+    const active = controller.submit("busy turn");
+
+    controller.requestExit();
+
+    expect(view.calls).toContainEqual(["setExitAfterTurn", true]);
+    expect(signals[0]?.aborted).toBe(true);
+    expect(closeCount).toBe(0);
+
+    pending.resolve(cancelledTurn(createSessionId()));
+    await active;
+    expect(await controller.waitForExit()).toBe(0);
+    expect(closeCount).toBe(1);
+  });
+
+  // 取消的 turn 会结束已有的流式 Assistant 卡片，但不调用 showError。
+  test("ends a streaming assistant card without showing an error for a cancelled turn", async () => {
+    const view = new RecordingView();
+    const loop = {
+      async runTurn(_input: Parameters<AgentLoop["runTurn"]>[0], options?: HeadlessTurnOptions) {
+        options?.onStreamEvent?.({ type: "content_delta", text: "partial" });
+        return cancelledTurn(createSessionId());
+      },
+    };
+    const controller = new InteractiveChatController({ loop, view, close: async () => undefined });
+    await controller.start();
+
+    await controller.submit("cancel me");
+
+    expect(view.calls).toContainEqual(["completeAssistantMessage", undefined]);
+    expect(view.calls.filter(([name]) => name === "showError")).toEqual([]);
+  });
+
+  // Controller 将 tool.cancelled 收敛为终态 Tool 卡片，reconcile 时仍以取消状态呈现完整内容。
+  test("maps tool.cancelled events into terminal tool cards", async () => {
+    const toolCallId = createToolCallId();
+    const view = new RecordingView();
+    const cancelledContent = '{"ok":false,"error":{"code":"tool_cancelled","message":"cancelled"}}';
+    const loop = {
+      async runTurn(_input: Parameters<AgentLoop["runTurn"]>[0], options?: HeadlessTurnOptions) {
+        options?.onRuntimeEvent?.({
+          type: "tool.cancelled",
+          turnId: createTurnId(),
+          ts: Date.now(),
+          toolCallId,
+          toolName: "edit_file",
+          started: false,
+          durationMs: 0,
+          errorCode: "tool_cancelled",
+          message: "cancelled before start",
+        });
+        return cancelledTurn(createSessionId(), [
+          {
+            id: createMessageId(),
+            role: "tool",
+            toolCallId,
+            content: cancelledContent,
+          },
+        ]);
+      },
+    };
+    const controller = new InteractiveChatController({ loop, view, close: async () => undefined });
+    await controller.start();
+
+    await controller.submit("cancel");
+
+    expect(view.calls).toContainEqual(["cancelToolCall", toolCallId, "cancelled before start"]);
+    expect(view.calls).toContainEqual(["cancelToolCall", toolCallId, cancelledContent]);
+    expect(
+      view.calls.filter(([name, id]) => name === "completeToolCall" && id === toolCallId),
+    ).toHaveLength(0);
+  });
+
+  // 空闲时退出不引入取消链路，行为与既有请求退出一致。
+  test("exits immediately without abort when idle", async () => {
+    const view = new RecordingView();
+    let closeCount = 0;
+    const controller = new InteractiveChatController({
+      loop: { runTurn: async () => completedTurn(createSessionId(), "done") },
+      view,
+      close: async () => {
+        closeCount += 1;
+      },
+    });
+    await controller.start();
+
+    controller.requestExit();
+    expect(await controller.waitForExit()).toBe(0);
+    expect(closeCount).toBe(1);
+  });
+});
+
 function completedTurn(
   sessionId: SessionId,
   content: string,
@@ -263,6 +377,24 @@ function failedTurn(sessionId: SessionId, message: string): HeadlessTurnResult {
     error: { message },
     newMessages: [],
     stopReason: "failed",
+    events: [],
+    trace: [],
+  };
+}
+
+function cancelledTurn(sessionId: SessionId, beforeFinal: Message[] = []): HeadlessTurnResult {
+  return {
+    status: "cancelled",
+    sessionId,
+    newMessages: [
+      ...beforeFinal,
+      {
+        id: createMessageId(),
+        role: "assistant",
+        content: "[Assistant reply cancelled.]",
+      },
+    ],
+    stopReason: "cancelled",
     events: [],
     trace: [],
   };

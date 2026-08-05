@@ -3,7 +3,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import type { ToolCallView } from "../byte-mentor-tui.js";
 import type { ByteMentorTheme } from "../theme.js";
 
-export type ToolExecutionState = "pending" | "running" | "success" | "error";
+export type ToolExecutionState = "pending" | "running" | "success" | "error" | "cancelled";
 
 const MAX_RENDERED_LINES = 10;
 
@@ -41,6 +41,13 @@ export class ToolExecutionComponent implements Component {
     this.updateText();
   }
 
+  // Converges a cancelled tool call into a distinct terminal state without treating it as an error.
+  cancel(message: string): void {
+    this.state = "cancelled";
+    this.output = message;
+    this.updateText();
+  }
+
   // Renders a bounded card and adds a visible truncation marker when output exceeds its row budget.
   render(width: number): string[] {
     const lines = this.text.render(width);
@@ -68,6 +75,7 @@ export class ToolExecutionComponent implements Component {
   private background(): (text: string) => string {
     if (this.state === "success") return this.theme.background.toolSuccess;
     if (this.state === "error") return this.theme.background.toolError;
+    if (this.state === "cancelled") return this.theme.background.toolCancelled;
     return this.theme.background.toolPending;
   }
 }
@@ -86,5 +94,6 @@ function stateGlyph(state: ToolExecutionState): string {
   if (state === "running") return "◌";
   if (state === "success") return "✓";
   if (state === "error") return "✕";
+  if (state === "cancelled") return "⊘";
   return "○";
 }

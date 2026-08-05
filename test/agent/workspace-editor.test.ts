@@ -369,4 +369,34 @@ describe("WorkspaceEditor.writeTextAtomically", () => {
     await editor.writeTextAtomically("f.txt", "new");
     expect(await readdir(root)).not.toContainEqual(expect.stringMatching(/^\.byte-mentor-tmp-/));
   });
+
+  // 取消只允许出现在提交点之前：预取消的 signal 在创建临时文件前即返回 tool_cancelled，
+  // 目标文件保持不变且不留下任何临时文件。
+  it("cancels before any I/O and leaves the target unchanged", async () => {
+    const root = await createWorkspace();
+    await writeFile(join(root, "f.txt"), "original");
+    const editor = createEditor(root);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expectWorkspaceError(
+      editor.writeTextAtomically("f.txt", "new", { signal: controller.signal }),
+      "tool_cancelled",
+    );
+    expect(await readFile(join(root, "f.txt"), "utf8")).toBe("original");
+    expect(await readdir(root)).not.toContainEqual(expect.stringMatching(/^\.byte-mentor-tmp-/));
+  });
+
+  // rename 成功即视为修改已经提交；之后到达的迟到 abort 不得把成功结果改写为取消。
+  it("keeps the committed result when the signal aborts after rename", async () => {
+    const root = await createWorkspace();
+    await writeFile(join(root, "f.txt"), "original");
+    const editor = createEditor(root);
+    const controller = new AbortController();
+
+    await editor.writeTextAtomically("f.txt", "new", { signal: controller.signal });
+    controller.abort();
+
+    expect(await readFile(join(root, "f.txt"), "utf8")).toBe("new");
+  });
 });

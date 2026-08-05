@@ -77,6 +77,25 @@ describe("ToolRegistry execution context", () => {
       result: { ok: false, error: { code: "unknown_tool" } },
     });
   });
+
+  // turn signal 属于单次执行控制信息，不进入静态 context；这里验证 Registry 把 execution options 透传给工具。
+  it("passes execution options signal through to tool.execute", async () => {
+    const registry = new ToolRegistry();
+    let receivedOptions: unknown;
+    registry.register({
+      name: "capture_options",
+      description: "captures execution options",
+      async execute(_args: unknown, _context: ToolExecutionContext, options?: unknown) {
+        receivedOptions = options;
+        return { ok: true, data: "captured" };
+      },
+    });
+
+    const controller = new AbortController();
+    await registry.execute("capture_options", {}, { signal: controller.signal });
+
+    expect(receivedOptions).toEqual({ signal: controller.signal });
+  });
 });
 
 describe("ToolRegistry.execute unknown tool", () => {

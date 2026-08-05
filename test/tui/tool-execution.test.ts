@@ -47,6 +47,28 @@ describe("tool execution cards", () => {
     expect(rendered).not.toContain("early preview");
   });
 
+  // A cancelled tool call converges into a distinct terminal state that is not an error.
+  test("renders a terminal cancelled state", () => {
+    const card = new ToolExecutionComponent({ id: "call-1", name: "edit_file", args: {} }, theme);
+    card.setRunning();
+    card.cancel("cancelled before start");
+
+    const rendered = plain(card.render(80));
+    expect(rendered).toContain("cancelled");
+    expect(rendered).toContain("cancelled before start");
+  });
+
+  // ToolViewStore routes cancelled calls to the terminal cancelled card without throwing for missing IDs.
+  test("store cancels a known tool card", () => {
+    const store = new ToolViewStore(theme);
+    store.add({ id: "call-1", name: "edit_file", args: {} });
+    store.cancel("call-1", "cancelled before start");
+
+    const rendered = plain(store.render(80));
+    expect(rendered).toContain("cancelled");
+    expect(rendered).toContain("cancelled before start");
+  });
+
   // Preserves assistant tool-call order even when later calls finish before earlier calls.
   test("keeps concurrent cards in insertion order", () => {
     const store = new ToolViewStore(theme);
