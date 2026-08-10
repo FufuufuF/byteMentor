@@ -1,434 +1,234 @@
 ---
 name: test-driven-development
-description: Use when implementing any feature or bugfix, before writing implementation code
+description: "Use when implementing features, bug fixes, refactors, or behavior changes. Executes test-first development in coherent reviewable batches: brief the user on the batch goal and every planned test case, wait for explicit approval, establish the complete batch RED suite, implement the whole batch to GREEN, then verify and hand off at the batch boundary."
 ---
 
-# Test-Driven Development (TDD)
+# Batch-Oriented Test-Driven Development
 
-## Overview
+## Core Rule
 
-Write the test first. Watch it fail. Write minimal code to pass.
-
-**Core principle:** If you didn't watch the test fail, you don't know if it tests the right thing.
-
-**Violating the letter of the rules is violating the spirit of the rules.**
-
-## When to Use
-
-**Always:**
-- New features
-- Bug fixes
-- Refactoring
-- Behavior changes
-
-**Exceptions (ask your human partner):**
-- Throwaway prototypes
-- Generated code
-- Configuration files
-
-Thinking "skip TDD just this once"? Stop. That's rationalization.
-
-## The Iron Law
-
-```
-NO PRODUCTION CODE WITHOUT A FAILING TEST FIRST
+```text
+NO BATCH IMPLEMENTATION BEFORE THE BATCH'S BEHAVIOR TESTS
+HAVE BEEN WRITTEN AND OBSERVED FAILING FOR THE EXPECTED REASONS
 ```
 
-Write code before the test? Delete it. Start over.
-
-**No exceptions:**
-- Don't keep it as "reference"
-- Don't "adapt" it while writing tests
-- Don't look at it
-- Delete means delete
-
-Implement fresh from tests. Period.
-
-## Red-Green-Refactor
-
-```dot
-digraph tdd_cycle {
-    rankdir=LR;
-    red [label="RED\nWrite failing test", shape=box, style=filled, fillcolor="#ffcccc"];
-    verify_red [label="Verify fails\ncorrectly", shape=diamond];
-    green [label="GREEN\nMinimal code", shape=box, style=filled, fillcolor="#ccffcc"];
-    verify_green [label="Verify passes\nAll green", shape=diamond];
-    refactor [label="REFACTOR\nClean up", shape=box, style=filled, fillcolor="#ccccff"];
-    next [label="Next", shape=ellipse];
-
-    red -> verify_red;
-    verify_red -> green [label="yes"];
-    verify_red -> red [label="wrong\nfailure"];
-    green -> verify_green;
-    verify_green -> refactor [label="yes"];
-    verify_green -> green [label="no"];
-    refactor -> verify_green [label="stay\ngreen"];
-    verify_green -> next;
-    next -> red;
-}
-```
-
-### RED - Write Failing Test
-
-Write one minimal test showing what should happen.
-
-<Good>
-```typescript
-test('retries failed operations 3 times', async () => {
-  let attempts = 0;
-  const operation = () => {
-    attempts++;
-    if (attempts < 3) throw new Error('fail');
-    return 'success';
-  };
-
-  const result = await retryOperation(operation);
-
-  expect(result).toBe('success');
-  expect(attempts).toBe(3);
-});
-```
-Clear name, tests real behavior, one thing
-</Good>
-
-<Bad>
-```typescript
-test('retry works', async () => {
-  const mock = jest.fn()
-    .mockRejectedValueOnce(new Error())
-    .mockRejectedValueOnce(new Error())
-    .mockResolvedValueOnce('success');
-  await retryOperation(mock);
-  expect(mock).toHaveBeenCalledTimes(3);
-});
-```
-Vague name, tests mock not code
-</Bad>
-
-**Requirements:**
-- One behavior
-- Clear name
-- Real code (no mocks unless unavoidable)
-- A concise comment immediately above the test case explaining the behavior or scenario under test
-
-### Verify RED - Watch It Fail
-
-**MANDATORY. Never skip.**
-
-```bash
-npm test path/to/test.test.ts
-```
-
-Confirm:
-- Test fails (not errors)
-- Failure message is expected
-- Fails because feature missing (not typos)
-
-**Test passes?** You're testing existing behavior. Fix test.
-
-**Test errors?** Fix error, re-run until it fails correctly.
-
-### GREEN - Minimal Code
-
-Write simplest code to pass the test.
-
-<Good>
-```typescript
-async function retryOperation<T>(fn: () => Promise<T>): Promise<T> {
-  for (let i = 0; i < 3; i++) {
-    try {
-      return await fn();
-    } catch (e) {
-      if (i === 2) throw e;
-    }
-  }
-  throw new Error('unreachable');
-}
-```
-Just enough to pass
-</Good>
-
-<Bad>
-```typescript
-async function retryOperation<T>(
-  fn: () => Promise<T>,
-  options?: {
-    maxRetries?: number;
-    backoff?: 'linear' | 'exponential';
-    onRetry?: (attempt: number) => void;
-  }
-): Promise<T> {
-  // YAGNI
-}
-```
-Over-engineered
-</Bad>
-
-Don't add features, refactor other code, or "improve" beyond the test.
-
-Add a concise responsibility comment immediately above every production function or method introduced or changed in this step. The comment must explain what the function or method does so a reviewer does not need to infer its responsibility from the name.
-
-### Verify GREEN - Watch It Pass
-
-**MANDATORY.**
-
-```bash
-npm test path/to/test.test.ts
-```
-
-Confirm:
-- Test passes
-- Other tests still pass
-- Output pristine (no errors, warnings)
-
-**Test fails?** Fix code, not test.
-
-**Other tests fail?** Fix now.
-
-### REFACTOR - Clean Up
-
-After green only:
-- Remove duplication
-- Improve names
-- Extract helpers
-
-Keep tests green. Don't add behavior.
-
-### Repeat
-
-Next failing test for next feature.
-
-## Code Comments (Mandatory)
-
-Comments are part of the TDD increment, not cleanup to defer until later.
-
-### Test Code
-
-- Put a concise comment immediately above every `test(...)` or `it(...)` case.
-- Explain the setup or input, the behavior being exercised, and the observable expected outcome.
-- Explain why multiple outputs or assertions are needed when their relationship is part of the contract.
-- Prefer plain domain language. Define internal terms at first use instead of relying on jargon, abbreviations, or implementation vocabulary.
-- Use two to four short lines when one compressed sentence would be harder to understand; concise does not mean cryptic.
-- Do not merely repeat the test name in different words.
-
-<Good>
-```typescript
-// Verifies that a transient operation succeeds on its third attempt without exceeding the retry budget.
-test('retries failed operations 3 times', async () => {
-  // ...
-});
-```
-</Good>
-
-<Bad>
-```typescript
-// Tests retry.
-test('retries failed operations 3 times', async () => {
-  // ...
-});
-```
-</Bad>
-
-### Production Code
-
-- Put a concise responsibility comment immediately above every function declaration, class method, and function-valued variable introduced or changed by the TDD step.
-- Include constructors when their setup responsibility is not completely represented by field declarations.
-- Explain what the function or method does, including an important boundary or side effect when relevant.
-- Prefer plain domain language and explain unfamiliar implementation terms when they are necessary.
-- Comment non-trivial inline callbacks at the call site when a reviewer would otherwise need to infer their role.
-- Do not merely translate the function name, narrate individual statements, or use comments to compensate for unclear code.
-
-<Good>
-```typescript
-// Executes an operation up to three times and returns the first successful result.
-async function retryOperation<T>(fn: () => Promise<T>): Promise<T> {
-  // ...
-}
-```
-</Good>
-
-<Bad>
-```typescript
-// Retry operation.
-async function retryOperation<T>(fn: () => Promise<T>): Promise<T> {
-  // ...
-}
-```
-</Bad>
-
-## Good Tests
-
-| Quality | Good | Bad |
-|---------|------|-----|
-| **Minimal** | One thing. "and" in name? Split it. | `test('validates email and domain and whitespace')` |
-| **Clear** | Name describes behavior | `test('test1')` |
-| **Shows intent** | Demonstrates desired API | Obscures what code should do |
-
-## Why Order Matters
-
-**"I'll write tests after to verify it works"**
-
-Tests written after code pass immediately. Passing immediately proves nothing:
-- Might test wrong thing
-- Might test implementation, not behavior
-- Might miss edge cases you forgot
-- You never saw it catch the bug
-
-Test-first forces you to see the test fail, proving it actually tests something.
-
-**"I already manually tested all the edge cases"**
-
-Manual testing is ad-hoc. You think you tested everything but:
-- No record of what you tested
-- Can't re-run when code changes
-- Easy to forget cases under pressure
-- "It worked when I tried it" ≠ comprehensive
-
-Automated tests are systematic. They run the same way every time.
-
-**"Deleting X hours of work is wasteful"**
-
-Sunk cost fallacy. The time is already gone. Your choice now:
-- Delete and rewrite with TDD (X more hours, high confidence)
-- Keep it and add tests after (30 min, low confidence, likely bugs)
-
-The "waste" is keeping code you can't trust. Working code without real tests is technical debt.
-
-**"TDD is dogmatic, being pragmatic means adapting"**
-
-TDD IS pragmatic:
-- Finds bugs before commit (faster than debugging after)
-- Prevents regressions (tests catch breaks immediately)
-- Documents behavior (tests show how to use code)
-- Enables refactoring (change freely, tests catch breaks)
-
-"Pragmatic" shortcuts = debugging in production = slower.
-
-**"Tests after achieve the same goals - it's spirit not ritual"**
-
-No. Tests-after answer "What does this do?" Tests-first answer "What should this do?"
-
-Tests-after are biased by your implementation. You test what you built, not what's required. You verify remembered edge cases, not discovered ones.
-
-Tests-first force edge case discovery before implementing. Tests-after verify you remembered everything (you didn't).
-
-30 minutes of tests after ≠ TDD. You get coverage, lose proof tests work.
-
-## Common Rationalizations
-
-| Excuse | Reality |
-|--------|---------|
-| "Too simple to test" | Simple code breaks. Test takes 30 seconds. |
-| "I'll test after" | Tests passing immediately prove nothing. |
-| "Tests after achieve same goals" | Tests-after = "what does this do?" Tests-first = "what should this do?" |
-| "Already manually tested" | Ad-hoc ≠ systematic. No record, can't re-run. |
-| "Deleting X hours is wasteful" | Sunk cost fallacy. Keeping unverified code is technical debt. |
-| "Keep as reference, write tests first" | You'll adapt it. That's testing after. Delete means delete. |
-| "Need to explore first" | Fine. Throw away exploration, start with TDD. |
-| "Test hard = design unclear" | Listen to test. Hard to test = hard to use. |
-| "TDD will slow me down" | TDD faster than debugging. Pragmatic = test-first. |
-| "Manual test faster" | Manual doesn't prove edge cases. You'll re-test every change. |
-| "Existing code has no tests" | You're improving it. Add tests for existing code. |
-
-## Red Flags - STOP and Start Over
-
-- Code before test
-- Test after implementation
-- Test passes immediately
-- Can't explain why test failed
-- Tests added "later"
-- Rationalizing "just this once"
-- "I already manually tested it"
-- "Tests after achieve the same purpose"
-- "It's about spirit not ritual"
-- "Keep as reference" or "adapt existing code"
-- "Already spent X hours, deleting is wasteful"
-- "TDD is dogmatic, I'm being pragmatic"
-- "This is different because..."
-
-**All of these mean: Delete code. Start over with TDD.**
-
-## Example: Bug Fix
-
-**Bug:** Empty email accepted
-
-**RED**
-```typescript
-test('rejects empty email', async () => {
-  const result = await submitForm({ email: '' });
-  expect(result.error).toBe('Email required');
-});
-```
-
-**Verify RED**
-```bash
-$ npm test
-FAIL: expected 'Email required', got undefined
-```
-
-**GREEN**
-```typescript
-function submitForm(data: FormData) {
-  if (!data.email?.trim()) {
-    return { error: 'Email required' };
-  }
-  // ...
-}
-```
-
-**Verify GREEN**
-```bash
-$ npm test
-PASS
-```
-
-**REFACTOR**
-Extract validation for multiple fields if needed.
-
-## Verification Checklist
-
-Before marking work complete:
-
-- [ ] Every new function/method has a test
-- [ ] Every test case has a concise comment explaining what it verifies
-- [ ] Every introduced or changed production function/method has a concise responsibility comment
-- [ ] Watched each test fail before implementing
-- [ ] Each test failed for expected reason (feature missing, not typo)
-- [ ] Wrote minimal code to pass each test
-- [ ] All tests pass
-- [ ] Output pristine (no errors, warnings)
-- [ ] Tests use real code (mocks only if unavoidable)
-- [ ] Edge cases and errors covered
-
-Can't check all boxes? You skipped TDD. Start over.
-
-## When Stuck
-
-| Problem | Solution |
-|---------|----------|
-| Don't know how to test | Write wished-for API. Write assertion first. Ask your human partner. |
-| Test too complicated | Design too complicated. Simplify interface. |
-| Must mock everything | Code too coupled. Use dependency injection. |
-| Test setup huge | Extract helpers. Still complex? Simplify design. |
-
-## Debugging Integration
-
-Bug found? Write failing test reproducing it. Follow TDD cycle. Test proves fix and prevents regression.
-
-Never fix bugs without a test.
-
-## Testing Anti-Patterns
-
-When adding mocks or test utilities, read @testing-anti-patterns.md to avoid common pitfalls:
-- Testing mock behavior instead of real behavior
-- Adding test-only methods to production classes
-- Mocking without understanding dependencies
+The Batch is the unit of development, verification, review, and suggested commit history.
+Individual tests and RED/GREEN transitions are internal work inside that Batch. Do not pause,
+request review, or create commits for each test unless the user explicitly asks.
+
+Before every Batch, present its goal and complete planned test-case inventory to the user. Do not
+write tests or production code until the user explicitly approves that Batch.
+
+## What Counts as a Batch
+
+A Batch is a coherent behavior slice from an approved implementation plan. It may cross files or
+packages when the contract and its consumers must change together. It must:
+
+- Deliver one reviewable capability or architectural boundary.
+- Include all tests and production changes required to leave the repository GREEN.
+- Avoid unrelated cleanup or behavior assigned to later Batches.
+- End with a clear observable result and verification evidence.
+
+If no approved plan defines the Batch, state the proposed scope and acceptance behavior before
+editing. Ask only when different Batch boundaries would materially change the implementation.
+
+## Batch Workflow
+
+### 1. Brief and Approve the Batch
+
+Before editing tests or production code:
+
+1. Read the relevant design, implementation plan, source, and existing tests.
+2. Confirm that required upstream contracts are available.
+3. Identify design gaps that would change public APIs, persistence, ordering, or error semantics.
+4. Present a Batch briefing containing:
+   - Goal: the user-visible or architectural outcome.
+   - Scope: likely modules/files, important boundaries, and explicit non-goals.
+   - Completion standard: acceptance behavior and verification commands.
+   - Test inventory: every test case planned for the Batch, including new and materially changed
+     cases. For each case, state its scenario or precondition, relevant input/action, expected
+     observable result, and the contract or risk it proves.
+5. Ask the user to approve the Batch and wait for an explicit confirmation.
+
+Read-only discovery is allowed before approval. Writing or modifying tests, fixtures, production
+code, generated implementation artifacts, or commits is not allowed.
+
+Do not invent missing architecture inside implementation. Pause for a design decision when such a
+gap exists.
+
+If implementation later reveals a required test scenario that was not in the approved inventory,
+pause before adding it. Present the test delta and any scope impact, then wait for explicit user
+approval. Mechanical renames or assertion wording changes that do not alter the approved scenario
+do not require a second approval.
+
+### 2. RED: Build the Batch Test Set
+
+Write or update the complete set of tests needed to prove the Batch's acceptance behavior before
+changing production code for that Batch.
+
+The RED test set must match the user-approved inventory.
+
+Requirements:
+
+- Cover normal behavior, important boundaries, and errors included in the Batch.
+- Prefer observable behavior and real collaborators; use mocks only at genuine external
+  boundaries.
+- Keep each test focused, but allow multiple related assertions when together they express one
+  contract.
+- Put a concise comment immediately above every `test(...)` or `it(...)` explaining the
+  scenario and expected observable result.
+- Do not add tests for later Batches merely because nearby code is being touched.
+
+Run the Batch test set and inspect the result:
+
+- The new behavior must fail for the expected missing or incorrect behavior.
+- A missing public contract may produce an expected compile/type failure during RED.
+- Environment, import, syntax, fixture, or test-runner failures are not valid RED; fix the test
+  setup first.
+- If a test passes because the behavior already exists, verify that it truly proves the
+  requirement. Keep it as regression coverage if useful, but ensure every production behavior
+  change in the Batch is motivated by at least one observed failure.
+
+The RED gate applies to the Batch as a whole. It is not necessary to run, review, or hand off each
+test separately.
+
+### 3. GREEN: Implement the Complete Batch
+
+After the Batch RED set is valid, implement all production behavior required by that Batch.
+
+- Work continuously across the Batch; do not stop after making the first test pass.
+- Make the smallest coherent implementation that satisfies the complete Batch contract.
+- Do not implement speculative options, later-Batch features, or unrelated refactors.
+- Keep public API changes and all required consumers in the same Batch so the repository can end
+  GREEN.
+- Re-run targeted tests as needed while implementing, but treat intermediate partial GREEN states
+  as internal progress rather than review boundaries.
+- Put a concise responsibility comment immediately above every production function, class method,
+  constructor with non-obvious setup, or function-valued variable introduced or changed in the
+  Batch. Explain important boundaries or side effects without narrating the code.
+
+If production code for the current Batch was written before its RED set, revert those production
+edits and restart the Batch from tests. Do not delete unrelated pre-existing code.
+
+### 4. REFACTOR: Clean Up Within the Batch
+
+Only after the Batch test set is GREEN:
+
+- Remove duplication introduced by the Batch.
+- Improve names and extract helpers where they clarify the implemented boundary.
+- Keep behavior and tests stable.
+- Do not use refactoring as a reason to absorb unrelated work.
+
+For a pure behavior-preserving refactor Batch, establish a GREEN characterization baseline first,
+then refactor while continuously preserving it. The RED requirement applies to new or changed
+observable behavior, not to a refactor whose contract intentionally remains unchanged.
+
+### 5. Verify the Batch
+
+Before declaring the Batch complete:
+
+1. Run the Batch's targeted tests.
+2. Run impacted regression tests.
+3. Run the plan-required typecheck, lint, formatting, build, and broader tests.
+4. Confirm output contains no unexplained errors or warnings.
+5. Review the diff for scope drift, test-only production APIs, accidental public exports, and
+   changes belonging to later Batches.
+
+Never commit or hand off a RED repository.
+
+### 6. Hand Off at the Batch Boundary
+
+Report:
+
+- The capability completed.
+- The main files or modules changed.
+- RED evidence observed before implementation.
+- GREEN and regression commands executed.
+- Any design deviation, residual risk, or deferred work.
+
+Pause for review after the Batch by default. If the user explicitly authorizes continuous
+multi-Batch execution, still complete and verify each Batch independently before starting the next
+one.
+
+A Batch is a suggested commit boundary, but execute `git commit` only when the user explicitly
+authorizes it.
+
+## Bugs and Regressions
+
+For a bug-fix Batch:
+
+1. Add the complete regression test set that reproduces the bug and relevant edge cases.
+2. Observe the expected RED result.
+3. Implement the fix across the Batch.
+4. Verify the new regression tests and impacted existing tests are GREEN.
+
+Never fix a bug first and add the regression test afterward.
+
+## Test Quality
+
+- Test behavior, not private implementation details.
+- Prefer real code over mocks; mock only boundaries that are slow, nondeterministic, destructive,
+  or external.
+- Do not assert that a mock merely exists or was configured.
+- Do not add production methods used only by tests.
+- Use controllable promises, barriers, fake clocks, or deterministic fakes for concurrency; do not
+  depend on timing sleeps.
+- Read [testing-anti-patterns.md](./testing-anti-patterns.md) before adding mocks, test utilities,
+  or test-only seams.
+
+## Comment Quality
+
+### Tests
+
+Comments above test cases must explain the setup or input, the behavior exercised, and the expected
+observable result. Do not merely repeat the test name.
+
+### Production
+
+Responsibility comments must explain what the function or method does and mention important side
+effects or boundaries when relevant. Do not translate the symbol name or narrate individual
+statements.
+
+## Stop Conditions
+
+Stop the Batch and ask for direction when:
+
+- The user has not explicitly approved the Batch briefing and test inventory.
+- The approved design cannot express a required public contract or durable boundary.
+- A required upstream Batch is missing or incompatible.
+- Passing the tests would require materially expanding the agreed Batch.
+- A required test scenario was not included in the approved inventory.
+- Existing user changes overlap in a way that cannot be preserved safely.
+
+Do not stop merely because the Batch contains multiple tests, files, or packages. That is expected.
+
+## Batch Completion Checklist
+
+- [ ] Batch scope and acceptance behavior were established before editing.
+- [ ] The Batch goal, completion standard, and every planned test case were explained to the user.
+- [ ] The user explicitly approved the Batch before any test or production edit.
+- [ ] The implemented RED test set matches the approved inventory or an approved test delta.
+- [ ] The complete Batch test set was written before production changes.
+- [ ] New or changed behavior was observed failing for the expected reason.
+- [ ] Production changes stayed within the Batch.
+- [ ] Tests and production code land together.
+- [ ] Test and production responsibility comments meet project rules.
+- [ ] Targeted and impacted regression tests pass.
+- [ ] Required typecheck, lint, formatting, and build checks pass.
+- [ ] The repository is GREEN at the Batch boundary.
+- [ ] The handoff reports evidence, risks, and deferred work.
 
 ## Final Rule
 
+```text
+Batch scope
+  → explain goal and every planned test case
+  → explicit user approval
+  → complete Batch RED test set
+  → verify expected failures
+  → implement the complete Batch
+  → GREEN
+  → refactor
+  → full Batch verification
+  → review / authorized commit
 ```
-Production code → test exists and failed first
-Otherwise → not TDD
-```
-
-No exceptions without your human partner's permission.
