@@ -800,7 +800,7 @@ describe("AgentLoop.runTurn", () => {
       content: '{"ok":true,"data":"result:docs"}',
     });
     expect(history[3]).toMatchObject({ role: "assistant", content: "found docs" });
-    expect(result.finalMessage).toBe(history[3]);
+    expect(result.finalMessage).toEqual(history[3]);
   });
 
   // 验证一次工具 turn 的 Loop 事件包含上下文、模型和工具阶段，并保持发生顺序。

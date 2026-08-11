@@ -1,34 +1,19 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SqliteSessionStore, type SessionStore } from "@byte-mentor/session";
+import { SqliteSessionStore } from "@byte-mentor/session";
+import type { SessionId } from "@byte-mentor/core";
+import { runStoreContractTests, validCreateInput } from "./store-contract.js";
 
-interface RawStatement {
-  get(...args: unknown[]): unknown;
-  run(...args: unknown[]): unknown;
-}
-
-interface RawDatabase {
-  prepare(sql: string): RawStatement;
-  pragma(sql: string): unknown;
-  close(): void;
-}
-
-const requireFromSession = createRequire(
-  new URL("../../packages/session/package.json", import.meta.url),
-);
-const RawDatabase = requireFromSession("better-sqlite3") as new (dbPath: string) => RawDatabase;
+// SQLite 实现注册同一份 Store contract 测试，并额外覆盖 schema/PRAGMA/约束/错误归一化。
 
 const tmpDirs: string[] = [];
-
 async function createDbPath(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "byte-mentor-sqlite-store-"));
   tmpDirs.push(dir);
   return join(dir, "session.sqlite");
 }
-
 async function createStore(): Promise<SqliteSessionStore> {
   return new SqliteSessionStore({ dbPath: await createDbPath() });
 }
@@ -37,229 +22,222 @@ afterEach(async () => {
   await Promise.all(tmpDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-describe("SqliteSessionStore create", () => {
-  it("returns a retrievable session", async () => {
-    const store = await createStore();
-
-    const session = await store.create();
-
-    expect(typeof session.id).toBe("string");
-    expect(session.id.length).toBeGreaterThan(0);
-    await expect(store.get(session.id)).resolves.toEqual(session);
-  });
-
-  it("returns empty metadata", async () => {
-    const store = await createStore();
-
-    const session = await store.create();
-
-    expect(session.metadata).toEqual({});
-    await expect(store.get(session.id)).resolves.toEqual({
-      id: session.id,
-      metadata: {},
-    });
-  });
-
-  it("returns undefined for an unknown sessionId", async () => {
-    const store = await createStore();
-    const unknownId = "00000000-0000-4000-8000-000000000000" as never;
-
-    await expect(store.get(unknownId)).resolves.toBeUndefined();
+describe("SqliteSessionStore contract", () => {
+  runStoreContractTests({
+    label: "sqlite",
+    async create() {
+      return new SqliteSessionStore({ dbPath: await createDbPath() });
+    },
+    async close(store) {
+      await store.close();
+    },
   });
 });
 
-describe("SqliteSessionStore metadata", () => {
-  it("updateMetadata persists metadata and get reads it back", async () => {
-    const store = await createStore();
-    const session = await store.create();
-
-    await expect(store.updateMetadata(session.id, () => ({ a: 1 }))).resolves.toEqual({ a: 1 });
-
-    await expect(store.get(session.id)).resolves.toEqual({
-      id: session.id,
-      metadata: { a: 1 },
-    });
-  });
-
-  it("updateMetadata updater receives previous metadata", async () => {
-    const store = await createStore();
-    const session = await store.create();
-
-    await store.updateMetadata(session.id, () => ({ a: 1 }));
-    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, b: 2 }));
-
-    await expect(store.get(session.id)).resolves.toEqual({
-      id: session.id,
-      metadata: { a: 1, b: 2 },
-    });
-  });
-
-  it("restores metadata after reopening the same database file", async () => {
+describe("SqliteSessionStore reopen persistence", () => {
+  it("restores snapshot, entries, and metadata after reopening the same database file", async () => {
     const dbPath = await createDbPath();
-    const firstStore = new SqliteSessionStore({ dbPath });
-    const session = await firstStore.create();
-    await firstStore.updateMetadata(session.id, () => ({ a: 1 }));
-    await firstStore.close();
+    const first = new SqliteSessionStore({ dbPath });
+    const session = await first.createSession(validCreateInput);
+    await first.updateMetadata(session.id, () => ({ a: 1 }));
+    await first.appendMessages(session.id, [{ role: "user", content: "persist me" }]);
+    await first.close();
 
-    const secondStore = new SqliteSessionStore({ dbPath });
-
-    await expect(secondStore.get(session.id)).resolves.toEqual({
-      id: session.id,
-      metadata: { a: 1 },
-    });
-    await secondStore.close();
+    const second = new SqliteSessionStore({ dbPath });
+    try {
+      const loaded = await second.loadSession(session.id);
+      expect(loaded).toBeDefined();
+      expect(loaded?.workspaceRoot).toBe("/workspace/a");
+      expect(loaded?.initialThinkingLevel).toBe("medium");
+      expect(loaded?.metadata).toEqual({ a: 1 });
+      expect(loaded?.entries).toHaveLength(1);
+      expect(loaded?.entries[0].type).toBe("user");
+      const history = await second.getHistory(session.id);
+      expect(history.map(({ role, content }) => ({ role, content }))).toEqual([
+        { role: "user", content: "persist me" },
+      ]);
+    } finally {
+      await second.close();
+    }
   });
 });
 
-describe("SqliteSessionStore history", () => {
-  it("appends messages preserving order across calls", async () => {
+describe("SqliteSessionStore schema", () => {
+  it("creates sessions with all new columns and session_entries, without the legacy messages table", async () => {
     const store = await createStore();
-    const session = await store.create();
-    const first = { role: "user" as const, content: "q1" };
-    const second = { role: "assistant" as const, content: "a1" };
-    const third = { role: "user" as const, content: "q2" };
-
-    await store.appendMessages(session.id, [first]);
-    await store.appendMessages(session.id, [second, third]);
-
-    await expect(store.getHistory(session.id)).resolves.toEqual([first, second, third]);
+    const db = (store as SqliteSessionStore).dbForTest();
+    const columns = db.prepare("PRAGMA table_info(sessions)").all() as { name: string }[];
+    const columnNames = columns.map((c) => c.name).sort();
+    expect(columnNames).toEqual(
+      [
+        "active_leaf_id",
+        "created_at",
+        "id",
+        "initial_model_id",
+        "initial_provider",
+        "initial_thinking_level",
+        "metadata_json",
+        "next_entry_seq",
+        "updated_at",
+        "workspace_root",
+      ].sort(),
+    );
+    const entryTables = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('session_entries', 'messages')",
+      )
+      .all() as { name: string }[];
+    expect(entryTables.map((t) => t.name)).toEqual(["session_entries"]);
+    await store.close();
   });
 
-  it("returns an empty history for an unknown sessionId", async () => {
+  it("applies foreign_keys, WAL, synchronous=FULL, and busy_timeout pragmas", async () => {
     const store = await createStore();
-    const unknownId = "00000000-0000-4000-8000-000000000000" as never;
-
-    await expect(store.getHistory(unknownId)).resolves.toEqual([]);
+    const db = (store as SqliteSessionStore).dbForTest();
+    expect(db.pragma("foreign_keys", { simple: true })).toBe(1);
+    expect(db.pragma("journal_mode", { simple: true })).toBe("wal");
+    expect(db.pragma("synchronous", { simple: true })).toBe(2); // FULL
+    expect(db.pragma("busy_timeout", { simple: true })).toBe(5000);
+    await store.close();
   });
 
-  it("restores appended history after reopening the same database file", async () => {
-    const dbPath = await createDbPath();
-    const firstStore = new SqliteSessionStore({ dbPath });
-    const session = await firstStore.create();
-    const message = { role: "user" as const, content: "persist me" };
-    await firstStore.appendMessages(session.id, [message]);
-    await firstStore.close();
-
-    const secondStore = new SqliteSessionStore({ dbPath });
-
-    await expect(secondStore.get(session.id)).resolves.toEqual(session);
-    await expect(secondStore.getHistory(session.id)).resolves.toEqual([message]);
-    await secondStore.close();
-  });
-
-  it("allows close to be called more than once", async () => {
+  it("rejects an entry whose sequence duplicates an existing sequence in the session", async () => {
     const store = await createStore();
-
-    await store.close();
-
-    await expect(store.close()).resolves.toBeUndefined();
-  });
-
-  it("rejects create after close with SessionStoreClosedError", async () => {
-    const store = await createStore();
-
-    await store.close();
-
-    await expect(store.create()).rejects.toMatchObject({
-      name: "SessionStoreClosedError",
-    });
-  });
-
-  it("rejects get after close with SessionStoreClosedError", async () => {
-    const store = await createStore();
-    const session = await store.create();
-
-    await store.close();
-
-    await expect(store.get(session.id)).rejects.toMatchObject({
-      name: "SessionStoreClosedError",
-    });
-  });
-
-  it("rejects appendMessages after close with SessionStoreClosedError", async () => {
-    const store = await createStore();
-    const session = await store.create();
-
-    await store.close();
-
-    await expect(
-      store.appendMessages(session.id, [{ role: "user", content: "after close" }]),
-    ).rejects.toMatchObject({
-      name: "SessionStoreClosedError",
-    });
-  });
-
-  it("rejects getHistory after close with SessionStoreClosedError", async () => {
-    const store = await createStore();
-    const session = await store.create();
-
-    await store.close();
-
-    await expect(store.getHistory(session.id)).rejects.toMatchObject({
-      name: "SessionStoreClosedError",
-    });
-  });
-
-  it("rejects updateMetadata after close with SessionStoreClosedError", async () => {
-    const store: SessionStore = await createStore();
-    const session = await store.create();
-
-    await store.close();
-
-    await expect(store.updateMetadata(session.id, () => ({ a: 1 }))).rejects.toMatchObject({
-      name: "SessionStoreClosedError",
-    });
-  });
-});
-
-describe("SqliteSessionStore schema constraints", () => {
-  it("rejects messages for an unknown sessionId", async () => {
-    const store = await createStore();
-    const unknownId = "00000000-0000-4000-8000-000000000000" as never;
-
-    await expect(
-      store.appendMessages(unknownId, [{ role: "user", content: "orphan" }]),
-    ).rejects.toThrow();
-  });
-
-  it("cascades messages when a session is deleted", async () => {
-    const dbPath = await createDbPath();
-    const store = new SqliteSessionStore({ dbPath });
-    const session = await store.create();
-    await store.appendMessages(session.id, [{ role: "user", content: "delete me" }]);
-    await store.close();
-    const db = new RawDatabase(dbPath);
-    db.pragma("foreign_keys = ON");
-
-    db.prepare("DELETE FROM sessions WHERE id = ?").run(session.id);
-    const row = db
-      .prepare("SELECT COUNT(*) AS count FROM messages WHERE session_id = ?")
-      .get(session.id) as { count: number };
-
-    expect(row.count).toBe(0);
-    db.close();
-  });
-
-  it("rejects duplicate message sequence numbers within a session", async () => {
-    const dbPath = await createDbPath();
-    const store = new SqliteSessionStore({ dbPath });
-    const session = await store.create();
-    await store.appendMessages(session.id, [{ role: "user", content: "first" }]);
-    await store.close();
-    const db = new RawDatabase(dbPath);
-
+    const session = await store.createSession(validCreateInput);
+    const db = (store as SqliteSessionStore).dbForTest();
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+       VALUES (?, 'e1', 1, NULL, 'user', ?, '{"content":"a"}')`,
+    ).run(session.id, now);
     expect(() =>
       db
         .prepare(
-          "INSERT INTO messages (session_id, seq, role, message_json, created_at) VALUES (?, 1, ?, ?, ?)",
+          `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+           VALUES (?, 'e2', 1, NULL, 'user', ?, '{"content":"b"}')`,
         )
-        .run(
-          session.id,
-          "user",
-          JSON.stringify({ role: "user", content: "duplicate" }),
-          new Date().toISOString(),
-        ),
+        .run(session.id, now),
     ).toThrow();
-    db.close();
+    await store.close();
+  });
+
+  it("rejects an invalid thinking level via the sessions CHECK constraint", async () => {
+    const store = await createStore();
+    const db = (store as SqliteSessionStore).dbForTest();
+    const now = new Date().toISOString();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO sessions (id, workspace_root, initial_provider, initial_model_id,
+             initial_thinking_level, next_entry_seq, metadata_json, created_at, updated_at)
+           VALUES ('s-bad', '/w', 'openai', 'gpt-5', 'ultra', 1, '{}', ?, ?)`,
+        )
+        .run(now, now),
+    ).toThrow();
+    await store.close();
+  });
+
+  it("rejects an invalid entry type via the session_entries CHECK constraint", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    const db = (store as SqliteSessionStore).dbForTest();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+           VALUES (?, 'e1', 1, NULL, 'hologram', ?, '{}')`,
+        )
+        .run(session.id, new Date().toISOString()),
+    ).toThrow();
+    await store.close();
+  });
+
+  it("rejects payload_json that is not valid JSON", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    const db = (store as SqliteSessionStore).dbForTest();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+           VALUES (?, 'e1', 1, NULL, 'user', ?, '{not-json')`,
+        )
+        .run(session.id, new Date().toISOString()),
+    ).toThrow();
+    await store.close();
+  });
+
+  it("cascades entry deletion when a session is deleted", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    const db = (store as SqliteSessionStore).dbForTest();
+    db.prepare(
+      `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+       VALUES (?, 'e1', 1, NULL, 'user', ?, '{"content":"delete me"}')`,
+    ).run(session.id, new Date().toISOString());
+    db.prepare("DELETE FROM sessions WHERE id = ?").run(session.id);
+    const row = db
+      .prepare("SELECT COUNT(*) AS count FROM session_entries WHERE session_id = ?")
+      .get(session.id) as { count: number };
+    expect(row.count).toBe(0);
+    await store.close();
+  });
+
+  it("rejects a non-null active_leaf_id that does not exist in the session", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    const db = (store as SqliteSessionStore).dbForTest();
+    expect(() =>
+      db.prepare("UPDATE sessions SET active_leaf_id = 'ghost' WHERE id = ?").run(session.id),
+    ).toThrow();
+    await store.close();
+  });
+});
+
+describe("SqliteSessionStore error normalization", () => {
+  it("maps constraint violations to SessionStoreError with kind constraint", async () => {
+    const store = await createStore();
+    const db = (store as SqliteSessionStore).dbForTest();
+    const now = new Date().toISOString();
+    expect(() =>
+      db
+        .prepare(
+          `INSERT INTO session_entries (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+           VALUES ('no-such-session', 'e1', 1, NULL, 'user', ?, '{"content":"x"}')`,
+        )
+        .run(now),
+    ).toThrow();
+    await store.close();
+  });
+
+  it("throws SessionStoreError with kind closed after close", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    await store.close();
+    await expect(store.createSession(validCreateInput)).rejects.toMatchObject({
+      name: "SessionStoreClosedError",
+      kind: "closed",
+    });
+    await expect(store.loadSession(session.id)).rejects.toMatchObject({
+      name: "SessionStoreClosedError",
+      kind: "closed",
+    });
+  });
+
+  it("throws SessionNotFoundError when appending to an unknown session", async () => {
+    const store = await createStore();
+    const unknownId = "00000000-0000-4000-8000-000000000000" as SessionId;
+    await expect(
+      store.appendMessages(unknownId, [{ role: "user", content: "orphan" }]),
+    ).rejects.toMatchObject({ name: "SessionNotFoundError" });
+    await store.close();
+  });
+});
+
+describe("SqliteSessionStore close", () => {
+  it("allows close to be called more than once", async () => {
+    const store = await createStore();
+    await store.close();
+    await expect(store.close()).resolves.toBeUndefined();
   });
 });
