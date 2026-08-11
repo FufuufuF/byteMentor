@@ -67,6 +67,38 @@ export class SessionStoreClosedError extends SessionStoreError {
   }
 }
 
+// 批量提交时 active leaf 与 expectedLeafId 不一致（并发下 leaf 已变或调用方持有过期快照）。
+// 属于 M9 D 级"当前操作失败"，不是存储错误；不写任何 entry、不推进 leaf/seq、不清 checkpoint。
+export class SessionLeafConflictError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionLeafConflictError";
+  }
+}
+
+// Turn 批量提交中的一条 pending entry：不含 sequence（事务内从 next_entry_seq 分配）与
+// parentId（第一条接当前 active leaf，后续依次连接前一条）；id/createdAt 未提供时由事务生成。
+// DistributiveOmit 保留 union 收窄。
+export type PendingTurnEntry = {
+  entry: DistributiveOmit<SessionEntry, "sequence" | "parentId" | "id" | "createdAt"> &
+    Partial<Pick<SessionEntry, "id" | "createdAt">>;
+};
+
+// 保留 discriminated union 结构地省略公共字段的类型工具。
+export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
+
+export interface CommitTurnInput {
+  sessionId: SessionId;
+  // 事务内校验当前 active_leaf_id 仍等于该值；不匹配时抛 SessionLeafConflictError。
+  expectedLeafId: SessionEntry["id"] | null;
+  entries: PendingTurnEntry[];
+}
+
+export interface CommitTurnResult {
+  activeLeafId: SessionEntry["id"];
+  nextEntrySeq: number;
+}
+
 export interface SessionStore {
   // 创建一个持久化 Session；返回初始 snapshot。
   createSession(input: CreateSessionInput): Promise<SessionSnapshot>;
@@ -79,6 +111,13 @@ export interface SessionStore {
     id: SessionId,
     updater: (metadata: SessionMetadata) => SessionMetadata,
   ): Promise<SessionMetadata>;
+  // 单语句写入 runtime_checkpoint（json_set），不读改写整个 metadata；返回更新后的 metadata。
+  setRuntimeCheckpoint(id: SessionId, checkpoint: unknown): Promise<SessionMetadata>;
+  // 单语句移除 runtime_checkpoint（json_remove），保留其他 metadata 字段；返回更新后的 metadata。
+  clearRuntimeCheckpoint(id: SessionId): Promise<SessionMetadata>;
+  // Turn 最终提交/恢复提交共用的批量追加事务：短 BEGIN IMMEDIATE 内校验 leaf、连续分配 seq、
+  // 批量插入、推进 leaf/seq、清除 runtime_checkpoint，全有或全无。
+  commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult>;
   close(): Promise<void>;
 
   /** @deprecated 仅短期兼容未迁移的 AgentLoop；AgentLoop 迁移到新契约后（B3 收尾）删除。 */

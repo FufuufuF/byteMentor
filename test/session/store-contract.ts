@@ -105,6 +105,170 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
   });
+
+  describe(`SessionStore transactional writes (${factory.label})`, () => {
+    it("commits a batch to an empty session: first entry rooted at null, leaf advances, seq starts at 1", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const result = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [
+            { entry: { type: "user", content: "q1" } },
+            {
+              entry: {
+                type: "assistant",
+                content: "a1",
+                toolCalls: [],
+                model: { provider: "openai", modelId: "gpt-5" },
+                stopReason: "completed",
+              },
+            },
+          ],
+        });
+        expect(result.activeLeafId).toBeDefined();
+        const loaded = await store.loadSession(session.id);
+        expect(loaded?.entries).toHaveLength(2);
+        expect(loaded?.entries[0].sequence).toBe(1);
+        expect(loaded?.entries[0].parentId).toBeNull();
+        expect(loaded?.entries[1].parentId).toBe(loaded?.entries[0].id);
+        expect(loaded?.entries[1].sequence).toBe(2);
+        expect(loaded?.activeLeafId).toBe(loaded?.entries[1].id);
+        expect(loaded?.nextEntrySeq).toBe(3);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("commits a batch after an existing leaf: first entry chains to the current leaf", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        const second = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: first.activeLeafId,
+          entries: [{ entry: { type: "user", content: "q2" } }],
+        });
+        const loaded = await store.loadSession(session.id);
+        expect(loaded?.entries).toHaveLength(2);
+        expect(loaded?.entries[1].parentId).toBe(loaded?.entries[0].id);
+        expect(loaded?.entries[1].sequence).toBe(2);
+        expect(loaded?.activeLeafId).toBe(second.activeLeafId);
+        expect(loaded?.nextEntrySeq).toBe(3);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("clears runtime_checkpoint in the same commit as the entries", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
+        await store.updateMetadata(session.id, (metadata) => ({ ...metadata, keep: 1 }));
+        await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        const metadata = await store.getMetadata(session.id);
+        expect(metadata).toEqual({ keep: 1 });
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects when expectedLeafId does not match the current leaf, leaving everything unchanged", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        await store.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
+        await expect(
+          store.commitTurnEntries({
+            sessionId: session.id,
+            expectedLeafId: "stale-leaf-id",
+            entries: [{ entry: { type: "user", content: "q2" } }],
+          }),
+        ).rejects.toMatchObject({ name: "SessionLeafConflictError" });
+        const loaded = await store.loadSession(session.id);
+        expect(loaded?.entries).toHaveLength(1);
+        expect(loaded?.activeLeafId).toBe(first.activeLeafId);
+        expect(loaded?.nextEntrySeq).toBe(2);
+        expect(loaded?.metadata).toEqual({ runtime_checkpoint: { phase: "awaiting_tools" } });
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects an empty batch as a constraint violation", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await expect(
+          store.commitTurnEntries({
+            sessionId: session.id,
+            expectedLeafId: null,
+            entries: [],
+          }),
+        ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+      } finally {
+        await factory.close(store);
+      }
+    });
+  });
+
+  describe(`SessionStore runtime checkpoint (${factory.label})`, () => {
+    it("setRuntimeCheckpoint stores a JSON value under runtime_checkpoint and preserves other metadata", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await store.updateMetadata(session.id, (metadata) => ({ ...metadata, keep: 1 }));
+        await store.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
+        const metadata = await store.getMetadata(session.id);
+        expect(metadata).toEqual({ keep: 1, runtime_checkpoint: { phase: "awaiting_tools" } });
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("setRuntimeCheckpoint overwrites a previous checkpoint value", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await store.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
+        await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
+        const metadata = await store.getMetadata(session.id);
+        expect(metadata).toEqual({ runtime_checkpoint: { phase: "ready_for_iteration" } });
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("clearRuntimeCheckpoint removes only the checkpoint key", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await store.updateMetadata(session.id, (metadata) => ({ ...metadata, keep: 1 }));
+        await store.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
+        await store.clearRuntimeCheckpoint(session.id);
+        const metadata = await store.getMetadata(session.id);
+        expect(metadata).toEqual({ keep: 1 });
+      } finally {
+        await factory.close(store);
+      }
+    });
+  });
 }
 
 // 断言辅助：验证错误属于归一化 SessionStoreError 且 kind 匹配。

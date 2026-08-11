@@ -1,9 +1,13 @@
 import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import { createSessionId } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
-import { encodeMessagesToEntries } from "./entry-codec.js";
+import { encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
 import {
+  SessionLeafConflictError,
   SessionNotFoundError,
+  SessionStoreError,
+  type CommitTurnInput,
+  type CommitTurnResult,
   type CreateSessionInput,
   type Session,
   type SessionMetadata,
@@ -68,6 +72,52 @@ export class InMemorySessionStore implements SessionStore {
     record.metadata = metadata;
     record.updatedAt = new Date().toISOString();
     return { ...metadata };
+  }
+
+  async setRuntimeCheckpoint(id: SessionId, checkpoint: unknown): Promise<SessionMetadata> {
+    const record = this.requireSession(id);
+    record.metadata = { ...record.metadata, runtime_checkpoint: checkpoint };
+    record.updatedAt = new Date().toISOString();
+    return { ...record.metadata };
+  }
+
+  async clearRuntimeCheckpoint(id: SessionId): Promise<SessionMetadata> {
+    const record = this.requireSession(id);
+    const { runtime_checkpoint: _removed, ...rest } = record.metadata;
+    record.metadata = rest;
+    record.updatedAt = new Date().toISOString();
+    return { ...record.metadata };
+  }
+
+  async commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult> {
+    const record = this.requireSession(input.sessionId);
+    if (input.entries.length === 0) {
+      throw new SessionStoreError("constraint", "commitTurnEntries requires at least one entry");
+    }
+    if (record.activeLeafId !== input.expectedLeafId) {
+      throw new SessionLeafConflictError(
+        `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(record.activeLeafId)}`,
+      );
+    }
+    const now = new Date().toISOString();
+    let parentId = record.activeLeafId;
+    for (const { entry } of input.entries) {
+      const materialized: SessionEntry = {
+        ...entry,
+        id: entry.id ?? randomEntryId(),
+        sequence: record.nextEntrySeq,
+        parentId,
+        createdAt: entry.createdAt ?? now,
+      } as SessionEntry;
+      record.entries.push(materialized);
+      parentId = materialized.id;
+      record.nextEntrySeq += 1;
+    }
+    record.activeLeafId = parentId;
+    delete record.metadata.runtime_checkpoint;
+    record.updatedAt = now;
+    // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
+    return { activeLeafId: parentId as string, nextEntrySeq: record.nextEntrySeq };
   }
 
   async close(): Promise<void> {}

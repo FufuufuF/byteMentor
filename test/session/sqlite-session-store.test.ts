@@ -194,6 +194,75 @@ describe("SqliteSessionStore schema", () => {
   });
 });
 
+describe("SqliteSessionStore checkpoint and commit persistence", () => {
+  it("persists committed entries and runtime_checkpoint across reopen", async () => {
+    const dbPath = await createDbPath();
+    const first = new SqliteSessionStore({ dbPath });
+    const session = await first.createSession(validCreateInput);
+    await first.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
+    await first.commitTurnEntries({
+      sessionId: session.id,
+      expectedLeafId: null,
+      entries: [{ entry: { type: "user", content: "persist me" } }],
+    });
+    await first.close();
+
+    const second = new SqliteSessionStore({ dbPath });
+    try {
+      const loaded = await second.loadSession(session.id);
+      expect(loaded?.entries).toHaveLength(1);
+      expect(loaded?.entries[0]).toMatchObject({ type: "user", content: "persist me" });
+      expect(loaded?.activeLeafId).toBe(loaded?.entries[0].id);
+      expect(loaded?.metadata).toEqual({});
+    } finally {
+      await second.close();
+    }
+  });
+
+  it("setRuntimeCheckpoint uses a single JSON update without clobbering other metadata fields", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    await store.updateMetadata(session.id, (metadata) => ({ ...metadata, keep: "value" }));
+    await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
+    const db = (store as SqliteSessionStore).dbForTest();
+    const row = db.prepare("SELECT metadata_json FROM sessions WHERE id = ?").get(session.id) as {
+      metadata_json: string;
+    };
+    expect(JSON.parse(row.metadata_json)).toEqual({
+      keep: "value",
+      runtime_checkpoint: { phase: "ready_for_iteration" },
+    });
+    await store.close();
+  });
+
+  it("rolls back the whole batch when a constraint fails mid-insert", async () => {
+    const store = await createStore();
+    const session = await store.createSession(validCreateInput);
+    await store.commitTurnEntries({
+      sessionId: session.id,
+      expectedLeafId: null,
+      entries: [{ entry: { type: "user", content: "q1" } }],
+    });
+    const loadedBefore = await store.loadSession(session.id);
+    const firstId = loadedBefore?.entries[0]?.id;
+    await expect(
+      store.commitTurnEntries({
+        sessionId: session.id,
+        expectedLeafId: loadedBefore?.activeLeafId ?? null,
+        entries: [
+          { entry: { type: "user", content: "q2" } },
+          { entry: { type: "user", content: "q3", id: firstId } }, // duplicate id
+        ],
+      }),
+    ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+    const loadedAfter = await store.loadSession(session.id);
+    expect(loadedAfter?.entries).toHaveLength(1);
+    expect(loadedAfter?.activeLeafId).toBe(loadedBefore?.activeLeafId);
+    expect(loadedAfter?.nextEntrySeq).toBe(2);
+    await store.close();
+  });
+});
+
 describe("SqliteSessionStore error normalization", () => {
   it("maps constraint violations to SessionStoreError with kind constraint", async () => {
     const store = await createStore();

@@ -2,11 +2,14 @@ import Database from "better-sqlite3";
 import { createSessionId } from "@byte-mentor/core";
 import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
-import { decodeEntry, encodeEntry, encodeMessagesToEntries } from "./entry-codec.js";
+import { decodeEntry, encodeEntry, encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
 import {
+  SessionLeafConflictError,
   SessionNotFoundError,
   SessionStoreClosedError,
   SessionStoreError,
+  type CommitTurnInput,
+  type CommitTurnResult,
   type CreateSessionInput,
   type Session,
   type SessionMetadata,
@@ -156,6 +159,125 @@ export class SqliteSessionStore implements SessionStore {
       })();
       return metadata;
     } catch (error) {
+      throw normalizeError(error);
+    }
+  }
+
+  async setRuntimeCheckpoint(id: SessionId, checkpoint: unknown): Promise<SessionMetadata> {
+    this.assertOpen();
+    try {
+      const row = this.db
+        .prepare(
+          `UPDATE sessions
+           SET metadata_json = json_set(metadata_json, '$.runtime_checkpoint', json(:checkpoint_json)),
+               updated_at = :now
+           WHERE id = :id
+           RETURNING metadata_json`,
+        )
+        .get({ id, checkpoint_json: JSON.stringify(checkpoint), now: new Date().toISOString() }) as
+        { metadata_json: string } | undefined;
+      if (row === undefined) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+      return parseMetadata(row.metadata_json);
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async clearRuntimeCheckpoint(id: SessionId): Promise<SessionMetadata> {
+    this.assertOpen();
+    try {
+      const row = this.db
+        .prepare(
+          `UPDATE sessions
+           SET metadata_json = json_remove(metadata_json, '$.runtime_checkpoint'),
+               updated_at = :now
+           WHERE id = :id
+           RETURNING metadata_json`,
+        )
+        .get({ id, now: new Date().toISOString() }) as { metadata_json: string } | undefined;
+      if (row === undefined) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+      return parseMetadata(row.metadata_json);
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult> {
+    this.assertOpen();
+    try {
+      return this.db.transaction(() => {
+        const row = this.sessionRow(input.sessionId);
+        if (row === undefined) {
+          throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+        }
+        if (input.entries.length === 0) {
+          throw new SessionStoreError(
+            "constraint",
+            "commitTurnEntries requires at least one entry",
+          );
+        }
+        if (row.active_leaf_id !== input.expectedLeafId) {
+          throw new SessionLeafConflictError(
+            `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+          );
+        }
+        const now = new Date().toISOString();
+        let parentId = row.active_leaf_id;
+        let nextSeq = row.next_entry_seq;
+        for (const { entry } of input.entries) {
+          const materialized = {
+            ...entry,
+            id: entry.id ?? randomEntryId(),
+            sequence: nextSeq,
+            parentId,
+            createdAt: entry.createdAt ?? now,
+          } as SessionEntry;
+          const encoded = encodeEntry(materialized);
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+                 (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              input.sessionId,
+              encoded.id,
+              encoded.entry_seq,
+              encoded.parent_id,
+              encoded.type,
+              encoded.created_at,
+              encoded.payload_json,
+            );
+          parentId = materialized.id;
+          nextSeq += 1;
+        }
+        this.db
+          .prepare(
+            `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 metadata_json = json_remove(metadata_json, '$.runtime_checkpoint'),
+                 updated_at = :now
+             WHERE id = :id`,
+          )
+          .run({ leaf: parentId, seq: nextSeq, now, id: input.sessionId });
+        // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
+        return { activeLeafId: parentId as string, nextEntrySeq: nextSeq };
+      })();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
       throw normalizeError(error);
     }
   }
