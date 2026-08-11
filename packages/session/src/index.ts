@@ -3,4 +3,6 @@ export * from "./entry-codec.js";
 export * from "./entry-validation.js";
 export * from "./in-memory-session-store.js";
 export * from "./session-store.js";
+export * from "./session-tree.js";
 export * from "./sqlite-session-store.js";
+export * from "./state-replay.js";

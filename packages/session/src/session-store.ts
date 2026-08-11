@@ -1,4 +1,4 @@
-import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
+import type { Message, ModelRef, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
 
 // SessionStore 领域契约：只暴露领域原子能力，不包含 provider、Runtime 或 UI 决策。
@@ -14,6 +14,9 @@ export interface CreateSessionInput {
 
 // Session 的完整持久化快照：初始状态、活动分支指针、追加序号、metadata 与全量 Entry 树。
 // entries 按 (session_id, entry_seq) 升序返回，供领域层在内存重建 id/children 索引。
+//
+// 命名计划：deprecated 线性适配入口删除（AgentLoop 迁移完成）后，本类型应重命名为 `Session`，
+// 届时不再使用 `SessionSnapshot` 命名；旧的 `Session` 遗留接口届时已删除，名称可回收。
 export interface SessionSnapshot {
   id: SessionId;
   workspaceRoot: string;
@@ -31,6 +34,7 @@ export interface SessionSnapshot {
 export type SessionMetadata = Record<string, unknown>;
 
 // deprecated 线性适配入口的历史遗留返回类型：仅 metadata 子集，供未迁移的 AgentLoop 使用。
+// 迁移完成后本类型删除；届时 `Session` 名称由 `SessionSnapshot` 重命名接替（见其上注释）。
 export interface Session {
   id: SessionId;
   metadata: SessionMetadata;
@@ -75,6 +79,45 @@ export class SessionLeafConflictError extends Error {
     this.name = "SessionLeafConflictError";
   }
 }
+
+// M4.1 活动路径/Entry 树结构损坏分类：严格失败策略，不截断、不自动修复。
+export type SessionCorruptionCode =
+  | "leaf-missing"
+  | "parent-missing"
+  | "parent-cycle"
+  | "parent-seq-order"
+  | "invalid-entry-structure";
+
+// Session 树结构损坏的领域错误（M9 B 级：Session 损坏，当前 Session 禁止继续，应用可继续）。
+// 携带 code 供上层诊断/展示，不继承存储错误。
+export class SessionCorruptedError extends Error {
+  readonly code: SessionCorruptionCode;
+
+  constructor(code: SessionCorruptionCode, message: string) {
+    super(message);
+    this.name = "SessionCorruptedError";
+    this.code = code;
+  }
+}
+
+// 活动路径重建的返回类型：ok 时给出根到 leaf 的完整路径；失败时携带损坏分类。
+export type ActivePathResult =
+  { ok: true; path: SessionEntry[] } | { ok: false; error: SessionCorruptedError };
+
+// 恢复出的模型运行状态：当前活动位置应使用的模型与 thinking level。
+export interface ModelState {
+  model: ModelRef;
+  thinkingLevel: ThinkingLevel;
+}
+
+// 运行环境可用性判定端口：由 Runtime（M7）注入真实实现；Session 领域层不持有 provider 能力表。
+export interface RuntimeEnvironment {
+  canExecute(state: ModelState): { ok: true } | { ok: false; reason: string };
+}
+
+export const defaultRuntimeEnvironment: RuntimeEnvironment = {
+  canExecute: () => ({ ok: true }),
+};
 
 // Turn 批量提交中的一条 pending entry：不含 sequence（事务内从 next_entry_seq 分配）与
 // parentId（第一条接当前 active leaf，后续依次连接前一条）；id/createdAt 未提供时由事务生成。
