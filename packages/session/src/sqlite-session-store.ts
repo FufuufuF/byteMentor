@@ -282,6 +282,23 @@ export class SqliteSessionStore implements SessionStore {
     }
   }
 
+  async updateLeaf(id: SessionId, leafId: string | null): Promise<void> {
+    this.assertOpen();
+    try {
+      const result = this.db
+        .prepare(`UPDATE sessions SET active_leaf_id = :leaf, updated_at = :now WHERE id = :id`)
+        .run({ leaf: leafId, now: new Date().toISOString(), id });
+      if (result.changes === 0) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closed) {
       return;

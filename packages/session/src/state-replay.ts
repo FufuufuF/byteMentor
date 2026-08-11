@@ -4,10 +4,7 @@ import type { ModelState, SessionSnapshot } from "./session-store.js";
 // M4.2 模型与 thinking level 状态恢复：从 leaf 向上追溯，遇到离 leaf 最近（=从 root 数的
 // 最后一条）的 ModelChangeEntry / ThinkingLevelChangeEntry 即生效，可提前终止；
 // 找不到时回落到 Session 创建时的初始基线。AssistantEntry.model 只记账、不参与状态。
-export function replayRuntimeState(
-  snapshot: SessionSnapshot,
-  leafId: EntryId | null,
-): ModelState {
+export function replayRuntimeState(snapshot: SessionSnapshot, leafId: EntryId | null): ModelState {
   const model = { provider: snapshot.initialProvider, modelId: snapshot.initialModelId };
   let thinkingLevel = snapshot.initialThinkingLevel;
   if (leafId === null) {

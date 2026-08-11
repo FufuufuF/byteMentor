@@ -122,7 +122,11 @@ export class InMemorySessionStore implements SessionStore {
 
   async close(): Promise<void> {}
 
-  // === deprecated 线性适配入口（仅短期兼容未迁移的 AgentLoop；B3 迁移完成后删除） ===
+  async updateLeaf(id: SessionId, leafId: string | null): Promise<void> {
+    const record = this.requireSession(id);
+    record.activeLeafId = leafId;
+    record.updatedAt = new Date().toISOString();
+  }
 
   /** @deprecated 见 SessionStore 契约注释。 */
   async create(): Promise<Session> {

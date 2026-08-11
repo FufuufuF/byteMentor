@@ -100,6 +100,14 @@ export class SessionCorruptedError extends Error {
   }
 }
 
+// Tree 直接导航失败（M5.8）：stale target、目标不可导航等 D 级操作错误，Session 本身未损坏。
+export class SessionNavigationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SessionNavigationError";
+  }
+}
+
 // 活动路径重建的返回类型：ok 时给出根到 leaf 的完整路径；失败时携带损坏分类。
 export type ActivePathResult =
   { ok: true; path: SessionEntry[] } | { ok: false; error: SessionCorruptedError };
@@ -161,6 +169,8 @@ export interface SessionStore {
   // Turn 最终提交/恢复提交共用的批量追加事务：短 BEGIN IMMEDIATE 内校验 leaf、连续分配 seq、
   // 批量插入、推进 leaf/seq、清除 runtime_checkpoint，全有或全无。
   commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult>;
+  // Tree 直接导航原语：单语句更新 active_leaf_id（不创建 Entry）；目标不存在时抛 SessionNotFoundError。
+  updateLeaf(id: SessionId, leafId: string | null): Promise<void>;
   close(): Promise<void>;
 
   /** @deprecated 仅短期兼容未迁移的 AgentLoop；AgentLoop 迁移到新契约后（B3 收尾）删除。 */

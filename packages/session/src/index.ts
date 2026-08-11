@@ -1,3 +1,4 @@
+export * from "./context-builder.js";
 export * from "./entries.js";
 export * from "./entry-codec.js";
 export * from "./entry-validation.js";
@@ -6,3 +7,4 @@ export * from "./session-store.js";
 export * from "./session-tree.js";
 export * from "./sqlite-session-store.js";
 export * from "./state-replay.js";
+export * from "./tree-navigation.js";
