@@ -1,4 +1,4 @@
-import type { Message, ModelRef, SessionId, ThinkingLevel } from "@byte-mentor/core";
+import type { Message, ModelRef, SessionId, ThinkingLevel, TokenUsage } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
 
 // SessionStore 领域契约：只暴露领域原子能力，不包含 provider、Runtime 或 UI 决策。
@@ -126,15 +126,6 @@ export interface ModelState {
   thinkingLevel: ThinkingLevel;
 }
 
-// 运行环境可用性判定端口：由 Runtime（M7）注入真实实现；Session 领域层不持有 provider 能力表。
-export interface RuntimeEnvironment {
-  canExecute(state: ModelState): { ok: true } | { ok: false; reason: string };
-}
-
-export const defaultRuntimeEnvironment: RuntimeEnvironment = {
-  canExecute: () => ({ ok: true }),
-};
-
 // Turn 批量提交中的一条 pending entry：不含 sequence（事务内从 next_entry_seq 分配）与
 // parentId（第一条接当前 active leaf，后续依次连接前一条）；id/createdAt 未提供时由事务生成。
 // DistributiveOmit 保留 union 收窄。
@@ -154,6 +145,28 @@ export interface CommitTurnInput {
 }
 
 export interface CommitTurnResult {
+  activeLeafId: SessionEntry["id"];
+  nextEntrySeq: number;
+}
+
+// Branch Summary 原子提交（M3.10）：短 BEGIN IMMEDIATE 内重新校验 active leaf 仍等于
+// expectedLeafId（= 导航前 source leaf S），插入一条 BranchSummaryEntry（parentId = 导航
+// 目标 T、sourceLeafId = S、summary/model/usage），同一事务推进 leaf/next_entry_seq/updated_at。
+// 与 commitTurnEntries 不同：不清除 runtime_checkpoint（摘要导航发生在空闲期，无 Turn 在途）。
+// 摘要文本由调用方（agent 领域服务）保证非空；这里仍防御性拒绝空白摘要。
+export interface CommitBranchSummaryInput {
+  sessionId: SessionId;
+  // 事务内校验当前 active_leaf_id 仍等于该值；不匹配时抛 SessionLeafConflictError。
+  expectedLeafId: SessionEntry["id"] | null;
+  // 摘要节点的父节点（归一化后的导航目标 T，可能为 null = 虚拟根）。
+  parentId: SessionEntry["id"] | null;
+  summary: string;
+  model: ModelRef;
+  usage?: TokenUsage;
+}
+
+export interface CommitBranchSummaryResult {
+  entryId: SessionEntry["id"];
   activeLeafId: SessionEntry["id"];
   nextEntrySeq: number;
 }
@@ -190,6 +203,8 @@ export interface SessionStore {
   commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult>;
   // Tree 直接导航原语：单语句更新 active_leaf_id（不创建 Entry）；目标不存在时抛 SessionNotFoundError。
   updateLeaf(id: SessionId, leafId: string | null): Promise<void>;
+  // Branch Summary 原子提交事务（见 CommitBranchSummaryInput 注释）。
+  commitBranchSummary(input: CommitBranchSummaryInput): Promise<CommitBranchSummaryResult>;
   // Fork 原子创建：同一事务内创建 session + 插入全部 entries + 设 leaf/seq；空 entries 合法。
   createSessionWithEntries(input: CreateSessionWithEntriesInput): Promise<SessionSnapshot>;
   close(): Promise<void>;

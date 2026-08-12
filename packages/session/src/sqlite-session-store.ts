@@ -8,6 +8,8 @@ import {
   SessionNotFoundError,
   SessionStoreClosedError,
   SessionStoreError,
+  type CommitBranchSummaryInput,
+  type CommitBranchSummaryResult,
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
@@ -274,6 +276,73 @@ export class SqliteSessionStore implements SessionStore {
           .run({ leaf: parentId, seq: nextSeq, now, id: input.sessionId });
         // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
         return { activeLeafId: parentId as string, nextEntrySeq: nextSeq };
+      })();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async commitBranchSummary(input: CommitBranchSummaryInput): Promise<CommitBranchSummaryResult> {
+    this.assertOpen();
+    if (input.summary.trim().length === 0) {
+      throw new SessionStoreError("constraint", "commitBranchSummary requires a non-empty summary");
+    }
+    try {
+      return this.db.transaction(() => {
+        const row = this.sessionRow(input.sessionId);
+        if (row === undefined) {
+          throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+        }
+        if (row.active_leaf_id !== input.expectedLeafId) {
+          throw new SessionLeafConflictError(
+            `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+          );
+        }
+        const entry: SessionEntry = {
+          type: "branch_summary",
+          id: randomEntryId(),
+          sequence: row.next_entry_seq,
+          parentId: input.parentId,
+          createdAt: new Date().toISOString(),
+          sourceLeafId: input.expectedLeafId,
+          summary: input.summary,
+          model: input.model,
+          ...(input.usage === undefined ? {} : { usage: input.usage }),
+        };
+        const encoded = encodeEntry(entry);
+        this.db
+          .prepare(
+            `INSERT INTO session_entries
+               (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            input.sessionId,
+            encoded.id,
+            encoded.entry_seq,
+            encoded.parent_id,
+            encoded.type,
+            encoded.created_at,
+            encoded.payload_json,
+          );
+        this.db
+          .prepare(
+            `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 updated_at = :now
+             WHERE id = :id`,
+          )
+          .run({
+            leaf: entry.id,
+            seq: row.next_entry_seq + 1,
+            now: entry.createdAt,
+            id: input.sessionId,
+          });
+        return { entryId: entry.id, activeLeafId: entry.id, nextEntrySeq: row.next_entry_seq + 1 };
       })();
     } catch (error) {
       if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {

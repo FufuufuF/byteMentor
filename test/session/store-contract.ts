@@ -331,6 +331,170 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
   });
+
+  describe(`SessionStore branch summary commit (${factory.label})`, () => {
+    it("commits a BranchSummaryEntry under the target parent with sourceLeafId, advances leaf and seq", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        const before = (await store.loadSession(session.id))!;
+        const result = await store.commitBranchSummary({
+          sessionId: session.id,
+          expectedLeafId: first.activeLeafId,
+          parentId: null,
+          summary: "branch summary",
+          model: { provider: "openai", modelId: "gpt-5" },
+          usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+        });
+        expect(result.activeLeafId).toBeDefined();
+        expect(result.nextEntrySeq).toBe(3);
+        const loaded = (await store.loadSession(session.id))!;
+        expect(loaded.entries).toHaveLength(2);
+        expect(loaded.entries[1]).toMatchObject({
+          type: "branch_summary",
+          sequence: 2,
+          parentId: null,
+          sourceLeafId: first.activeLeafId,
+          summary: "branch summary",
+          model: { provider: "openai", modelId: "gpt-5" },
+          usage: { inputTokens: 12, outputTokens: 3, totalTokens: 15 },
+        });
+        expect(loaded.entries[1].id).toBe(result.activeLeafId);
+        expect(loaded.activeLeafId).toBe(result.activeLeafId);
+        expect(loaded.nextEntrySeq).toBe(3);
+        expect(loaded.updatedAt >= before.updatedAt).toBe(true);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects when expectedLeafId does not match the current leaf, leaving the session unchanged", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        await expect(
+          store.commitBranchSummary({
+            sessionId: session.id,
+            expectedLeafId: "stale-leaf-id",
+            parentId: null,
+            summary: "branch summary",
+            model: { provider: "openai", modelId: "gpt-5" },
+          }),
+        ).rejects.toMatchObject({ name: "SessionLeafConflictError" });
+        const loaded = (await store.loadSession(session.id))!;
+        expect(loaded.entries).toHaveLength(1);
+        expect(loaded.activeLeafId).toBe(first.activeLeafId);
+        expect(loaded.nextEntrySeq).toBe(2);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects when the session does not exist", async () => {
+      const store = await factory.create();
+      try {
+        await expect(
+          store.commitBranchSummary({
+            sessionId: "00000000-0000-4000-8000-000000000099" as SessionId,
+            expectedLeafId: null,
+            parentId: null,
+            summary: "branch summary",
+            model: { provider: "openai", modelId: "gpt-5" },
+          }),
+        ).rejects.toMatchObject({ name: "SessionNotFoundError" });
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects an empty summary as a constraint violation without writing an entry", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        await expect(
+          store.commitBranchSummary({
+            sessionId: session.id,
+            expectedLeafId: first.activeLeafId,
+            parentId: null,
+            summary: "   \n  ",
+            model: { provider: "openai", modelId: "gpt-5" },
+          }),
+        ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+        const loaded = (await store.loadSession(session.id))!;
+        expect(loaded.entries).toHaveLength(1);
+        expect(loaded.activeLeafId).toBe(first.activeLeafId);
+        expect(loaded.nextEntrySeq).toBe(2);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("rejects a parentId that does not exist in the session and rolls back the whole transaction", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        await expect(
+          store.commitBranchSummary({
+            sessionId: session.id,
+            expectedLeafId: first.activeLeafId,
+            parentId: "missing-parent",
+            summary: "branch summary",
+            model: { provider: "openai", modelId: "gpt-5" },
+          }),
+        ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+        const loaded = (await store.loadSession(session.id))!;
+        expect(loaded.entries).toHaveLength(1);
+        expect(loaded.activeLeafId).toBe(first.activeLeafId);
+        expect(loaded.nextEntrySeq).toBe(2);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("does not clear runtime_checkpoint (unlike commitTurnEntries)", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const first = await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries: [{ entry: { type: "user", content: "q1" } }],
+        });
+        await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
+        await store.commitBranchSummary({
+          sessionId: session.id,
+          expectedLeafId: first.activeLeafId,
+          parentId: null,
+          summary: "branch summary",
+          model: { provider: "openai", modelId: "gpt-5" },
+        });
+        const metadata = await store.getMetadata(session.id);
+        expect(metadata).toEqual({ runtime_checkpoint: { phase: "ready_for_iteration" } });
+      } finally {
+        await factory.close(store);
+      }
+    });
+  });
 }
 
 // 断言辅助：验证错误属于归一化 SessionStoreError 且 kind 匹配。

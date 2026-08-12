@@ -1,9 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  replayRuntimeState,
-  defaultRuntimeEnvironment,
-  type ModelState,
-} from "@byte-mentor/session";
+import { defaultRuntimeEnvironment } from "@byte-mentor/agent";
+import { replayRuntimeState, type ModelState } from "@byte-mentor/session";
 import type { SessionSnapshot } from "@byte-mentor/session";
 import type { SessionEntry } from "@byte-mentor/session";
 import type { SessionId } from "@byte-mentor/core";

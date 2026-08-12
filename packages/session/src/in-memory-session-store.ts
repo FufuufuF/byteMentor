@@ -6,6 +6,8 @@ import {
   SessionLeafConflictError,
   SessionNotFoundError,
   SessionStoreError,
+  type CommitBranchSummaryInput,
+  type CommitBranchSummaryResult,
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
@@ -122,6 +124,40 @@ export class InMemorySessionStore implements SessionStore {
   }
 
   async close(): Promise<void> {}
+
+  async commitBranchSummary(input: CommitBranchSummaryInput): Promise<CommitBranchSummaryResult> {
+    const record = this.requireSession(input.sessionId);
+    if (input.summary.trim().length === 0) {
+      throw new SessionStoreError("constraint", "commitBranchSummary requires a non-empty summary");
+    }
+    if (input.parentId !== null && !record.entries.some((entry) => entry.id === input.parentId)) {
+      throw new SessionStoreError(
+        "constraint",
+        `parent ${input.parentId} does not exist in session ${input.sessionId}`,
+      );
+    }
+    if (record.activeLeafId !== input.expectedLeafId) {
+      throw new SessionLeafConflictError(
+        `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(record.activeLeafId)}`,
+      );
+    }
+    const entry: SessionEntry = {
+      type: "branch_summary",
+      id: randomEntryId(),
+      sequence: record.nextEntrySeq,
+      parentId: input.parentId,
+      createdAt: new Date().toISOString(),
+      sourceLeafId: input.expectedLeafId,
+      summary: input.summary,
+      model: input.model,
+      ...(input.usage === undefined ? {} : { usage: input.usage }),
+    };
+    record.entries.push(entry);
+    record.activeLeafId = entry.id;
+    record.nextEntrySeq += 1;
+    record.updatedAt = entry.createdAt;
+    return { entryId: entry.id, activeLeafId: entry.id, nextEntrySeq: record.nextEntrySeq };
+  }
 
   async updateLeaf(id: SessionId, leafId: string | null): Promise<void> {
     const record = this.requireSession(id);

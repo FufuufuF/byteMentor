@@ -1,11 +1,10 @@
 import type { Message, MessageId } from "@byte-mentor/core";
 import type { SessionEntry } from "@byte-mentor/session";
+import { SessionCorruptedError, type ModelState } from "@byte-mentor/session";
 import {
-  SessionCorruptedError,
-  type ModelState,
-  type RuntimeEnvironment,
   defaultRuntimeEnvironment,
-} from "@byte-mentor/session";
+  type RuntimeEnvironment,
+} from "../runtime/runtime-environment.js";
 import { replayRuntimeState } from "@byte-mentor/session";
 
 // M4.3～4.7 的上下文重建：把活动路径（已由 SessionTree 重建、状态由 replayRuntimeState 恢复）

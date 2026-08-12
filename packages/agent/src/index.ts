@@ -4,6 +4,8 @@ export * from "./context/context-builder.js";
 export * from "./context/session-context.js";
 export * from "./providers/openai-chat-provider.js";
 export * from "./providers/provider.js";
+export * from "./runtime/runtime-environment.js";
+export * from "./summary/branch-summary.js";
 export * from "./summary/summary-executor.js";
 export * from "./summary/summary-interval.js";
 export * from "./summary/summary-port.js";
