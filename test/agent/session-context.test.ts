@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyCompaction, buildProviderContext, mapEntriesToMessages } from "@byte-mentor/session";
+import { applyCompaction, buildProviderContext, mapEntriesToMessages } from "@byte-mentor/agent";
 import type { SessionSnapshot } from "@byte-mentor/session";
 import type { SessionEntry } from "@byte-mentor/session";
 import type { SessionId, ToolCallId } from "@byte-mentor/core";

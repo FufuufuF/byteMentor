@@ -243,15 +243,16 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 
 ## 10. Batch 7：摘要基础设施（区间、输入序列化、摘要端口）
 
-建议 commit：`feat(session): add summary interval and model port`
+建议 commit：`feat(session): add summary infrastructure in agent layer`
 
 对应设计：M5.3、M5.4、M5.5、M6.8、M6.9 的端口/重试/取消部分。
 
 ### 范围
 
-- `packages/session/src/**`：LCA、总结区间、协议安全的摘要输入序列化。
-- `packages/agent/src/**`：provider-neutral 摘要执行适配及可控重试/取消/超预算边界。
-- `test/session/**`、`test/agent/**` 中对应摘要基础设施测试。
+- `packages/agent/src/summary/**`、`packages/agent/src/context/**`：LCA、总结区间、协议安全的摘要输入序列化、
+  压缩感知上下文裁剪（`session-context`）与摘要端口（类型定义在 agent，执行适配与重试/取消在 agent）。
+- `test/agent/**` 中对应摘要基础设施测试。
+- 说明：压缩/摘要生成语义归属 agent 层（用户确认）；session 包只接收摘要产物 Entry 并负责持久化。
 
 ### 目标
 
@@ -280,8 +281,9 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 
 ### 范围
 
-- `packages/session/src/**`：Branch Summary 的提交事务与导航后重建。
-- `test/session/**`：Branch Summary 提交与重建测试。
+- `packages/agent/src/**`：Branch Summary 的领域服务（消费区间/端口，生成摘要后调 session 提交原语）。
+- `packages/session/src/**`：Branch Summary 的原子提交事务（`BranchSummaryEntry` 落库、推进 leaf/seq）。
+- `test/agent/**`、`test/session/**`：Branch Summary 提交与重建测试。
 
 ### 目标
 
@@ -309,9 +311,9 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 
 ### 范围
 
-- `packages/session/src/**`：ModelCapabilities 表、token 估算、预算与阈值、触发决策。
+- `packages/agent/src/**`：ModelCapabilities 表、token 估算、预算与阈值、触发决策（压缩决策属于 agent 层）。
 - `packages/agent/src/**`：provider usage 归一化的必要扩展。
-- `test/session/**`、相关 `test/agent/**`。
+- `test/agent/**` 中对应 token 预算与触发决策测试。
 
 ### 目标
 
@@ -338,9 +340,9 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 
 ### 范围
 
-- `packages/session/src/**`：cut point、交互段切分、增量摘要、Compaction 提交、Turn 内 pending Compaction 结果。
-- `packages/agent/src/**`：provider overflow 归一化的必要扩展。
-- `test/session/**`、相关 `test/agent/**` 与分支级集成测试。
+- `packages/agent/src/**`：cut point、交互段切分、增量摘要、Compaction 领域服务、Turn 内 pending Compaction 结果、overflow 归一化。
+- `packages/session/src/**`：Compaction 的原子提交事务（`CompactionEntry` 落库、推进 leaf/seq）。
+- `test/agent/**`、`test/session/**` 与分支级集成测试。
 - package public exports 与设计文档所需的最终契约测试。
 
 ### 目标

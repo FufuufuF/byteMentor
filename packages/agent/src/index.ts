@@ -1,8 +1,13 @@
 export * from "./loop/agent-loop.js";
 export * from "./runner/agent-runner.js";
 export * from "./context/context-builder.js";
+export * from "./context/session-context.js";
 export * from "./providers/openai-chat-provider.js";
 export * from "./providers/provider.js";
+export * from "./summary/summary-executor.js";
+export * from "./summary/summary-interval.js";
+export * from "./summary/summary-port.js";
+export * from "./summary/summary-serialize.js";
 export type { RuntimeCheckpoint } from "./loop/runtime-checkpoint.js";
 export * from "./tools/contracts.js";
 export * from "./tools/tool-registry.js";

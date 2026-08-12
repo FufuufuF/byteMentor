@@ -1,12 +1,12 @@
 import type { Message, MessageId } from "@byte-mentor/core";
-import type { SessionEntry } from "./entries.js";
+import type { SessionEntry } from "@byte-mentor/session";
 import {
   SessionCorruptedError,
   type ModelState,
   type RuntimeEnvironment,
   defaultRuntimeEnvironment,
-} from "./session-store.js";
-import { replayRuntimeState } from "./state-replay.js";
+} from "@byte-mentor/session";
+import { replayRuntimeState } from "@byte-mentor/session";
 
 // M4.3～4.7 的上下文重建：把活动路径（已由 SessionTree 重建、状态由 replayRuntimeState 恢复）
 // 转换为 provider-neutral 的统一 Message[]，并应用 M4.6 的压缩感知裁剪。
