@@ -11,6 +11,7 @@ import {
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
+  type CreateSessionWithEntriesInput,
   type Session,
   type SessionMetadata,
   type SessionSnapshot,
@@ -295,6 +296,59 @@ export class SqliteSessionStore implements SessionStore {
       if (error instanceof SessionNotFoundError) {
         throw error;
       }
+      throw normalizeError(error);
+    }
+  }
+
+  async createSessionWithEntries(input: CreateSessionWithEntriesInput): Promise<SessionSnapshot> {
+    this.assertOpen();
+    try {
+      return this.db.transaction(() => {
+        const id = createSessionId();
+        const now = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO sessions (
+               id, workspace_root, initial_provider, initial_model_id, initial_thinking_level,
+               next_entry_seq, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)`,
+          )
+          .run(
+            id,
+            input.workspaceRoot,
+            input.initialProvider,
+            input.initialModelId,
+            input.initialThinkingLevel,
+            input.entries.length + 1,
+            now,
+            now,
+          );
+        for (const entry of input.entries) {
+          const encoded = encodeEntry(entry);
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+                 (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              id,
+              encoded.id,
+              encoded.entry_seq,
+              encoded.parent_id,
+              encoded.type,
+              encoded.created_at,
+              encoded.payload_json,
+            );
+        }
+        if (input.entries.length > 0) {
+          this.db
+            .prepare("UPDATE sessions SET active_leaf_id = ? WHERE id = ?")
+            .run(input.entries[input.entries.length - 1].id, id);
+        }
+        return this.requireSnapshot(id, this.sessionRow(id));
+      })();
+    } catch (error) {
       throw normalizeError(error);
     }
   }

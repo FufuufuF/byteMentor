@@ -9,6 +9,7 @@ import {
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
+  type CreateSessionWithEntriesInput,
   type Session,
   type SessionMetadata,
   type SessionSnapshot,
@@ -126,6 +127,25 @@ export class InMemorySessionStore implements SessionStore {
     const record = this.requireSession(id);
     record.activeLeafId = leafId;
     record.updatedAt = new Date().toISOString();
+  }
+
+  async createSessionWithEntries(input: CreateSessionWithEntriesInput): Promise<SessionSnapshot> {
+    const id = createSessionId();
+    const now = new Date().toISOString();
+    const record: InMemorySessionRecord = {
+      workspaceRoot: input.workspaceRoot,
+      initialProvider: input.initialProvider,
+      initialModelId: input.initialModelId,
+      initialThinkingLevel: input.initialThinkingLevel,
+      activeLeafId: input.entries.length > 0 ? input.entries[input.entries.length - 1].id : null,
+      nextEntrySeq: input.entries.length + 1,
+      metadata: {},
+      createdAt: now,
+      updatedAt: now,
+      entries: input.entries.map((entry) => ({ ...entry })),
+    };
+    this.sessions.set(id, record);
+    return toSnapshot(id, record);
   }
 
   /** @deprecated 见 SessionStore 契约注释。 */

@@ -226,6 +226,68 @@ export function runStoreContractTests(factory: StoreFactory): void {
         await factory.close(store);
       }
     });
+
+    it("createSessionWithEntries creates a session with entries, leaf, and nextEntrySeq", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSessionWithEntries({
+          workspaceRoot: "/w",
+          initialProvider: "openai",
+          initialModelId: "gpt-5",
+          initialThinkingLevel: "medium",
+          entries: [
+            {
+              id: "u1",
+              sequence: 1,
+              parentId: null,
+              createdAt: "2026-01-01T00:00:00.000Z",
+              type: "user",
+              content: "q1",
+            },
+            {
+              id: "a1",
+              sequence: 2,
+              parentId: "u1",
+              createdAt: "2026-01-01T00:00:01.000Z",
+              type: "assistant",
+              content: "a",
+              toolCalls: [],
+              model: { provider: "openai", modelId: "gpt-5" },
+              stopReason: "completed",
+            },
+          ],
+        });
+        expect(session.entries).toHaveLength(2);
+        expect(session.entries[0].id).toBe("u1");
+        expect(session.entries[1].parentId).toBe("u1");
+        expect(session.activeLeafId).toBe("a1");
+        expect(session.nextEntrySeq).toBe(3);
+        expect(session.metadata).toEqual({});
+        // 重新加载确认持久化
+        const loaded = await store.loadSession(session.id);
+        expect(loaded?.entries.map((e) => e.id)).toEqual(["u1", "a1"]);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    it("createSessionWithEntries accepts an empty entry list (empty fork path)", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSessionWithEntries({
+          workspaceRoot: "/w",
+          initialProvider: "openai",
+          initialModelId: "gpt-5",
+          initialThinkingLevel: "medium",
+          entries: [],
+        });
+        expect(session.entries).toEqual([]);
+        expect(session.activeLeafId).toBeNull();
+        expect(session.nextEntrySeq).toBe(1);
+      } finally {
+        await factory.close(store);
+      }
+    });
   });
 
   describe(`SessionStore runtime checkpoint (${factory.label})`, () => {

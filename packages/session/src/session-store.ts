@@ -108,6 +108,14 @@ export class SessionNavigationError extends Error {
   }
 }
 
+// Fork 输入校验失败（D 级）：目标不是 user entry、session 无 user 可选等。
+export class ForkValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ForkValidationError";
+  }
+}
+
 // 活动路径重建的返回类型：ok 时给出根到 leaf 的完整路径；失败时携带损坏分类。
 export type ActivePathResult =
   { ok: true; path: SessionEntry[] } | { ok: false; error: SessionCorruptedError };
@@ -150,6 +158,17 @@ export interface CommitTurnResult {
   nextEntrySeq: number;
 }
 
+// Fork 原子创建：调用方（fork 领域服务）已准备完整 entries（含 sequence/parentId），
+// store 在一个事务内创建 session 行 + 批量插入 entries + 设置 leaf/seq。空 entries 合法
+// （空 fork 路径：leaf null、nextEntrySeq 1）。
+export interface CreateSessionWithEntriesInput {
+  workspaceRoot: string;
+  initialProvider: string;
+  initialModelId: string;
+  initialThinkingLevel: ThinkingLevel;
+  entries: SessionEntry[];
+}
+
 export interface SessionStore {
   // 创建一个持久化 Session；返回初始 snapshot。
   createSession(input: CreateSessionInput): Promise<SessionSnapshot>;
@@ -171,6 +190,8 @@ export interface SessionStore {
   commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult>;
   // Tree 直接导航原语：单语句更新 active_leaf_id（不创建 Entry）；目标不存在时抛 SessionNotFoundError。
   updateLeaf(id: SessionId, leafId: string | null): Promise<void>;
+  // Fork 原子创建：同一事务内创建 session + 插入全部 entries + 设 leaf/seq；空 entries 合法。
+  createSessionWithEntries(input: CreateSessionWithEntriesInput): Promise<SessionSnapshot>;
   close(): Promise<void>;
 
   /** @deprecated 仅短期兼容未迁移的 AgentLoop；AgentLoop 迁移到新契约后（B3 收尾）删除。 */
