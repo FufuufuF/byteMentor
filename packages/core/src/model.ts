@@ -20,3 +20,13 @@ export interface TokenUsage {
   cacheWriteTokens?: number;
   reasoningTokens?: number;
 }
+
+// 归一化 provider 上报的 usage（M6.2）：当 totalTokens 已包含 cachedInputTokens 时扣减后者，
+// 避免锚点估算重复计入缓存命中部分；total 不等于 input+output 时视为已含 cached，原样保留。
+export function normalizeUsage(usage: TokenUsage): TokenUsage {
+  const { inputTokens, outputTokens, totalTokens, cachedInputTokens } = usage;
+  if (cachedInputTokens !== undefined && totalTokens === inputTokens + outputTokens) {
+    return { ...usage, totalTokens: Math.max(0, totalTokens - cachedInputTokens) };
+  }
+  return usage;
+}

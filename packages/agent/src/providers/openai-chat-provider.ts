@@ -1,8 +1,10 @@
 import OpenAI from "openai";
+import { normalizeUsage } from "@byte-mentor/core";
 import type {
   AssistantMessage,
   Message,
   StopReason,
+  TokenUsage,
   ToolCall,
   ToolCallId,
 } from "@byte-mentor/core";
@@ -52,6 +54,7 @@ export class OpenAIChatProvider implements ModelProvider {
     return {
       message: done.message,
       stopReason: done.stopReason,
+      ...(done.usage === undefined ? {} : { usage: done.usage }),
     };
   }
 
@@ -70,8 +73,17 @@ export class OpenAIChatProvider implements ModelProvider {
     });
     let content = "";
     const toolCalls = new Map<number, StreamingToolCall>();
+    let usage: TokenUsage | undefined;
+    let terminalChunk:
+      | { content: string; toolCalls: Map<number, StreamingToolCall>; stopReason: StopReason }
+      | undefined;
 
     for await (const chunk of stream) {
+      // usage chunk（choices 为空数组）：只携带 usage，不产生内容增量。
+      if (chunk.usage !== undefined && chunk.usage !== null) {
+        usage = normalizeOpenAIUsage(chunk.usage);
+        continue;
+      }
       const choice = chunk.choices[0];
       if (choice === undefined) {
         continue;
@@ -84,17 +96,37 @@ export class OpenAIChatProvider implements ModelProvider {
       for (const toolCallDelta of choice.delta.tool_calls ?? []) {
         applyToolCallDelta(toolCalls, toolCallDelta);
       }
+      // finish_reason 可能出现在普通 chunk（后续还有 usage chunk）也可能在最后；
+      // 先记录终止状态，等流结束后统一产出 done，保证 usage 收集完整。
       if (choice.finish_reason !== null) {
-        yield {
-          type: "done",
-          message: toStreamedAssistantMessage(content, toolCalls),
+        terminalChunk = {
+          content,
+          toolCalls: new Map(toolCalls),
           stopReason: toStopReason(choice.finish_reason),
         };
-        return;
       }
     }
-    throw new Error("OpenAI chat completion stream ended without finish_reason");
+    if (terminalChunk === undefined) {
+      throw new Error("OpenAI chat completion stream ended without finish_reason");
+    }
+    yield {
+      type: "done",
+      message: toStreamedAssistantMessage(terminalChunk.content, terminalChunk.toolCalls),
+      stopReason: terminalChunk.stopReason,
+      ...(usage === undefined ? {} : { usage }),
+    };
   }
+}
+
+// 把 OpenAI 上报的 usage 归一化为内部 TokenUsage：total 已含 cached 时扣减，避免重复计入。
+function normalizeOpenAIUsage(usage: OpenAI.CompletionUsage): TokenUsage {
+  const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
+  return normalizeUsage({
+    inputTokens: usage.prompt_tokens,
+    outputTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    ...(cachedInputTokens !== undefined && cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+  });
 }
 
 interface StreamingToolCall {

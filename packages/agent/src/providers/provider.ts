@@ -1,4 +1,4 @@
-import type { AssistantMessage, Message, StopReason } from "@byte-mentor/core";
+import type { AssistantMessage, Message, StopReason, TokenUsage } from "@byte-mentor/core";
 
 export interface ToolDefinition {
   name: string;
@@ -19,11 +19,13 @@ export interface ProviderInvocationOptions {
 export interface ProviderResponse {
   message: AssistantMessage;
   stopReason: StopReason;
+  // 该次调用的 token 用量（已归一化）；provider 未上报时为 undefined。
+  usage?: TokenUsage;
 }
 
 export type ProviderStreamEvent =
   | { type: "content_delta"; text: string }
-  | { type: "done"; message: AssistantMessage; stopReason: StopReason };
+  | { type: "done"; message: AssistantMessage; stopReason: StopReason; usage?: TokenUsage };
 
 export interface ModelProvider {
   invoke(req: ProviderRequest, options?: ProviderInvocationOptions): Promise<ProviderResponse>;

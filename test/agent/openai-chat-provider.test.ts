@@ -34,6 +34,12 @@ interface FakeOpenAIChunk {
       finish_reason: string | null;
     },
   ];
+  usage?: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    prompt_tokens_details?: { cached_tokens: number };
+  };
 }
 
 interface FakeCreateRequest {
@@ -361,3 +367,89 @@ describe("OpenAIChatProvider.invoke", () => {
     ).rejects.toThrow("network down");
   });
 });
+
+// usage 归一化：流式 usage 读取、cached 扣减、无 usage 时省略。
+describe("OpenAIChatProvider usage", () => {
+  it("maps streamed usage into the done event with cached input subtracted", async () => {
+    const { client } = createFakeClient([
+      completion({ role: "assistant", content: "done" }, "stop"),
+    ]);
+    client.chat.completions.create = attachUsage(client.chat.completions.create, {
+      prompt_tokens: 100,
+      completion_tokens: 50,
+      total_tokens: 150,
+      prompt_tokens_details: { cached_tokens: 80 },
+    });
+    const provider = createProvider(client);
+
+    const events = [];
+    for await (const event of provider.invokeStream({
+      messages: [{ role: "user", content: "hi" }],
+    })) {
+      events.push(event);
+    }
+
+    const done = events.find((e) => e.type === "done");
+    expect(done).toMatchObject({
+      type: "done",
+      usage: { inputTokens: 100, outputTokens: 50, totalTokens: 70, cachedInputTokens: 80 },
+    });
+  });
+
+  it("omits usage when the stream carries no usage data", async () => {
+    const { client } = createFakeClient([
+      completion({ role: "assistant", content: "done" }, "stop"),
+    ]);
+    const provider = createProvider(client);
+
+    const events = [];
+    for await (const event of provider.invokeStream({
+      messages: [{ role: "user", content: "hi" }],
+    })) {
+      events.push(event);
+    }
+
+    const done = events.find((e) => e.type === "done");
+    expect(done).toMatchObject({ type: "done" });
+    expect(done).not.toHaveProperty("usage");
+  });
+
+  it("returns usage through invoke() as well", async () => {
+    const { client } = createFakeClient([
+      completion({ role: "assistant", content: "done" }, "stop"),
+    ]);
+    client.chat.completions.create = attachUsage(client.chat.completions.create, {
+      prompt_tokens: 10,
+      completion_tokens: 20,
+      total_tokens: 30,
+    });
+    const provider = createProvider(client);
+
+    const result = await provider.invoke({ messages: [{ role: "user", content: "hi" }] });
+    expect(result).toMatchObject({
+      stopReason: "completed",
+      usage: { inputTokens: 10, outputTokens: 20, totalTokens: 30 },
+    });
+  });
+});
+
+// 测试辅助：包装 fake completions.create，在流末尾追加携带 usage 的 usage chunk。
+function attachUsage(
+  create: FakeOpenAIClient["chat"]["completions"]["create"],
+  usage: {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    prompt_tokens_details?: { cached_tokens: number };
+  },
+): FakeOpenAIClient["chat"]["completions"]["create"] {
+  return async function* withUsage(req): AsyncGenerator<FakeOpenAIChunk, void, void> {
+    for await (const chunk of create(req)) {
+      yield chunk;
+    }
+    yield {
+      choices: [] as unknown as FakeOpenAIChunk["choices"],
+      usage,
+    };
+  };
+}

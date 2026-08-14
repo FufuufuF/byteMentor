@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { normalizeUsage } from "@byte-mentor/core";
 import type { ModelRef, ThinkingLevel, TokenUsage } from "@byte-mentor/core";
 
 // 场景：构造一个 ModelRef 值对象。预期：provider 与 modelId 字段原样保留，可整体断言。
@@ -59,5 +60,31 @@ describe("TokenUsage", () => {
     // @ts-expect-error totalTokens is required
     const usage: TokenUsage = { inputTokens: 1, outputTokens: 2 };
     expect(usage as object).toBeDefined();
+  });
+
+  // 场景：totalTokens 已含 cachedInputTokens 时归一化应扣减 cached，避免重复计入；
+  // 不含 cached 时（total 等于 input+output）归一化应保持原值。
+  it("normalizes totalTokens by subtracting cached input tokens when included", () => {
+    expect(
+      normalizeUsage({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 150,
+        cachedInputTokens: 80,
+      }),
+    ).toEqual({ inputTokens: 100, outputTokens: 50, totalTokens: 70, cachedInputTokens: 80 });
+    expect(normalizeUsage({ inputTokens: 100, outputTokens: 50, totalTokens: 150 })).toEqual({
+      inputTokens: 100,
+      outputTokens: 50,
+      totalTokens: 150,
+    });
+    expect(
+      normalizeUsage({
+        inputTokens: 100,
+        outputTokens: 50,
+        totalTokens: 130,
+        cachedInputTokens: 80,
+      }),
+    ).toEqual({ inputTokens: 100, outputTokens: 50, totalTokens: 130, cachedInputTokens: 80 });
   });
 });
