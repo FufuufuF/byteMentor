@@ -137,6 +137,12 @@ export type PendingTurnEntry = {
 // 保留 discriminated union 结构地省略公共字段的类型工具。
 export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
+// Checkpoint 与最终提交共用的 pending Entry：身份与逻辑 parent 已固定，只缺少 sequence。
+export type PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">;
+
+// 独立 Compaction 提交所接受的 pending Entry 类型。
+export type PendingCompactionEntry = Extract<PendingSessionEntry, { type: "compaction" }>;
+
 export interface CommitTurnInput {
   sessionId: SessionId;
   // 事务内校验当前 active_leaf_id 仍等于该值；不匹配时抛 SessionLeafConflictError。
@@ -145,6 +151,20 @@ export interface CommitTurnInput {
 }
 
 export interface CommitTurnResult {
+  activeLeafId: SessionEntry["id"];
+  nextEntrySeq: number;
+}
+
+// 独立 Compaction 提交的输入：entry 的身份与 parent 已由领域层冻结，Store 只分配 sequence。
+export interface CommitCompactionInput {
+  sessionId: SessionId;
+  // 事务内校验当前 active_leaf_id 仍等于该值；不匹配时抛 SessionLeafConflictError。
+  expectedLeafId: SessionEntry["id"] | null;
+  entry: PendingCompactionEntry;
+}
+
+export interface CommitCompactionResult {
+  entryId: SessionEntry["id"];
   activeLeafId: SessionEntry["id"];
   nextEntrySeq: number;
 }
@@ -201,6 +221,9 @@ export interface SessionStore {
   // Turn 最终提交/恢复提交共用的批量追加事务：短 BEGIN IMMEDIATE 内校验 leaf、连续分配 seq、
   // 批量插入、推进 leaf/seq、清除 runtime_checkpoint，全有或全无。
   commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult>;
+  // 独立 Compaction 提交：短事务内校验 source leaf、插入一个 pending Compaction、推进 leaf/seq；
+  // 与 commitTurnEntries 不同，不清除 runtime_checkpoint。
+  commitCompaction(input: CommitCompactionInput): Promise<CommitCompactionResult>;
   // Tree 直接导航原语：单语句更新 active_leaf_id（不创建 Entry）；目标不存在时抛 SessionNotFoundError。
   updateLeaf(id: SessionId, leafId: string | null): Promise<void>;
   // Branch Summary 原子提交事务（见 CommitBranchSummaryInput 注释）。

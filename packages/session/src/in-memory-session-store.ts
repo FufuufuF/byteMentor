@@ -1,6 +1,7 @@
 import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import { createSessionId } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
+import { validatePendingCompaction } from "./compaction-validation.js";
 import { encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
 import {
   SessionLeafConflictError,
@@ -8,6 +9,8 @@ import {
   SessionStoreError,
   type CommitBranchSummaryInput,
   type CommitBranchSummaryResult,
+  type CommitCompactionInput,
+  type CommitCompactionResult,
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
@@ -121,6 +124,34 @@ export class InMemorySessionStore implements SessionStore {
     record.updatedAt = now;
     // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
     return { activeLeafId: parentId as string, nextEntrySeq: record.nextEntrySeq };
+  }
+
+  // 在所有校验通过后一次性追加 Compaction，并同步推进 active leaf 与 sequence；不清理 checkpoint。
+  async commitCompaction(input: CommitCompactionInput): Promise<CommitCompactionResult> {
+    const record = this.requireSession(input.sessionId);
+    if (record.activeLeafId !== input.expectedLeafId) {
+      throw new SessionLeafConflictError(
+        `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(record.activeLeafId)}`,
+      );
+    }
+    validatePendingCompaction(input.entry, record.activeLeafId, (entryId) =>
+      record.entries.some((candidate) => candidate.id === entryId),
+    );
+
+    const now = new Date().toISOString();
+    const entry: SessionEntry = {
+      ...input.entry,
+      sequence: record.nextEntrySeq,
+    };
+    record.entries.push(entry);
+    record.activeLeafId = entry.id;
+    record.nextEntrySeq += 1;
+    record.updatedAt = now;
+    return {
+      entryId: entry.id,
+      activeLeafId: entry.id,
+      nextEntrySeq: record.nextEntrySeq,
+    };
   }
 
   async close(): Promise<void> {}

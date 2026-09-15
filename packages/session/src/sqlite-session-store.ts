@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { createSessionId } from "@byte-mentor/core";
 import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
+import { validatePendingCompaction } from "./compaction-validation.js";
 import { decodeEntry, encodeEntry, encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
 import {
   SessionLeafConflictError,
@@ -10,6 +11,8 @@ import {
   SessionStoreError,
   type CommitBranchSummaryInput,
   type CommitBranchSummaryResult,
+  type CommitCompactionInput,
+  type CommitCompactionResult,
   type CommitTurnInput,
   type CommitTurnResult,
   type CreateSessionInput,
@@ -285,6 +288,79 @@ export class SqliteSessionStore implements SessionStore {
     }
   }
 
+  // 在一个短 SQLite 事务内提交 Compaction、推进 leaf/sequence，并保留 runtime_checkpoint。
+  async commitCompaction(input: CommitCompactionInput): Promise<CommitCompactionResult> {
+    this.assertOpen();
+    try {
+      return this.db
+        .transaction(() => {
+          const row = this.sessionRow(input.sessionId);
+          if (row === undefined) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          if (row.active_leaf_id !== input.expectedLeafId) {
+            throw new SessionLeafConflictError(
+              `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+            );
+          }
+          validatePendingCompaction(input.entry, row.active_leaf_id, (entryId) =>
+            this.entryExists(input.sessionId, entryId),
+          );
+
+          const materialized: SessionEntry = {
+            ...input.entry,
+            sequence: row.next_entry_seq,
+          };
+          const encoded = encodeEntry(materialized);
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+               (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              input.sessionId,
+              encoded.id,
+              encoded.entry_seq,
+              encoded.parent_id,
+              encoded.type,
+              encoded.created_at,
+              encoded.payload_json,
+            );
+
+          const now = new Date().toISOString();
+          const update = this.db
+            .prepare(
+              `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 updated_at = :now
+             WHERE id = :id`,
+            )
+            .run({
+              leaf: materialized.id,
+              seq: row.next_entry_seq + 1,
+              now,
+              id: input.sessionId,
+            });
+          if (update.changes !== 1) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          return {
+            entryId: materialized.id,
+            activeLeafId: materialized.id,
+            nextEntrySeq: row.next_entry_seq + 1,
+          };
+        })
+        .immediate();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
   async commitBranchSummary(input: CommitBranchSummaryInput): Promise<CommitBranchSummaryResult> {
     this.assertOpen();
     if (input.summary.trim().length === 0) {
@@ -521,6 +597,14 @@ export class SqliteSessionStore implements SessionStore {
          FROM sessions WHERE id = ?`,
       )
       .get(id) as SessionRow | undefined;
+  }
+
+  // 查询同一 Session 中的 Entry 引用，供事务内的 pending Compaction 校验使用。
+  private entryExists(sessionId: SessionId, entryId: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS present FROM session_entries WHERE session_id = ? AND id = ?")
+      .get(sessionId, entryId) as { present: number } | undefined;
+    return row !== undefined;
   }
 
   private requireSnapshot(id: SessionId, row = this.sessionRow(id)): SessionSnapshot {
