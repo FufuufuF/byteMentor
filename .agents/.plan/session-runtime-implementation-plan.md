@@ -14,7 +14,8 @@
 开始前必须满足：
 
 - `feat/session-tree-compaction` 已完成或本分支明确基于其最终提交；
-- SessionEntry、SessionStore 原子操作、Context/Navigation/Compaction 服务契约已经冻结；
+- SessionEntry、`PendingSessionEntry`、SessionStore 原子操作、Context/Navigation/Compaction 服务契约已经冻结；
+- Runtime 直接消费上游冻结的 pending Entry（稳定 id/createdAt/parentId，仅缺 sequence）、结构化 `SummaryRequest` 和 provider-neutral `ProviderInvocationError("context-overflow")`，不再定义同义类型或解析厂商错误；
 - deprecated 线性 Store API 只作为迁移起点，不再新增使用者。
 
 完成后，应用层只需通过 AgentRuntime 即可提交消息/命令、停止 Turn、响应 interaction、读取 snapshot、订阅事件和关闭资源。
@@ -44,7 +45,7 @@
 - 落实 streaming partial 不持久化、完整 Assistant 才入链、执行工具前 checkpoint、完整 ToolResult 批次后 checkpoint。
 - 实现 completed/cancelled/failed/max-iterations 的内存终态链和最终原子提交。
 - 实现两种 checkpoint 的保守恢复：不续跑旧 ReAct、不重试工具，未知副作用生成固定 ToolResult 后提交。
-- 把 turn 间/Turn 内 Compaction 接到 provider 前 safe point，支持 overflow 后基于最近稳定 checkpoint 压缩并只重试一次。
+- 把 turn 间/Turn 内 Compaction 接到 provider 前 safe point，直接使用上游 `PendingSessionEntry`/Compaction 服务；支持捕获 provider-neutral context overflow 后基于最近稳定 checkpoint 压缩并只重试一次。
 - 保持 AgentRunner 不依赖 SessionStore；AgentLoop 负责 durable boundary 与领域服务编排。
 
 ### 测试

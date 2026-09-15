@@ -332,43 +332,110 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 - 未知模型策略是否严格，没有模糊前缀猜测。
 - 决策与提交是否分离：本 Batch 只产出压缩决策，不写 Entry。
 
-## 13. Batch 10：Compaction 垂直切片与契约冻结
+## 13. Batch 10a：Compaction 压缩算法（纯计算，已完成）
+
+建议 commit：`feat(agent): add compaction planning`
+
+对应设计：M6.6、M6.7、M6.8 的 cut point、交互前缀、增量摘要与输入预算。
+
+### 已交付
+
+- `planCompaction`：从有效活动路径向前累计 token，选择 User/Assistant 安全切点，ToolResult 命中时回退到产生它的 Assistant，状态 Entry 不作为切点。
+- 必要时把交互段前缀并入摘要输入，但不导出同构 segment/prefix 类型，也不把内部前缀暴露到 `CompactionPlan`。
+- 合并最近 `previousSummary` 与本次新增被压缩内容；摘要输入经过单 ToolResult 截断后仍超预算时明确失败。
+- 固定 Compaction 摘要章节与“只总结、不继续执行”提示词。
+- `selectEffectiveContextEntries` 作为压缩感知有效上下文选择 API。
+
+## 13.1 Batch 10b：Compaction 提交、Turn 内结果与契约冻结
 
 建议 commit：`feat(session): add context compaction and freeze contracts`
 
-对应设计：M6.5、M6.6、M6.7、M6.10、M6.11，M3.11 的 Compaction 事务，以及 M1～M6 公共契约冻结。
+对应设计：M6.5、M6.9、M6.10、M6.11，M3.7/M3.11 的提交事务，以及 M1～M6 公共契约冻结。
+
+### 已确认公共契约
+
+- `PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">`：进入 checkpoint 前已经具有稳定 `id`、`createdAt` 和逻辑 `parentId`，最终事务只分配 sequence。
+- `PendingCompactionEntry` 是上述 union 中的 compaction 分支；Turn 内 Compaction 可以通过 `firstKeptEntryId` 引用已持久化或本 Turn 更早的 pending Entry。
+- `SessionStore.commitTurnEntries` 改为直接接收 `PendingSessionEntry[]`，校验稳定 ID 与连续 parent 链，不再提交时生成 ID/时间或推导另一条 parent 链。
+- `SessionStore.commitCompaction` 接收已经准备好的 `PendingCompactionEntry`，短事务内校验 leaf、分配 sequence、插入并推进 leaf。
+- agent 提供 `prepareCompaction`（只生成 pending 结果）和 `compactSession`（空闲期生成、提交与重建）；提交失败通过 `PreparedCompaction` 复用同一摘要和 Entry ID。
+- `SummaryRequest` 增加 `instructions` 和可选 `maxOutputTokens`，与 `historyText`、model/thinking、signal 一起构成 provider-neutral 摘要请求。
+- 各 provider adapter 把可可靠识别的厂商结构化 overflow 错误转换成 Byte Mentor 的 `ProviderInvocationError(kind = "context-overflow")`；上层不依赖厂商 SDK、不解析异常文案，其他错误不得误判。
 
 ### 范围
 
-- `packages/agent/src/**`：cut point、交互段切分、增量摘要、Compaction 领域服务、Turn 内 pending Compaction 结果、overflow 归一化。
-- `packages/session/src/**`：Compaction 的原子提交事务（`CompactionEntry` 落库、推进 leaf/seq）。
-- `test/agent/**`、`test/session/**` 与分支级集成测试。
-- package public exports 与设计文档所需的最终契约测试。
+- `packages/agent/src/compaction/**`：pending Compaction 准备、空闲期领域服务、prepared 重试和提交后上下文重建。
+- `packages/agent/src/summary/**`：固定 instructions 与 `SummaryRequest.maxOutputTokens` 契约。
+- `packages/agent/src/providers/**`：provider-neutral context overflow 错误及 OpenAI adapter 映射。
+- `packages/session/src/**`：pending Entry 最终契约、Turn 提交迁移、Compaction 原子提交事务（InMemory + SQLite）。
+- `test/agent/**`、`test/session/**`、package public exports 和 M1～M6 契约测试。
+
+明确不接入 AgentLoop、最终 RuntimeCheckpoint、mailbox、safe-point 调度、实际 provider overflow 重试循环或 TUI；这些由下游 Runtime/TUI 分支消费本 Batch 冻结的能力。自定义 prompt、多级摘要和自动换模型仍不实现。
 
 ### 目标
 
-- 实现合法 cut point：完整工具批次、用户交互段边界、Interaction Prefix Summary、状态 Entry 不作切点。
-- 实现增量累计摘要与固定摘要结构（Goal/Constraints/Progress/…/Critical Context），合并 `previousSummary` 与本次被压掉内容。
-- 实现空闲期手动/turn 间 Compaction 的原子提交：`BEGIN IMMEDIATE` 校验 leaf、插入 `CompactionEntry`（`parentId = sourceLeafId`）、推进 leaf/sequence；失败不修改 Session，成功后可重建有效上下文。
-- 实现 Turn 内 pending Compaction：只返回可由 Runtime 放入 checkpoint 的领域结果，不提前移动数据库 leaf、不提前提交半个 Turn。
-- 实现 overflow 分类与恢复策略：一次压缩重试、压缩后仍 overflow 停止并建议换更大窗口。
-- 冻结下游 Runtime 将消费的 `SessionEntry`、`SessionStore`、Context、Navigation、Summary 和 Compaction 公共契约，补齐 M9 验收矩阵中属于 M1～M6 的场景。
+- 空闲期 Compaction 在数据库事务外生成摘要，成功后原子插入 Entry 并推进 leaf/sequence；提交成功后重建完整 path、有效 messages、模型状态和压缩后 token 估算。
+- Turn 内 Compaction 只返回可写入 checkpoint 的稳定 pending Entry 与压缩后 working context，不写数据库、不移动 active leaf。
+- 摘要失败、取消、空摘要或 stale leaf 不留下部分持久化状态；提交失败保留 prepared 结果供复用。
+- checkpoint、Turn 最终提交和 Turn 内 Compaction 共用一种 pending Entry 结构。
+- provider overflow 只通过 adapter 翻译后的内部错误契约暴露给 Runtime；真正的“压缩并重试一次”由下游 Runtime 在最近安全 checkpoint 上编排。
 
-### 测试
+### 测试（Batch briefing 冻结的 29 个场景）
 
-- 从 User/Assistant 开始的 cut point、完整 tool batch、多 User 交互段、prefix summary。
-- 旧 Compaction 增量更新、摘要输入超预算、单 ToolResult 截断、压缩后仍 overflow。
-- 手动 no-op、自动失败、取消 durable boundary、摘要成功但提交失败后复用结果。
-- Turn 内 Compaction 只形成领域结果，不移动数据库 leaf。
-- 公共 API contract、InMemory/SQLite 集成以及 M9 验收矩阵中属于 M1～M6 的场景。
+#### Pending Entry 与 Turn 提交
+
+1. 稳定 pending Entry 提交到空 Session：Store 只分配 sequence，保留调用方提供的 ID、时间和根 parent。
+2. pending 链接到已有 active leaf：parent 链与连续 sequence 正确，leaf 指向末条。
+3. Turn 提交原子清除 checkpoint，同时提交 Entry、leaf 和 sequence。
+4. stale leaf 拒绝 Turn 提交，Entry、leaf、sequence 和 checkpoint 全部不变。
+5. 空 pending 链返回 constraint，Session 不变。
+6. 第一条或后续 Entry 的 parent 链不连续时拒绝整批提交。
+7. pending Compaction 的 `firstKeptEntryId` 引用本 Turn 更早 pending Entry 时可完整物化并保持引用有效。
+
+#### Compaction Store 事务
+
+8. InMemory/SQLite 成功提交 Compaction，完整保存 payload 并原子推进 leaf/sequence。
+9. 独立 Compaction 提交不擅自清除 runtime checkpoint metadata。
+10. stale source leaf 返回 `SessionLeafConflictError` 并完整回滚。
+11. Session 不存在时返回 `SessionNotFoundError`。
+12. 空白摘要返回 constraint 且不写 Entry。
+13. 非法 parent 或 `firstKeptEntryId` 引用在两种 Store 中都被拒绝并回滚。
+
+#### Summary 契约
+
+14. Compaction 请求分别传递固定 instructions、协议安全 history、model/thinking、maxOutputTokens 和 signal。
+15. Branch Summary 迁移到固定 instructions，并保持原有区间、模型、重试和取消行为。
+
+#### Turn 内 Compaction
+
+16. 成功准备具有稳定 ID、时间、逻辑 parent、trigger/model/usage/tokensBefore 的 pending Compaction，且 Store 未被调用。
+17. pending Compaction 可以引用尚未落库的同 Turn Entry，并返回应用新 Compaction 后的有效 messages。
+18. pending 摘要失败或取消时不返回 Compaction Entry，也不修改原 pending 链。
+19. pending 摘要为空时返回 `empty-summary`，不形成 durable 结果。
+
+#### 空闲期 Compaction 领域服务
+
+20. 手动 Compaction 在事务外生成摘要，提交后成为 active leaf，并返回重建上下文与压缩后估算。
+21. 没有可压缩内容时友好 no-op，不调用摘要模型、不写 Entry。
+22. 当前模型不可执行时返回 `model-unavailable`，摘要模型调用次数为零。
+23. 摘要生成失败或取消时返回 `generation-failed`，不提交 Compaction。
+24. 摘要成功后 source leaf 已变化时返回 `SessionLeafConflictError`，不写 Compaction。
+25. 提交失败返回 `PreparedCompaction`；复用重试时保持同一摘要和 Entry ID，不再次调用模型。
+26. 提交成功后 messages 以新 Compaction summary 开始，保留尾部、完整路径状态与模型状态正确。
+
+#### Provider overflow 归一化
+
+27. OpenAI 结构化 context overflow 被 adapter 转换为内部 `ProviderInvocationError("context-overflow")`。
+28. rate limit、认证、网络或未知 OpenAI 错误不被误判为 context overflow。
+29. overflow 在 stream 创建或消费阶段发生时得到相同内部分类，partial stream 不形成成功响应。
 
 ### Review 重点
 
-- cut point 是否保留用户意图与工具协议边界。
-- Turn 内 Compaction 是否只形成领域结果，没有提前接管 checkpoint 或移动数据库 leaf。
+- Store 是否只分配 sequence，并严格保留 checkpoint 已冻结的 Entry 身份和 parent 链。
+- Turn 内 Compaction 是否只形成领域结果，没有提前写 checkpoint、提交半个 Turn或移动数据库 leaf。
+- 摘要模型调用是否始终在 SQLite 事务外；prepared 重试是否不重复模型调用。
+- provider 错误映射是否局限于 adapter，且只依据可靠结构化字段。
 - 冻结接口是否最小、provider-neutral，足够让 Runtime 不访问 Session 内部实现。
-
-> 备注：本 Batch 是十个中最重的一个（cut point + 增量摘要 + 提交 + Turn 内 + 契约冻结）。如实现或 review 时发现负担过大，按下列自然边界拆成两个 Batch：**B10a** 压缩算法（cut point + 交互段切分 + 增量摘要，纯计算）；**B10b** Compaction 提交 + Turn 内 pending 结果 + overflow 恢复 + 契约冻结。
 
 ## 14. 分支完成标准
 

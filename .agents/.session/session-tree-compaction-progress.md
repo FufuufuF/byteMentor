@@ -3,7 +3,7 @@
 - 分支：`feat/session-tree-compaction`
 - 计划：[`.agents/.plan/session-tree-compaction-implementation-plan.md`](../.plan/session-tree-compaction-implementation-plan.md)
 - 设计：[`.agents/.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)（M1～M6）
-- 状态：**Batch 1～9 已提交；Batch 10a 压缩算法已完成 review，随本次提交；Batch 10b 尚未开始（未 briefing）**
+- 状态：**Batch 1～10a 已提交；Batch 10b 契约决策与 briefing 已写入文档，等待用户确认后进入 TDD**
 
 ## 当前进度
 
@@ -18,8 +18,8 @@
 | 7 | 摘要基础设施（区间、序列化、端口、重试） | `5b86d05` | ✅ 已提交 |
 | 8 | Branch Summary 垂直切片 | `51142fb` | ✅ 已提交 |
 | 9 | Token 预算与压缩决策（决策层） | `e50c56d` | 🟡 已提交；运行时接线待补 |
-| 10a | Compaction 压缩算法（纯计算） | — | ✅ 已完成 review；随本次提交 |
-| 10b | Compaction 提交、Turn 内结果与契约冻结 | — | ⬜ 未开始 |
+| 10a | Compaction 压缩算法（纯计算） | `4a36011` | ✅ 已提交 |
+| 10b | Compaction 提交、Turn 内结果与契约冻结 | — | 🟡 briefing 待确认 |
 
 ## 重要架构决策（实现中用户确认，已偏离原始计划）
 
@@ -61,7 +61,7 @@
 
 - 现状：`SummaryModelPort` 只是接口；`navigateWithBranchSummary` 经 `input.summarize` 注入、由 `executeSummaryWithRetry` 包装调用。全仓库无具体实现，测试均用 fake port。
 - 归属：语义上等价于一次单轮、无工具的 provider 调用，现有 `ModelProvider`（`providers/provider.ts`）已具备能力。
-- **待办（M7 Runtime 分支）**：在 agent 包新建 provider 桥接适配器（如 `summary/provider-summary-adapter.ts`），把 `SummaryRequest`（historyText + model/thinking）映射为 `ProviderRequest`，调用 `invoke` 并把输出映射为 `SummaryResponse`（文本 + usage）；取消接 `ProviderInvocationOptions.signal`。M7 Runtime 组装时经 `summarize` 注入。
+- **待办（M7 Runtime 分支）**：在 agent 包新建 provider 桥接适配器（如 `summary/provider-summary-adapter.ts`），把 `SummaryRequest`（固定 instructions + historyText + model/thinking + 可选 maxOutputTokens）映射为具体 provider 请求，调用模型并把输出映射为 `SummaryResponse`（文本 + usage）；取消接 `signal`。M7 Runtime 组装时经 `summarize` 注入。
 
 ### 5. `RuntimeEnvironment` 从 session 迁入 agent（B8 用户确认）
 
@@ -74,6 +74,14 @@
 - `RebuiltNavigationContext`（path/messages/modelState/execution）以扁平字段展开进 `navigateWithBranchSummary` 成功结果，而非嵌套 `context` 对象。
 - `unknown-entry` 区间结果 → `SessionCorruptedError("parent-missing")`（活动路径已通过重建校验，剩余只可能是目标祖先链缺失）。
 - 摘要文本 trim 后存储；`PreparedBranchSummary` 只含 summary/model/usage，重试时重新校验目标与区间。
+
+### 7. B10b 公共契约（用户已确认）
+
+- pending Entry 在写入 runtime checkpoint 前已经具有稳定 `id`、`createdAt` 和逻辑 `parentId`，只缺少最终事务分配的 `sequence`；统一导出 `PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">`，不再维护第二套同义 checkpoint 类型。
+- `commitTurnEntries` 直接接收并校验上述稳定 pending 链；Store 不在提交时生成新 ID/时间或推导另一条 parent 链。这样 Turn 内 `CompactionEntry.firstKeptEntryId` 可以安全引用尚未落库的同 Turn Entry。
+- `SummaryRequest` 增加固定 `instructions` 与可选 `maxOutputTokens`，和不可信 `historyText` 分离；Compaction/Branch Summary 领域服务负责填入各自固定指令，不开放自定义 prompt。
+- provider overflow 采用 adapter 翻译边界：每个 Provider Adapter 根据自身厂商的结构化错误映射为 Byte Mentor 的 `ProviderInvocationError(kind = "context-overflow")`；Agent/Runtime 不依赖 OpenAI SDK、不解析厂商错误文案，无法确认的错误不得猜测为 overflow。
+- B10b 的 29 个测试场景、明确范围与非目标已写入 implementation plan；实际 safe-point/checkpoint 接线和 overflow 后单次重试循环仍由下游 Runtime 分支实现。
 
 ## 各 Batch 交付细节
 
@@ -96,7 +104,7 @@
 
 - `setRuntimeCheckpoint`/`clearRuntimeCheckpoint`：单语句 `json_set`/`json_remove` + RETURNING，形状无关（checkpoint 结构由 M7 Runtime 定义）
 - `commitTurnEntries({ sessionId, expectedLeafId, entries })`：BEGIN IMMEDIATE 内校验 leaf → 连续分配 seq → 批量插入 → 推进 leaf/seq → 清除 runtime_checkpoint，全有或全无
-- `SessionLeafConflictError`（leaf 过期，D 级）；`PendingTurnEntry`（DistributiveOmit 保留 union 收窄，id/createdAt 可省略）
+- `SessionLeafConflictError`（leaf 过期，D 级）；B3 初版 `PendingTurnEntry` 允许省略 id/createdAt 并由 Store 推导 parent，B10b 将按已确认的最终 checkpoint 契约替换为稳定 `PendingSessionEntry`
 - 恢复提交复用同一 commitTurnEntries（补"未知 ToolResult"的物化逻辑在 M7 Runtime）
 
 ### Batch 4：`feat(session): rebuild active path and replay state`
@@ -166,11 +174,11 @@
 
 - 测试：56 文件 / 674 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
 - `tsc -b`、测试类型检查、`eslint`、Prettier 检查均通过
-- Git 状态：B10a 代码与本进度更新位于同一提交；B10b 尚未开始
+- Git 状态：B10a 已提交（`4a36011`）；B10b 的设计/计划/进度文档更新尚未提交，生产代码与测试尚未开始
 
 ## 下一步（Batch 10b：Compaction 提交、Turn 内结果与契约冻结）
 
-继续完成 `packages/agent/**`、`packages/session/**` 及对应测试：
+等待用户确认 implementation plan 中已经冻结的 Batch 10b briefing；确认后按 29 个测试场景进入完整 RED → GREEN：
 
 - **agent 包**：在 B10a 的纯规划结果上实现 Compaction 领域服务、pending Compaction 结果和 overflow 归一化。
 - **session 包**：Compaction 原子提交事务，落库 `CompactionEntry` 并推进 leaf/sequence。

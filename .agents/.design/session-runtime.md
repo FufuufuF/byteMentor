@@ -72,7 +72,7 @@ interface RuntimeCheckpoint {
 }
 ```
 
-`PendingEntry` 表达已获得稳定 ID 和逻辑 parent、但尚未分配 `sequence` 的 Session Entry。
+`PendingEntry` 直接使用上游 Session Tree & Compaction 模块冻结的 `PendingSessionEntry`：它表达已获得稳定 `id`、`createdAt` 和逻辑 `parentId`、但尚未分配 `sequence` 的 Session Entry。Runtime checkpoint、Turn 内 Compaction 和最终提交不得再定义第二套同义 pending 类型。
 
 phase 表达“从这个稳定持久化状态恢复后，接下来可以安全做什么”，不再编码“最后追加了哪种 Entry”：
 

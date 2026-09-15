@@ -471,18 +471,26 @@ Verify external state or ask the user before retrying.
 
 一个 Turn 在运行期间只更新统一的 runtime checkpoint；Turn 到达可提交终态后，再把 checkpoint 中累计的 user、assistant、tool result 以及可能在 Turn 内生成的 compaction 转换为一批有序 Session Entry。
 
+checkpoint 与最终提交共用一种 pending Entry 结构：pending Entry 在进入 checkpoint 前已经获得稳定的 `id`、`createdAt` 和逻辑 `parentId`，只缺少由最终事务分配的 `sequence`：
+
+```ts
+type PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">;
+```
+
+第一条 pending Entry 的 `parentId` 必须等于 Turn 的 `baseLeafId`，后续 Entry 的 `parentId` 必须等于前一条 pending Entry 的 `id`。Store 不在提交时重新生成这些身份或推导另一条 parent 链；这保证 checkpoint 恢复、Turn 内 Compaction 的 `firstKeptEntryId` 引用和最终 Session 树使用同一组稳定身份。
+
 整批 Entry 的写入使用一个短暂的 `BEGIN IMMEDIATE` 事务，并在同一事务中完成：
 
 1. 读取并校验当前 `active_leaf_id` 仍等于 Turn 开始时的 leaf。
 2. 从 `sessions.next_entry_seq` 开始，为本批 Entry 分配连续的 `entry_seq`。
-3. 第一条 Entry 的 `parent_id` 指向原 active leaf；后续 Entry 按 Turn 内顺序依次连接前一条 Entry。空 Session 的第一条 Entry 使用 `parent_id = null`。
+3. 校验 pending Entry ID 唯一且 parent 链连续：第一条指向原 active leaf，后续逐条指向前一条；空 Session 的第一条使用 `parent_id = null`。
 4. 插入本批全部 Entry。
 5. 把 `active_leaf_id` 推进到本批最后一条 Entry，并把 `next_entry_seq` 增加本批 Entry 数量。
 6. 仅从 `metadata_json` 中移除 `runtime_checkpoint`，保留其他 metadata，同时更新 `updated_at`。
 
 任意步骤失败则整个事务回滚：不会留下部分 Entry，leaf 和 sequence 不推进，checkpoint 仍可用于恢复。事务提交成功后，Entry、leaf、sequence 和 checkpoint 清理同时可见，不会把同一 Turn 再次恢复。
 
-模型请求、工具执行和其他 Turn 运行过程不包含在该数据库事务内。Entry ID 可以在事务前生成，但只有事务提交后才成为持久化事实。
+模型请求、工具执行和其他 Turn 运行过程不包含在该数据库事务内。Entry ID、createdAt 和逻辑 parent 在 checkpoint 前生成，但只有事务提交后才成为正式 Session 树中的持久化事实。
 
 ### 3.8 Checkpoint 更新
 
@@ -543,12 +551,12 @@ RETURNING active_leaf_id;
 1. 捕获当前 `sourceLeafId`、活动路径、cut point 和摘要输入。
 2. 在数据库事务外调用模型生成压缩摘要。
 3. 成功后开启短暂的 `BEGIN IMMEDIATE` 事务，校验当前 active leaf 仍为 `sourceLeafId`。
-4. 使用当前 `next_entry_seq` 插入 `CompactionEntry`，其 `parent_id = sourceLeafId`；领域层在写入前保证 `firstKeptEntryId` 为该活动路径中的合法节点或 `null`。
+4. 领域层提交已经具有稳定 `id`、`createdAt` 和 `parentId = sourceLeafId` 的 pending `CompactionEntry`；Store 使用当前 `next_entry_seq` 为其分配 sequence 并插入。领域层在写入前保证 `firstKeptEntryId` 为该活动路径中的合法节点或 `null`。
 5. 同一事务把 active leaf 推进到 compaction entry、`next_entry_seq` 加一并更新 `updated_at`。
 
 摘要生成失败或取消时不修改 session。提交失败时 Entry、leaf 和 sequence 一起回滚；成功后再重建模型上下文。触发条件、cut point 和摘要更新算法留到 M6，不在数据库事务中决定。
 
-上述立即插入事务适用于 Agent 空闲时的手动 Compaction，以及新 Turn 正式进入 ReAct 前对已有持久化路径执行的 Compaction。M6 进一步确认：Turn 内也可以在完整 tool 批次结束后的安全点生成 pending Compaction。该 Entry 先进入 runtime checkpoint，与本 Turn 其他 pending Entry 一起在 Turn 最终提交事务中统一插入；Turn 内摘要生成期间不提前移动数据库中的 active leaf。具体 checkpoint 状态机在 M7 落实。
+上述立即插入事务适用于 Agent 空闲时的手动 Compaction，以及新 Turn 正式进入 ReAct 前对已有持久化路径执行的 Compaction。M6 进一步确认：Turn 内也可以在完整 tool 批次结束后的安全点生成 `PendingSessionEntry` 形态的 Compaction。该 Entry 的 ID、时间和逻辑 parent 在写 checkpoint 前已经固定，先进入 runtime checkpoint，再与本 Turn 其他 pending Entry 一起在 Turn 最终提交事务中统一分配 sequence 并插入；Turn 内摘要生成期间不提前移动数据库中的 active leaf。具体 checkpoint 状态机在 M7 落实。
 
 ### 3.12 Fork
 
@@ -954,6 +962,24 @@ User₁ → Assistant₁ → ToolResult₁ → User₂ → Assistant₂ → Tool
 
 Compaction 和 Branch Summary 共用摘要基础设施：历史序列化成带角色标记、受固定标签包裹的纯文本，作为独立摘要请求发送；提示词明确要求只总结，不继续执行历史中的请求。
 
+摘要端口使用 provider-neutral 的结构化请求，明确区分由领域层生成的固定任务指令与不可信历史输入：
+
+```ts
+interface SummaryRequest {
+  instructions: string;
+  historyText: string;
+  model: ModelRef;
+  thinkingLevel: ThinkingLevel;
+  maxOutputTokens?: number;
+  signal?: AbortSignal;
+}
+```
+
+- `instructions` 只能由 Branch Summary/Compaction 领域服务填入各自固定提示词，不开放用户自定义 prompt。
+- `historyText` 只承载协议安全序列化后的历史，不与任务指令混成一个无边界字符串。
+- `maxOutputTokens` 传递本次摘要输出预算；provider adapter 负责映射到具体厂商请求。Branch Summary 没有单独预算时可以省略。
+- 摘要端口的具体 provider 桥接仍由 Runtime 组装；Session 包不依赖 provider。
+
 摘要输入中的单个 ToolResult 最多保留 2,000 字符，并标记截断及原长度，优先保留错误、路径、退出码和结果头尾。该限制只作用于摘要请求，不修改 Session 中保存的原始 ToolResult。
 
 已知窗口时：
@@ -994,7 +1020,16 @@ summaryInputBudget =
 
 手动 Compaction 或 Branch Summary 失败时 Session/leaf 不变。自动 Compaction 失败时，不继续发送已经判定接近或超过安全阈值的 provider 请求；当前操作明确失败，已完成工具调用和 checkpoint 仍按既有恢复规则保存，不自动换模型。
 
-provider adapter 负责把各厂商错误归一化为明确的 context-overflow 分类，AgentLoop 不直接解析厂商异常文本，并排除 rate limit、quota、authentication 等非 overflow 错误。
+provider adapter 负责把各厂商错误归一化为 Byte Mentor 自己定义的 provider-neutral 错误，AgentLoop 不直接解析厂商异常文本，也不依赖任何厂商 SDK 类型。首版冻结 `ProviderInvocationError` 的 `context-overflow` 分类：
+
+```ts
+class ProviderInvocationError extends Error {
+  readonly kind: "context-overflow";
+  readonly cause?: unknown;
+}
+```
+
+每个 provider adapter 只在厂商返回可可靠识别的结构化错误 code/type 时转换为 `context-overflow`；OpenAI adapter 可以在自身内部依赖 OpenAI SDK 的错误结构，未来其他 adapter 分别实现各自映射。rate limit、quota、authentication、网络错误和无法确认的异常不得猜测为 overflow，保持其原有普通 provider 错误语义。上层只识别 Byte Mentor 的错误契约。
 
 provider 调用发生 overflow 时，在最近安全 checkpoint 上自动压缩并重试该 provider 调用一次：失败请求的 partial stream 被丢弃，已完成工具不会重新执行。同一次调用最多恢复一次；压缩后仍 overflow 时停止并建议切换更大窗口模型。成功响应若 usage 已接近阈值，不重试该响应，只在下一个安全点压缩。
 
