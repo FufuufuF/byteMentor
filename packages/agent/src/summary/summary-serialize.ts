@@ -1,5 +1,5 @@
 import type { SessionEntry } from "@byte-mentor/session";
-import { applyCompaction } from "../context/session-context.js";
+import { selectEffectiveContextEntries } from "../context/session-context.js";
 
 // M5.4/M6.8 摘要输入序列化：把待总结区间转换为固定标签包裹的纯文本，作为独立摘要请求发送。
 // 不把任意片段伪装成原生 provider 对话；状态 Entry 排除；区间内 Compaction 按 M4
@@ -8,7 +8,7 @@ import { applyCompaction } from "../context/session-context.js";
 // 序列化区间为摘要输入。输入区间已被 computeSummaryInterval 裁剪为 (LCA, S]，
 // 这里再次应用 Compaction 裁剪并逐条转文本。
 export function serializeSummaryInput(entries: readonly SessionEntry[]): string {
-  const compactionResult = applyCompaction(entries);
+  const compactionResult = selectEffectiveContextEntries(entries);
   const effective = compactionResult.ok ? compactionResult.entries : [...entries];
   const parts: string[] = [];
   for (const entry of effective) {

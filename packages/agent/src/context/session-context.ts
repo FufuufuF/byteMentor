@@ -61,7 +61,7 @@ export function mapEntriesToMessages(entries: readonly SessionEntry[]): Message[
 
 // M4.6 压缩感知裁剪：以活动路径上最后一个 Compaction 计算有效上下文 [C] + [K..C) + (C..leaf]。
 // firstKeptEntryId = null 时不保留 C 之前的尾部；非空时必须是路径中严格早于 C 的节点，否则损坏。
-export function applyCompaction(
+export function selectEffectiveContextEntries(
   path: readonly SessionEntry[],
 ): { ok: true; entries: SessionEntry[] } | { ok: false; error: SessionCorruptedError } {
   const lastCompactionIndex = findLastIndex(path, (e) => e.type === "compaction");
@@ -104,7 +104,7 @@ export function buildProviderContext(
       execution: { ok: true } | { ok: false; reason: string };
     }
   | { ok: false; error: SessionCorruptedError } {
-  const compactionResult = applyCompaction(path);
+  const compactionResult = selectEffectiveContextEntries(path);
   if (!compactionResult.ok) {
     return compactionResult;
   }

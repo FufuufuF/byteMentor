@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { applyCompaction, buildProviderContext, mapEntriesToMessages } from "@byte-mentor/agent";
+import {
+  buildProviderContext,
+  mapEntriesToMessages,
+  selectEffectiveContextEntries,
+} from "@byte-mentor/agent";
 import type { SessionSnapshot } from "@byte-mentor/session";
 import type { SessionEntry } from "@byte-mentor/session";
 import type { SessionId, ToolCallId } from "@byte-mentor/core";
@@ -231,15 +235,15 @@ describe("mapEntriesToMessages all kinds", () => {
 });
 
 // 场景：无 Compaction。预期：裁剪返回全部路径 Entry。
-describe("applyCompaction without compaction", () => {
+describe("selectEffectiveContextEntries without compaction", () => {
   it("returns the full path when there is no compaction entry", () => {
     const entries = [userEntry("u1", 1, null), assistantEntry("a1", 2, "u1", { content: "x" })];
-    expect(applyCompaction(entries)).toEqual({ ok: true, entries });
+    expect(selectEffectiveContextEntries(entries)).toEqual({ ok: true, entries });
   });
 });
 
 // 场景：有 Compaction 且 firstKeptEntryId 指向路径中。预期：[C] + [K..C) + (C..leaf]。
-describe("applyCompaction with compaction", () => {
+describe("selectEffectiveContextEntries with compaction", () => {
   it("keeps [C] + [K..C) + (C..leaf]", () => {
     const entries: SessionEntry[] = [
       userEntry("u1", 1, null), // 被压掉（K 之前）
@@ -250,7 +254,7 @@ describe("applyCompaction with compaction", () => {
       userEntry("u3", 6, "c1"), // C 之后
       assistantEntry("a3", 7, "u3", { content: "new" }),
     ];
-    const result = applyCompaction(entries);
+    const result = selectEffectiveContextEntries(entries);
     expect(result).toEqual({
       ok: true,
       entries: [
@@ -271,7 +275,7 @@ describe("applyCompaction with compaction", () => {
       compactionEntry("c1", 3, "a1", null),
       userEntry("u2", 4, "c1"),
     ];
-    const result = applyCompaction(entries);
+    const result = selectEffectiveContextEntries(entries);
     expect(result).toEqual({ ok: true, entries: [entries[2], entries[3]] });
   });
 
@@ -284,7 +288,7 @@ describe("applyCompaction with compaction", () => {
       compactionEntry("c2", 4, "u2", null, "second summary"),
       userEntry("u3", 5, "c2"),
     ];
-    const result = applyCompaction(entries);
+    const result = selectEffectiveContextEntries(entries);
     expect(result).toEqual({ ok: true, entries: [entries[3], entries[4]] });
   });
 
@@ -294,7 +298,7 @@ describe("applyCompaction with compaction", () => {
       userEntry("u1", 1, null),
       compactionEntry("c1", 2, "u1", "ghost-kept"),
     ];
-    const result = applyCompaction(entries);
+    const result = selectEffectiveContextEntries(entries);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.name).toBe("SessionCorruptedError");
@@ -308,7 +312,7 @@ describe("applyCompaction with compaction", () => {
       compactionEntry("c1", 3, "u2", "u3"), // firstKept 指向 C 之后的 u3（非法）
       userEntry("u3", 4, "c1"),
     ];
-    const result = applyCompaction(entries);
+    const result = selectEffectiveContextEntries(entries);
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.error.name).toBe("SessionCorruptedError");
@@ -316,12 +320,12 @@ describe("applyCompaction with compaction", () => {
   });
 });
 
-// 场景：非活动分支上的 Compaction（不在 path 里）。预期：不生效（applyCompaction 只处理传入的路径）。
-describe("applyCompaction branch isolation", () => {
+// 场景：非活动分支上的 Compaction（不在 path 里）。预期：不生效（只处理传入的活动路径）。
+describe("selectEffectiveContextEntries branch isolation", () => {
   it("ignores compaction entries not on the provided path", () => {
     const path = [userEntry("u1", 1, null), assistantEntry("a1", 2, "u1", { content: "x" })];
     // 分支 A 上的 compaction 不在 path 中，自然不生效
-    expect(applyCompaction(path)).toEqual({ ok: true, entries: path });
+    expect(selectEffectiveContextEntries(path)).toEqual({ ok: true, entries: path });
   });
 });
 

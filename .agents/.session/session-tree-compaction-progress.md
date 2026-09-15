@@ -3,7 +3,7 @@
 - 分支：`feat/session-tree-compaction`
 - 计划：[`.agents/.plan/session-tree-compaction-implementation-plan.md`](../.plan/session-tree-compaction-implementation-plan.md)
 - 设计：[`.agents/.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)（M1～M6）
-- 状态：**Batch 1～8 已完成并提交；Batch 9 尚未开始（未 briefing）**
+- 状态：**Batch 1～9 已提交；Batch 10a 压缩算法已完成 review，随本次提交；Batch 10b 尚未开始（未 briefing）**
 
 ## 当前进度
 
@@ -17,8 +17,9 @@
 | 6 | Fork 垂直切片 | `43dcb4f` | ✅ 已提交 |
 | 7 | 摘要基础设施（区间、序列化、端口、重试） | `5b86d05` | ✅ 已提交 |
 | 8 | Branch Summary 垂直切片 | `51142fb` | ✅ 已提交 |
-| 9 | Token 预算与压缩决策 | — | ⬜ 未开始 |
-| 10 | Compaction 垂直切片与契约冻结 | — | ⬜ 未开始 |
+| 9 | Token 预算与压缩决策（决策层） | `e50c56d` | 🟡 已提交；运行时接线待补 |
+| 10a | Compaction 压缩算法（纯计算） | — | ✅ 已完成 review；随本次提交 |
+| 10b | Compaction 提交、Turn 内结果与契约冻结 | — | ⬜ 未开始 |
 
 ## 重要架构决策（实现中用户确认，已偏离原始计划）
 
@@ -32,7 +33,7 @@
   - `summary/summary-port.ts`：端口类型 `SummaryModelPort`/`SummaryRequest`/`SummaryResponse`/`SummaryError`（三分类 retryable/permanent/cancelled）
   - `summary/summary-executor.ts`：`executeSummaryWithRetry`（重试一次、Retry-After、取消）
   - `summary/branch-summary.ts`：`navigateWithBranchSummary` 领域服务 + `BranchSummaryError`（四分类）+ `PreparedBranchSummary`（B8）
-  - `context/session-context.ts`：`mapEntriesToMessages`/`applyCompaction`/`buildProviderContext`（原 session 的 context-builder 整体移入，M4.9 流水线）
+  - `context/session-context.ts`：`mapEntriesToMessages`/`selectEffectiveContextEntries`/`buildProviderContext`（原 session 的 context-builder 整体移入，M4.9 流水线）
   - `runtime/runtime-environment.ts`：`RuntimeEnvironment`/`defaultRuntimeEnvironment`（B8 从 session 迁入，见决策 5）
 - **session 包**（`packages/session/src/`）：只保留 Entry 类型、Store 持久化、树/路径/状态回放、导航、fork、以及各写事务提交原语。**零 agent 依赖**。
 
@@ -107,7 +108,7 @@
 
 ### Batch 5：`feat(session): build provider context and direct navigation`
 
-- `context-builder.ts`（后移入 agent）：`mapEntriesToMessages`（Entry→Message，wrapper 固定、Entry ID 作 Message ID）、`applyCompaction`（`[C]+[K..C)+(C..leaf]`，firstKeptEntryId 合法性）、`buildProviderContext`（M4.9 流水线）
+- `context-builder.ts`（后移入 agent）：`mapEntriesToMessages`（Entry→Message，wrapper 固定、Entry ID 作 Message ID）、`selectEffectiveContextEntries`（`[C]+[K..C)+(C..leaf]`，firstKeptEntryId 合法性）、`buildProviderContext`（M4.9 流水线）
 - `tree-navigation.ts`：`listTreeTargets`（M5.1 可见/可选规则）、`navigateDirectly`（user→parent 归一化+草稿、no-op、stale 错误）
 - `updateLeaf` 单语句原语（双实现）；`SessionNavigationError`
 - **未改 agent 的旧 ContextBuilder**（决策 3：M7 迁移时改）
@@ -136,18 +137,43 @@
 - `RuntimeEnvironment` 迁入 agent（决策 5）
 - 测试：`test/session/store-contract.ts`（+6 契约用例，双实现共享）、`test/agent/branch-summary.test.ts`（20 用例）
 
+### Batch 9：`feat(agent): add token budgeting and compaction triggers`
+
+- `packages/agent/src/token/model-capabilities.ts`：按精确 `(provider, modelId)` 匹配的模型能力表；未知模型不假定 context window，也不启用阈值自动压缩。
+- `packages/agent/src/token/token-estimator.ts`：消息、tool definitions/schema、system prompt 的本地 token 估算；ASCII/非 ASCII 保守估算、固定协议开销、tool-call 参数稳定序列化，以及 usage 锚点估算。
+- `packages/agent/src/token/token-budget.ts`：`reserveTokens`/`keepRecentTokens`/`maxSummaryOutputTokens` 预算计算、压缩阈值判定、未知模型策略和超预算错误。
+- provider usage 归一化：扩展 provider response/stream usage，并在 OpenAI provider 中解析 usage。
+- 测试：`test/agent/model-capabilities.test.ts`、`test/agent/token-estimator.test.ts`、`test/agent/token-budget.test.ts`、`test/agent/openai-chat-provider.test.ts` 以及 core model 测试。
+- 边界：本 Batch 只产出压缩决策，不写 `CompactionEntry`；真实 compaction 提交和 Runtime 消费留在 Batch 10/下游 Runtime。
+
+### Batch 9 当前未闭合项
+
+- `AgentRunner` 目前仍只向上返回 message/stopReason，provider 返回的 usage 尚未完整接入 AssistantEntry/session 持久化。
+- `shouldCompact` 尚未接入完整 Turn 前置决策和实际压缩流程。
+- `SummaryModelPort` 仍只有接口，provider 桥接适配器按决策归入下游 Runtime 分支实现。
+
+### Batch 10a：Compaction 压缩算法（纯计算）
+
+- `packages/agent/src/compaction/compaction-planner.ts`：`planCompaction` 基于有效活动上下文与 `keepRecentTokens` 选择切点；状态 Entry 不参与 token 切点，ToolResult 切点回退到产生它的 AssistantEntry，必要时把同一用户交互的前缀并入摘要输入。
+- 增量摘要：只携带最近 Compaction 的 `previousSummary` 与本次新增被压缩内容，不重新展开已被旧摘要替代的历史；摘要输入超过 `summaryInputBudget` 时返回 `summary-input-overflow`。
+- `packages/agent/src/compaction/compaction-summary.ts`：固定 Goal、Constraints、Progress、Key Decisions、Files、Errors、Next Steps、Critical Context 八段摘要结构，并明确历史内容只可总结、不可继续执行。
+- `selectEffectiveContextEntries`：原 `applyCompaction` 重命名为语义更准确的有效上下文选择函数，仍按最后一个 Compaction 的 `firstKeptEntryId` 执行 `[C] + [K..C) + (C..leaf]` 裁剪。
+- API 收敛：交互前缀仅作为 planner 内部的 `readonly SessionEntry[] | null` 临时值，不导出同构的 segment/prefix 类型，也不暴露在 `CompactionPlan` 中。
+- 测试：`test/agent/compaction.test.ts` 共 10 个用例，覆盖 User/Assistant 切点、完整 tool batch、多 User 交互、交互前缀、状态 Entry、旧摘要增量合并、固定 prompt、ToolResult 截断、摘要输入溢出和 no-op。
+- 边界：本 Batch 只产出纯 `CompactionPlan`，不调用摘要模型、不写 `CompactionEntry`、不移动数据库 leaf，也不接管 Runtime checkpoint。
+
 ## 当前基线
 
-- 测试：52 文件 / 638 测试全绿（`pnpm test`）
-- `pnpm typecheck`、`pnpm lint`、`pnpm format:check` 通过
-- Git 状态：工作区干净（B8 已提交，含本进度文件）
+- 测试：56 文件 / 674 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
+- `tsc -b`、测试类型检查、`eslint`、Prettier 检查均通过
+- Git 状态：B10a 代码与本进度更新位于同一提交；B10b 尚未开始
 
-## 下一步（Batch 9：Token 预算与压缩决策）
+## 下一步（Batch 10b：Compaction 提交、Turn 内结果与契约冻结）
 
-按更新后的计划（全部在 agent 包 + test/agent）：
+继续完成 `packages/agent/**`、`packages/session/**` 及对应测试：
 
-- **agent 包**：ModelCapabilities 表、token 估算、预算与阈值、触发决策（压缩决策属于 agent 层）
-- **agent 包**：provider usage 归一化的必要扩展
-- 目标：内置 `(provider, modelId)` 精确匹配的 `ModelCapabilities`；未知模型不启用阈值自动压缩、不假定默认窗口；usage 锚点（真实 usage 优先、cachedInputTokens 不重复计入、锚点失效重新全量估算）；本地估算（ASCII chars/4、非 ASCII 保守、固定协议开销、tool-call 稳定序列化）；动态 reserveTokens/keepRecentTokens/maxSummaryOutputTokens 与触发阈值；压缩后重估仍超阈值时阻止请求
-- 明确边界：本 Batch 只产出压缩决策，不写 Entry（提交在 B10）
+- **agent 包**：在 B10a 的纯规划结果上实现 Compaction 领域服务、pending Compaction 结果和 overflow 归一化。
+- **session 包**：Compaction 原子提交事务，落库 `CompactionEntry` 并推进 leaf/sequence。
+- **上下文与恢复**：压缩后重建有效 provider context；Turn 内只产出可由 Runtime 消费的 pending 结果，不提前移动数据库 leaf。
+- **契约冻结**：补齐 InMemory/SQLite contract、公共 exports 和 M1～M6 验收场景；完成后再进入 `feat/session-runtime`。
 - 流程：每个 Batch 开始前 briefing + 等用户确认；GREEN 后报告 + 等 review + 授权后才提交
