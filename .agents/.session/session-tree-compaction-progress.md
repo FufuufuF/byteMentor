@@ -3,7 +3,7 @@
 - 分支：`feat/session-tree-compaction`
 - 计划：[`.agents/.plan/session-tree-compaction-implementation-plan.md`](../.plan/session-tree-compaction-implementation-plan.md)
 - 设计：[`.agents/.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)（M1～M6）
-- 状态：**Batch 1～10a、10b-session 已提交；Batch 10b-Turn 已完成并将在本次提交；10b-agent 待实现**
+- 状态：**Batch 1～10a、10b-session、10b-Turn、10b-agent 已提交；下一步进入 `feat/session-runtime`**
 
 ## 当前进度
 
@@ -20,8 +20,8 @@
 | 9 | Token 预算与压缩决策（决策层） | `e50c56d` | 🟡 已提交；运行时接线待补 |
 | 10a | Compaction 压缩算法（纯计算） | `4a36011` | ✅ 已提交 |
 | 10b-session | Compaction 原子提交事务（InMemory + SQLite） | `80fff2a` | ✅ 已提交 |
-| 10b-Turn | PendingSessionEntry 契约与 Turn 最终提交迁移 | 本次提交 | ✅ 已完成 |
-| 10b-agent | Compaction pending/空闲期领域服务与 overflow 归一化 | — | ⏳ 待实现 |
+| 10b-Turn | PendingSessionEntry 契约与 Turn 最终提交迁移 | `dd4722a` | ✅ 已提交 |
+| 10b-agent | Compaction pending/空闲期领域服务与 overflow 归一化 | 本次提交 | ✅ 已提交 |
 
 ## 重要架构决策（实现中用户确认，已偏离原始计划）
 
@@ -180,18 +180,27 @@
 - SQLite Turn 提交使用 `BEGIN IMMEDIATE`、批量 Entry 写入、leaf/sequence 更新和 checkpoint 清理；受影响行数异常时回滚。
 - 迁移 Store contract、fork、tree navigation 和 SQLite 持久化测试；新增空批、非连续 parent 链、同批 Compaction 引用场景。
 
+### Batch 10b-agent：Compaction 领域服务与 overflow 归一化（已提交）
+
+- `packages/agent/src/compaction/compaction-service.ts`：新增 `prepareCompaction`，支持持久化/同 Turn pending 路径，生成稳定 `PendingCompactionEntry`、working messages 和 token 估算；准备阶段不访问 Store。
+- 新增 `compactSession`：空闲期先规划 no-op，再在 Store 事务外调用摘要模型，成功后复用 `commitCompaction`，提交后 reload/rebuild active path、有效 messages、ModelState、execution 和压缩后估算。
+- 新增 `CompactionError` 与 `PreparedCompaction`；摘要失败、取消、空摘要、模型不可用和提交失败均保持明确错误边界，提交失败可复用同一 Entry ID/摘要重试且不重复调用模型。
+- `SummaryRequest` 增加固定 `instructions` 与可选 `maxOutputTokens`；Branch Summary 使用固定指令，Compaction 使用固定章节提示词。
+- 新增 provider-neutral `ProviderInvocationError("context-overflow")`；OpenAI adapter 仅依据结构化 `code/type` 在 stream 创建/消费阶段归一化 context overflow，其他错误保持原样。
+- 测试：新增 Compaction service 10 个场景，并补齐 Summary/Branch Summary/OpenAI overflow 契约；总计 57 文件 / 708 测试。
+- 边界：未接入 AgentLoop、Runtime checkpoint/safe-point、provider bridge 或 overflow 后实际重试循环；这些由 `feat/session-runtime` 消费本批冻结的能力。
+
 ## 当前基线
 
-- 测试：56 文件 / 696 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
+- 测试：57 文件 / 708 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
 - `tsc -b`、测试类型检查、`eslint`、Prettier 检查均通过
-- Git 状态：B10a（`4a36011`）、B10b-session（`80fff2a`）和计划文档（`7c33e3b`）已提交；B10b-Turn 随本次提交完成，B10b-agent 尚未开始
+- Git 状态：B10a（`4a36011`）、B10b-session（`80fff2a`）、计划文档（`7c33e3b`）、B10b-Turn（`dd4722a`）和 B10b-agent 已提交；当前工作区应保持干净
 
-## 下一步（Batch 10b-agent：Compaction 领域服务与 overflow 归一化）
+## 下一步（`feat/session-runtime` Batch 1：Durable Runtime Turn 与崩溃恢复）
 
-在本次 Turn 契约冻结的基础上，按 plan 中剩余场景继续完整 RED → GREEN：
+在本批冻结的 Session/Compaction/Provider 契约基础上，进入 Runtime 分支：
 
-- **agent 包**：在 B10a 的纯规划结果上实现 pending Compaction 准备、空闲期 Compaction 领域服务、prepared 重试和 provider overflow 归一化。
-- **上下文与恢复**：压缩后重建有效 provider context；Turn 内只产出可由 Runtime 消费的 pending 结果，不提前移动数据库 leaf。
-- **session 包**：复用已完成的 `commitCompaction` 与 `commitTurnEntries` 契约，不在本阶段重新扩大 Store 职责。
-- **契约收口**：补齐 Summary `instructions`、`maxOutputTokens`、provider-neutral overflow 和对应 public exports；完成后再进入 `feat/session-runtime`。
-- 流程：每个 Batch 开始前 briefing + 等用户确认；GREEN 后报告 + 等 review + 授权后才提交
+- **AgentLoop/Runtime**：接入统一 `PendingSessionEntry`、最终 `commitTurnEntries`、Turn 内 `prepareCompaction` 和稳定 checkpoint。
+- **恢复与边界**：实现 `ready_for_iteration`/`awaiting_tools` 恢复、完整工具批次和最终 completed/cancelled/failed/max-iterations 提交。
+- **Provider overflow**：由 Runtime 在最近安全 checkpoint 上编排一次压缩并重试；Agent/Runtime 消费 `ProviderInvocationError`，不再解析厂商异常。
+- **流程**：新分支每个 Batch 开始前 briefing + 等用户确认；GREEN 后报告 review，获得授权后再提交。

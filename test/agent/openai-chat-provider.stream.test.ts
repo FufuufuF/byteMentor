@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OpenAIChatProvider } from "@byte-mentor/agent";
+import { OpenAIChatProvider, ProviderInvocationError } from "@byte-mentor/agent";
 import type { ProviderResponse, ProviderStreamEvent } from "@byte-mentor/agent";
 
 interface FakeChunkDeltaToolCall {
@@ -290,5 +290,62 @@ describe("OpenAIChatProvider.invokeStream", () => {
     );
 
     expect(requestOptions[0]).toEqual({ signal: controller.signal });
+  });
+
+  // 场景 29：stream 创建或消费阶段发生 overflow。预期：都归一化为同一内部错误分类，
+  // 已经发出的 partial content 没有 done 成功事件。
+  it("normalizes context overflow during stream creation and consumption", async () => {
+    const errors = [
+      Object.assign(new Error("creation overflow"), {
+        code: "context_length_exceeded",
+        type: "invalid_request_error",
+      }),
+      Object.assign(new Error("consumption overflow"), {
+        code: "context_length_exceeded",
+        type: "invalid_request_error",
+      }),
+    ];
+
+    const creationClient: FakeOpenAIClient = {
+      chat: {
+        completions: {
+          create() {
+            throw errors[0];
+          },
+        },
+      },
+    };
+    const creationProvider = createProvider(creationClient);
+    await expect(collectStream(creationProvider)).rejects.toMatchObject({
+      name: "ProviderInvocationError",
+      kind: "context-overflow",
+    });
+
+    const consumptionClient: FakeOpenAIClient = {
+      chat: {
+        completions: {
+          async *create() {
+            yield chunk({ content: "partial" }, null);
+            throw errors[1];
+          },
+        },
+      },
+    };
+    const consumptionProvider = createProvider(consumptionClient);
+    const events: ProviderStreamEvent[] = [];
+    let caught: unknown;
+    try {
+      for await (const event of consumptionProvider.invokeStream({
+        messages: [{ role: "user", content: "hello" }],
+      })) {
+        events.push(event);
+      }
+    } catch (error) {
+      caught = error;
+    }
+    expect(events).toEqual([{ type: "content_delta", text: "partial" }]);
+    expect(caught).toBeInstanceOf(ProviderInvocationError);
+    expect(caught).toMatchObject({ kind: "context-overflow" });
+    expect(events.some((event) => event.type === "done")).toBe(false);
   });
 });

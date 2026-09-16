@@ -5,6 +5,7 @@ import type { SummaryModelPort, SummaryRequest, SummaryResponse } from "@byte-me
 // 测试工具：构造最小请求。
 function makeRequest(): SummaryRequest {
   return {
+    instructions: "summarize only",
     historyText: "serialized history",
     model: { provider: "openai", modelId: "gpt-5" },
     thinkingLevel: "medium",

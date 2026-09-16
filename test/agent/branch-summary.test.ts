@@ -186,6 +186,7 @@ describe("navigateWithBranchSummary success", () => {
     if (!result.ok) return;
     expect(result.mode).toBe("summary");
     expect(calls()).toBe(1);
+    expect(requests[0].instructions).toMatch(/only summarize|do not continue/i);
     expect(requests[0].model).toEqual({ provider: "openai", modelId: "gpt-5" });
     expect(requests[0].thinkingLevel).toBe("medium");
     expect(requests[0].historyText).toContain("branch a");

@@ -16,6 +16,26 @@ export interface ProviderInvocationOptions {
   signal?: AbortSignal;
 }
 
+// Provider adapter 对厂商结构化错误的 provider-neutral 归一化结果。
+// 首版只冻结 context overflow；其他错误保留厂商/运行时原错误语义。
+export type ProviderInvocationErrorKind = "context-overflow";
+
+export class ProviderInvocationError extends Error {
+  readonly kind: ProviderInvocationErrorKind;
+  readonly cause?: unknown;
+
+  constructor(
+    kind: ProviderInvocationErrorKind,
+    message = `provider invocation failed: ${kind}`,
+    options: { cause?: unknown } = {},
+  ) {
+    super(message);
+    this.name = "ProviderInvocationError";
+    this.kind = kind;
+    this.cause = options.cause;
+  }
+}
+
 export interface ProviderResponse {
   message: AssistantMessage;
   stopReason: StopReason;

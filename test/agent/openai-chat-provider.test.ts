@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OpenAIChatProvider } from "@byte-mentor/agent";
+import { OpenAIChatProvider, ProviderInvocationError } from "@byte-mentor/agent";
 import type { ToolDefinition } from "@byte-mentor/agent";
 import type { Message, ToolCallId } from "@byte-mentor/core";
 
@@ -365,6 +365,43 @@ describe("OpenAIChatProvider.invoke", () => {
     await expect(
       provider.invoke({ messages: [{ role: "user", content: "hello" }] }),
     ).rejects.toThrow("network down");
+  });
+
+  // 场景 27/28：OpenAI 结构化错误映射。预期：只有可靠 code 为 context_length_exceeded 时归一化，
+  // rate limit 等其他结构化错误仍保持原错误，不依据异常文案猜测。
+  it("normalizes a structured context overflow but preserves other OpenAI errors", async () => {
+    const overflow = Object.assign(new Error("opaque provider message"), {
+      code: "context_length_exceeded",
+      type: "invalid_request_error",
+    });
+    const { client } = createFakeClient([overflow]);
+    const provider = createProvider(client);
+
+    await expect(
+      provider.invoke({ messages: [{ role: "user", content: "hello" }] }),
+    ).rejects.toBeInstanceOf(ProviderInvocationError);
+
+    const otherErrors = [
+      Object.assign(new Error("context length wording is irrelevant"), {
+        code: "rate_limit_exceeded",
+        type: "rate_limit_error",
+      }),
+      Object.assign(new Error("context length wording is irrelevant"), {
+        code: "invalid_api_key",
+        type: "authentication_error",
+      }),
+      new Error("network down"),
+      Object.assign(new Error("unknown provider error"), {
+        code: "invalid_request_error",
+        type: "invalid_request_error",
+      }),
+    ];
+    for (const otherError of otherErrors) {
+      const other = createProvider(createFakeClient([otherError]).client);
+      await expect(other.invoke({ messages: [{ role: "user", content: "hello" }] })).rejects.toBe(
+        otherError,
+      );
+    }
   });
 });
 
