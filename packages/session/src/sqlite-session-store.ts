@@ -4,6 +4,7 @@ import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
 import { validatePendingCompaction } from "./compaction-validation.js";
 import { decodeEntry, encodeEntry, encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
+import { validatePendingSessionEntries } from "./pending-entry-validation.js";
 import {
   SessionLeafConflictError,
   SessionNotFoundError,
@@ -218,68 +219,70 @@ export class SqliteSessionStore implements SessionStore {
     }
   }
 
+  // 校验并在单一事务内物化稳定 pending Entry 链；Store 只补 sequence，并同步清除 checkpoint。
   async commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult> {
     this.assertOpen();
     try {
-      return this.db.transaction(() => {
-        const row = this.sessionRow(input.sessionId);
-        if (row === undefined) {
-          throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
-        }
-        if (input.entries.length === 0) {
-          throw new SessionStoreError(
-            "constraint",
-            "commitTurnEntries requires at least one entry",
+      return this.db
+        .transaction(() => {
+          const row = this.sessionRow(input.sessionId);
+          if (row === undefined) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          if (input.entries.length === 0) {
+            throw new SessionStoreError(
+              "constraint",
+              "commitTurnEntries requires at least one entry",
+            );
+          }
+          if (row.active_leaf_id !== input.expectedLeafId) {
+            throw new SessionLeafConflictError(
+              `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+            );
+          }
+          validatePendingSessionEntries(input.entries, row.active_leaf_id, (entryId) =>
+            this.entryExists(input.sessionId, entryId),
           );
-        }
-        if (row.active_leaf_id !== input.expectedLeafId) {
-          throw new SessionLeafConflictError(
-            `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
-          );
-        }
-        const now = new Date().toISOString();
-        let parentId = row.active_leaf_id;
-        let nextSeq = row.next_entry_seq;
-        for (const { entry } of input.entries) {
-          const materialized = {
-            ...entry,
-            id: entry.id ?? randomEntryId(),
-            sequence: nextSeq,
-            parentId,
-            createdAt: entry.createdAt ?? now,
-          } as SessionEntry;
-          const encoded = encodeEntry(materialized);
-          this.db
-            .prepare(
-              `INSERT INTO session_entries
+
+          const now = new Date().toISOString();
+          let nextSeq = row.next_entry_seq;
+          for (const entry of input.entries) {
+            const materialized: SessionEntry = { ...entry, sequence: nextSeq };
+            const encoded = encodeEntry(materialized);
+            this.db
+              .prepare(
+                `INSERT INTO session_entries
                  (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
                VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            )
-            .run(
-              input.sessionId,
-              encoded.id,
-              encoded.entry_seq,
-              encoded.parent_id,
-              encoded.type,
-              encoded.created_at,
-              encoded.payload_json,
-            );
-          parentId = materialized.id;
-          nextSeq += 1;
-        }
-        this.db
-          .prepare(
-            `UPDATE sessions
+              )
+              .run(
+                input.sessionId,
+                encoded.id,
+                encoded.entry_seq,
+                encoded.parent_id,
+                encoded.type,
+                encoded.created_at,
+                encoded.payload_json,
+              );
+            nextSeq += 1;
+          }
+          const lastEntry = input.entries[input.entries.length - 1]!;
+          const update = this.db
+            .prepare(
+              `UPDATE sessions
              SET active_leaf_id = :leaf,
                  next_entry_seq = :seq,
                  metadata_json = json_remove(metadata_json, '$.runtime_checkpoint'),
                  updated_at = :now
              WHERE id = :id`,
-          )
-          .run({ leaf: parentId, seq: nextSeq, now, id: input.sessionId });
-        // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
-        return { activeLeafId: parentId as string, nextEntrySeq: nextSeq };
-      })();
+            )
+            .run({ leaf: lastEntry.id, seq: nextSeq, now, id: input.sessionId });
+          if (update.changes !== 1) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          return { activeLeafId: lastEntry.id, nextEntrySeq: nextSeq };
+        })
+        .immediate();
     } catch (error) {
       if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
         throw error;

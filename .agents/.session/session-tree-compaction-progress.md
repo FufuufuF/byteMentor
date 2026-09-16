@@ -3,7 +3,7 @@
 - 分支：`feat/session-tree-compaction`
 - 计划：[`.agents/.plan/session-tree-compaction-implementation-plan.md`](../.plan/session-tree-compaction-implementation-plan.md)
 - 设计：[`.agents/.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)（M1～M6）
-- 状态：**Batch 1～10a 已提交；Batch 10b 契约决策与 briefing 已写入文档，等待用户确认后进入 TDD**
+- 状态：**Batch 1～10a、10b-session 已提交；Batch 10b-Turn 已完成并将在本次提交；10b-agent 待实现**
 
 ## 当前进度
 
@@ -19,7 +19,9 @@
 | 8 | Branch Summary 垂直切片 | `51142fb` | ✅ 已提交 |
 | 9 | Token 预算与压缩决策（决策层） | `e50c56d` | 🟡 已提交；运行时接线待补 |
 | 10a | Compaction 压缩算法（纯计算） | `4a36011` | ✅ 已提交 |
-| 10b | Compaction 提交、Turn 内结果与契约冻结 | — | 🟡 briefing 待确认 |
+| 10b-session | Compaction 原子提交事务（InMemory + SQLite） | `80fff2a` | ✅ 已提交 |
+| 10b-Turn | PendingSessionEntry 契约与 Turn 最终提交迁移 | 本次提交 | ✅ 已完成 |
+| 10b-agent | Compaction pending/空闲期领域服务与 overflow 归一化 | — | ⏳ 待实现 |
 
 ## 重要架构决策（实现中用户确认，已偏离原始计划）
 
@@ -170,18 +172,26 @@
 - 测试：`test/agent/compaction.test.ts` 共 10 个用例，覆盖 User/Assistant 切点、完整 tool batch、多 User 交互、交互前缀、状态 Entry、旧摘要增量合并、固定 prompt、ToolResult 截断、摘要输入溢出和 no-op。
 - 边界：本 Batch 只产出纯 `CompactionPlan`，不调用摘要模型、不写 `CompactionEntry`、不移动数据库 leaf，也不接管 Runtime checkpoint。
 
+### Batch 10b-Turn：Pending Entry 契约与 Turn 最终提交（本次提交）
+
+- `PendingSessionEntry` 统一为 `DistributiveOmit<SessionEntry, "sequence">`；进入 checkpoint 前已冻结稳定 `id`、`createdAt` 和 `parentId`。
+- `commitTurnEntries` 在 InMemory/SQLite 中只分配 `sequence`，不再生成 ID、时间或重新推导 parent。
+- 两种 Store 共用 pending 链校验：稳定 ID、重复 ID、连续 parent、持久化引用，以及同批更早 pending Entry 的 `firstKeptEntryId`；完整校验通过后才开始写入。
+- SQLite Turn 提交使用 `BEGIN IMMEDIATE`、批量 Entry 写入、leaf/sequence 更新和 checkpoint 清理；受影响行数异常时回滚。
+- 迁移 Store contract、fork、tree navigation 和 SQLite 持久化测试；新增空批、非连续 parent 链、同批 Compaction 引用场景。
+
 ## 当前基线
 
-- 测试：56 文件 / 674 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
+- 测试：56 文件 / 696 测试全绿（直接运行已安装的 Vitest；`pnpm` wrapper 因 Corepack 网络限制未使用）
 - `tsc -b`、测试类型检查、`eslint`、Prettier 检查均通过
-- Git 状态：B10a 已提交（`4a36011`）；B10b 的设计/计划/进度文档更新尚未提交，生产代码与测试尚未开始
+- Git 状态：B10a（`4a36011`）、B10b-session（`80fff2a`）和计划文档（`7c33e3b`）已提交；B10b-Turn 随本次提交完成，B10b-agent 尚未开始
 
-## 下一步（Batch 10b：Compaction 提交、Turn 内结果与契约冻结）
+## 下一步（Batch 10b-agent：Compaction 领域服务与 overflow 归一化）
 
-等待用户确认 implementation plan 中已经冻结的 Batch 10b briefing；确认后按 29 个测试场景进入完整 RED → GREEN：
+在本次 Turn 契约冻结的基础上，按 plan 中剩余场景继续完整 RED → GREEN：
 
-- **agent 包**：在 B10a 的纯规划结果上实现 Compaction 领域服务、pending Compaction 结果和 overflow 归一化。
-- **session 包**：Compaction 原子提交事务，落库 `CompactionEntry` 并推进 leaf/sequence。
+- **agent 包**：在 B10a 的纯规划结果上实现 pending Compaction 准备、空闲期 Compaction 领域服务、prepared 重试和 provider overflow 归一化。
 - **上下文与恢复**：压缩后重建有效 provider context；Turn 内只产出可由 Runtime 消费的 pending 结果，不提前移动数据库 leaf。
-- **契约冻结**：补齐 InMemory/SQLite contract、公共 exports 和 M1～M6 验收场景；完成后再进入 `feat/session-runtime`。
+- **session 包**：复用已完成的 `commitCompaction` 与 `commitTurnEntries` 契约，不在本阶段重新扩大 Store 职责。
+- **契约收口**：补齐 Summary `instructions`、`maxOutputTokens`、provider-neutral overflow 和对应 public exports；完成后再进入 `feat/session-runtime`。
 - 流程：每个 Batch 开始前 briefing + 等用户确认；GREEN 后报告 + 等 review + 授权后才提交

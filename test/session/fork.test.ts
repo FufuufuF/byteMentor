@@ -4,6 +4,7 @@ import type { SessionSnapshot } from "@byte-mentor/session";
 import type { SessionEntry } from "@byte-mentor/session";
 import type { SessionId, ToolCallId } from "@byte-mentor/core";
 import { InMemorySessionStore } from "@byte-mentor/session";
+import { makePendingEntries } from "./pending-entries.js";
 
 // 测试工具：构造一个已有对话的 InMemory store（source session）。
 // 结构：u1(根) → a1(带 tool call) → t1 → u2 → a2(文本)
@@ -21,37 +22,31 @@ async function makeSourceStore(): Promise<{
   await store.commitTurnEntries({
     sessionId: snapshot.id,
     expectedLeafId: null,
-    entries: [
-      { entry: { type: "user", content: "q1" } },
+    entries: makePendingEntries("source", null, [
+      { type: "user", content: "q1" },
       {
-        entry: {
-          type: "assistant",
-          content: "",
-          toolCalls: [{ id: "call-1" as ToolCallId, name: "bash", args: {} }],
-          model: { provider: "openai", modelId: "gpt-5" },
-          stopReason: "tool_calls",
-        },
+        type: "assistant",
+        content: "",
+        toolCalls: [{ id: "call-1" as ToolCallId, name: "bash", args: {} }],
+        model: { provider: "openai", modelId: "gpt-5" },
+        stopReason: "tool_calls",
       },
       {
-        entry: {
-          type: "tool_result",
-          toolCallId: "call-1" as ToolCallId,
-          toolName: "bash",
-          content: "out",
-          isError: false,
-        },
+        type: "tool_result",
+        toolCallId: "call-1" as ToolCallId,
+        toolName: "bash",
+        content: "out",
+        isError: false,
       },
-      { entry: { type: "user", content: "q2" } },
+      { type: "user", content: "q2" },
       {
-        entry: {
-          type: "assistant",
-          content: "a2",
-          toolCalls: [],
-          model: { provider: "openai", modelId: "gpt-5" },
-          stopReason: "completed",
-        },
+        type: "assistant",
+        content: "a2",
+        toolCalls: [],
+        model: { provider: "openai", modelId: "gpt-5" },
+        stopReason: "completed",
       },
-    ],
+    ]),
   });
   return { store, snapshot: (await store.loadSession(snapshot.id))! };
 }
@@ -162,32 +157,35 @@ describe("forkSession reference normalization", () => {
       initialModelId: "gpt-5",
       initialThinkingLevel: "medium",
     });
+    // 先建立一条不在目标 fork 路径中的合法 Entry，供 compaction 引用。
+    await store.commitTurnEntries({
+      sessionId: snapshot.id,
+      expectedLeafId: null,
+      entries: makePendingEntries("out-of-path", null, [{ type: "user", content: "outside" }]),
+    });
+    await store.updateLeaf(snapshot.id, null);
     // 构造：u1 → b1(branch_summary, sourceLeaf 指向路径外的 x) → u2 → c1(compaction, firstKept 指向路径外的 y)
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("references", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "branch_summary",
-            sourceLeafId: "out-of-path",
-            summary: "s",
-            model: { provider: "openai", modelId: "gpt-5" },
-          },
+          type: "branch_summary",
+          sourceLeafId: "out-of-path-1",
+          summary: "s",
+          model: { provider: "openai", modelId: "gpt-5" },
         },
-        { entry: { type: "user", content: "q2" } },
+        { type: "user", content: "q2" },
         {
-          entry: {
-            type: "compaction",
-            summary: "c",
-            firstKeptEntryId: "out-of-path-2",
-            tokensBefore: 10,
-            trigger: "manual",
-            model: { provider: "openai", modelId: "gpt-5" },
-          },
+          type: "compaction",
+          summary: "c",
+          firstKeptEntryId: "out-of-path-1",
+          tokensBefore: 10,
+          trigger: "manual",
+          model: { provider: "openai", modelId: "gpt-5" },
         },
-      ],
+      ]),
     });
     const loaded = (await store.loadSession(snapshot.id))!;
     // 选最后一个 user（u2）→ 复制路径 u1→b1→u2；b1 的 sourceLeaf 路径外 → null
@@ -216,18 +214,16 @@ describe("forkSession reference normalization", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("in-path-base", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "assistant",
-            content: "a",
-            toolCalls: [],
-            model: { provider: "openai", modelId: "gpt-5" },
-            stopReason: "completed",
-          },
+          type: "assistant",
+          content: "a",
+          toolCalls: [],
+          model: { provider: "openai", modelId: "gpt-5" },
+          stopReason: "completed",
         },
-      ],
+      ]),
     });
     const loaded = (await store.loadSession(snapshot.id))!;
     // 选最后一个 user 之前的路径需要 target 是 user —— 这里只有 q1；选 q1 fork 空路径。
@@ -235,7 +231,9 @@ describe("forkSession reference normalization", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: loaded.activeLeafId,
-      entries: [{ entry: { type: "user", content: "q2" } }],
+      entries: makePendingEntries("in-path-next", loaded.activeLeafId, [
+        { type: "user", content: "q2" },
+      ]),
     });
     const after = (await store.loadSession(snapshot.id))!;
     const q2 = after.entries.find((e) => e.type === "user" && e.content === "q2")!;
@@ -314,7 +312,7 @@ describe("forkSession atomicity", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [{ entry: { type: "user", content: "q1" } }],
+      entries: makePendingEntries("immutable-source", null, [{ type: "user", content: "q1" }]),
     });
     const loaded = (await store.loadSession(snapshot.id))!;
     const u1 = loaded.entries[0];
@@ -328,7 +326,7 @@ describe("forkSession atomicity", () => {
     await store.commitTurnEntries({
       sessionId: result.newSession.id,
       expectedLeafId: null,
-      entries: [{ entry: { type: "user", content: "forked q" } }],
+      entries: makePendingEntries("forked-session", null, [{ type: "user", content: "forked q" }]),
     });
     const forked = (await store.loadSession(result.newSession.id))!;
     expect(forked.entries).toHaveLength(1);

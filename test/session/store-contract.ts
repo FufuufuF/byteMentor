@@ -6,6 +6,7 @@ import type {
   SessionStoreErrorKind,
 } from "@byte-mentor/session";
 import type { SessionId } from "@byte-mentor/core";
+import { makePendingEntries } from "./pending-entries.js";
 
 // 双实现共享的 Store 契约测试：每个具体实现注册自己的构造器与 close/reopen 行为，
 // 保证 InMemory 与 SQLite 满足同一份领域契约，而不是各写一套断言。
@@ -107,6 +108,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
   });
 
   describe(`SessionStore transactional writes (${factory.label})`, () => {
+    // 场景：提交带稳定身份的 pending 链到空 Session。预期：ID、时间和根 parent 原样保留，Store 只分配 sequence。
     it("commits a batch to an empty session: first entry rooted at null, leaf advances, seq starts at 1", async () => {
       const store = await factory.create();
       try {
@@ -114,24 +116,26 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const result = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [
-            { entry: { type: "user", content: "q1" } },
+          entries: makePendingEntries("empty-turn", null, [
+            { type: "user", content: "q1" },
             {
-              entry: {
-                type: "assistant",
-                content: "a1",
-                toolCalls: [],
-                model: { provider: "openai", modelId: "gpt-5" },
-                stopReason: "completed",
-              },
+              type: "assistant",
+              content: "a1",
+              toolCalls: [],
+              model: { provider: "openai", modelId: "gpt-5" },
+              stopReason: "completed",
             },
-          ],
+          ]),
         });
         expect(result.activeLeafId).toBeDefined();
         const loaded = await store.loadSession(session.id);
         expect(loaded?.entries).toHaveLength(2);
+        expect(loaded?.entries[0].id).toBe("empty-turn-1");
+        expect(loaded?.entries[0].createdAt).toBe("2026-01-01T00:00:00.000Z");
         expect(loaded?.entries[0].sequence).toBe(1);
         expect(loaded?.entries[0].parentId).toBeNull();
+        expect(loaded?.entries[1].id).toBe("empty-turn-2");
+        expect(loaded?.entries[1].createdAt).toBe("2026-01-01T00:00:01.000Z");
         expect(loaded?.entries[1].parentId).toBe(loaded?.entries[0].id);
         expect(loaded?.entries[1].sequence).toBe(2);
         expect(loaded?.activeLeafId).toBe(loaded?.entries[1].id);
@@ -141,6 +145,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
 
+    // 场景：稳定 pending 链从已有 active leaf 继续追加。预期：调用方提供的 parent 链不被 Store 重写，leaf/sequence 连续推进。
     it("commits a batch after an existing leaf: first entry chains to the current leaf", async () => {
       const store = await factory.create();
       try {
@@ -148,12 +153,14 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("first-turn", null, [{ type: "user", content: "q1" }]),
         });
         const second = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: first.activeLeafId,
-          entries: [{ entry: { type: "user", content: "q2" } }],
+          entries: makePendingEntries("second-turn", first.activeLeafId, [
+            { type: "user", content: "q2" },
+          ]),
         });
         const loaded = await store.loadSession(session.id);
         expect(loaded?.entries).toHaveLength(2);
@@ -166,6 +173,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
 
+    // 场景：Turn 提交同时写入 Entry、leaf、sequence 并清除 checkpoint。预期：这些状态变化一起成功。
     it("clears runtime_checkpoint in the same commit as the entries", async () => {
       const store = await factory.create();
       try {
@@ -175,7 +183,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
         await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("checkpoint-turn", null, [{ type: "user", content: "q1" }]),
         });
         const metadata = await store.getMetadata(session.id);
         expect(metadata).toEqual({ keep: 1 });
@@ -184,6 +192,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
 
+    // 场景：Turn 使用过期 expectedLeafId 提交。预期：返回 leaf 冲突且 Entry、leaf、sequence、checkpoint 全部不变。
     it("rejects when expectedLeafId does not match the current leaf, leaving everything unchanged", async () => {
       const store = await factory.create();
       try {
@@ -191,14 +200,16 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("stale-base", null, [{ type: "user", content: "q1" }]),
         });
         await store.setRuntimeCheckpoint(session.id, { phase: "awaiting_tools" });
         await expect(
           store.commitTurnEntries({
             sessionId: session.id,
             expectedLeafId: "stale-leaf-id",
-            entries: [{ entry: { type: "user", content: "q2" } }],
+            entries: makePendingEntries("stale-turn", first.activeLeafId, [
+              { type: "user", content: "q2" },
+            ]),
           }),
         ).rejects.toMatchObject({ name: "SessionLeafConflictError" });
         const loaded = await store.loadSession(session.id);
@@ -211,10 +222,12 @@ export function runStoreContractTests(factory: StoreFactory): void {
       }
     });
 
+    // 场景：Turn 没有任何 pending Entry。预期：返回 constraint，Session 不发生变化。
     it("rejects an empty batch as a constraint violation", async () => {
       const store = await factory.create();
       try {
         const session = await store.createSession(validCreateInput);
+        const before = (await store.loadSession(session.id))!;
         await expect(
           store.commitTurnEntries({
             sessionId: session.id,
@@ -222,6 +235,105 @@ export function runStoreContractTests(factory: StoreFactory): void {
             entries: [],
           }),
         ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+        await expect(store.loadSession(session.id)).resolves.toEqual(before);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    // 场景：第一条或后续 pending Entry 的 parent 链不连续。预期：整批拒绝且不留下部分 Entry 或 checkpoint 清理。
+    it.each([
+      {
+        name: "first entry does not point to the expected leaf",
+        entries: [
+          {
+            id: "broken-first",
+            parentId: "wrong-parent",
+            createdAt: "2026-01-01T00:00:00.000Z",
+            type: "user" as const,
+            content: "q1",
+          },
+        ],
+      },
+      {
+        name: "later entry does not point to the previous pending entry",
+        entries: [
+          {
+            id: "valid-first",
+            parentId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            type: "user" as const,
+            content: "q1",
+          },
+          {
+            id: "broken-later",
+            parentId: "wrong-parent",
+            createdAt: "2026-01-01T00:00:01.000Z",
+            type: "user" as const,
+            content: "q2",
+          },
+        ],
+      },
+    ])("rejects a non-contiguous pending chain ($name)", async ({ entries }) => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
+        const before = (await store.loadSession(session.id))!;
+
+        await expect(
+          store.commitTurnEntries({
+            sessionId: session.id,
+            expectedLeafId: null,
+            entries,
+          }),
+        ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
+
+        await expect(store.loadSession(session.id)).resolves.toEqual(before);
+      } finally {
+        await factory.close(store);
+      }
+    });
+
+    // 场景：Compaction 的 firstKeptEntryId 指向同一批中更早的 pending Entry。预期：整批物化后引用和 parent 链保持有效。
+    it("preserves a pending Compaction reference to an earlier pending Entry", async () => {
+      const store = await factory.create();
+      try {
+        const session = await store.createSession(validCreateInput);
+        const entries = [
+          {
+            id: "pending-user",
+            parentId: null,
+            createdAt: "2026-01-01T00:00:00.000Z",
+            type: "user" as const,
+            content: "q1",
+          },
+          {
+            id: "pending-compaction",
+            parentId: "pending-user",
+            createdAt: "2026-01-01T00:00:01.000Z",
+            type: "compaction" as const,
+            summary: "compressed history",
+            firstKeptEntryId: "pending-user",
+            tokensBefore: 100,
+            trigger: "automatic" as const,
+            model: { provider: "openai", modelId: "gpt-5" },
+          },
+        ];
+
+        await store.commitTurnEntries({
+          sessionId: session.id,
+          expectedLeafId: null,
+          entries,
+        });
+
+        const loaded = (await store.loadSession(session.id))!;
+        expect(loaded.entries).toEqual([
+          { ...entries[0], sequence: 1 },
+          { ...entries[1], sequence: 2 },
+        ]);
+        expect(loaded.activeLeafId).toBe("pending-compaction");
+        expect(loaded.nextEntrySeq).toBe(3);
       } finally {
         await factory.close(store);
       }
@@ -340,7 +452,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("branch-base", null, [{ type: "user", content: "q1" }]),
         });
         const before = (await store.loadSession(session.id))!;
         const result = await store.commitBranchSummary({
@@ -380,7 +492,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("branch-stale-base", null, [{ type: "user", content: "q1" }]),
         });
         await expect(
           store.commitBranchSummary({
@@ -424,7 +536,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("branch-empty-base", null, [{ type: "user", content: "q1" }]),
         });
         await expect(
           store.commitBranchSummary({
@@ -451,7 +563,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("branch-parent-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         await expect(
           store.commitBranchSummary({
@@ -478,7 +592,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("branch-checkpoint-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
         await store.commitBranchSummary({
@@ -505,7 +621,7 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-base", null, [{ type: "user", content: "q1" }]),
         });
         const pending = {
           id: "compaction-1",
@@ -551,7 +667,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-metadata-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         await store.updateMetadata(session.id, () => ({ keep: 1 }));
         await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
@@ -589,7 +707,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-stale-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         await store.setRuntimeCheckpoint(session.id, { phase: "ready_for_iteration" });
         const before = (await store.loadSession(session.id))!;
@@ -627,12 +747,16 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-parent-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         const second = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: first.activeLeafId,
-          entries: [{ entry: { type: "user", content: "q2" } }],
+          entries: makePendingEntries("compaction-parent-next", first.activeLeafId, [
+            { type: "user", content: "q2" },
+          ]),
         });
         const before = (await store.loadSession(session.id))!;
 
@@ -694,7 +818,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-blank-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         const before = (await store.loadSession(session.id))!;
 
@@ -730,7 +856,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-invalid-parent-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         const before = (await store.loadSession(session.id))!;
 
@@ -766,7 +894,9 @@ export function runStoreContractTests(factory: StoreFactory): void {
         const first = await store.commitTurnEntries({
           sessionId: session.id,
           expectedLeafId: null,
-          entries: [{ entry: { type: "user", content: "q1" } }],
+          entries: makePendingEntries("compaction-invalid-first-kept-base", null, [
+            { type: "user", content: "q1" },
+          ]),
         });
         const before = (await store.loadSession(session.id))!;
 

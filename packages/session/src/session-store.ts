@@ -126,18 +126,10 @@ export interface ModelState {
   thinkingLevel: ThinkingLevel;
 }
 
-// Turn 批量提交中的一条 pending entry：不含 sequence（事务内从 next_entry_seq 分配）与
-// parentId（第一条接当前 active leaf，后续依次连接前一条）；id/createdAt 未提供时由事务生成。
-// DistributiveOmit 保留 union 收窄。
-export type PendingTurnEntry = {
-  entry: DistributiveOmit<SessionEntry, "sequence" | "parentId" | "id" | "createdAt"> &
-    Partial<Pick<SessionEntry, "id" | "createdAt">>;
-};
-
 // 保留 discriminated union 结构地省略公共字段的类型工具。
 export type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 
-// Checkpoint 与最终提交共用的 pending Entry：身份与逻辑 parent 已固定，只缺少 sequence。
+// Checkpoint 与最终提交共用的 pending Entry：id、createdAt、parentId 等稳定字段已冻结，Store 只分配 sequence。
 export type PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">;
 
 // 独立 Compaction 提交所接受的 pending Entry 类型。
@@ -147,7 +139,7 @@ export interface CommitTurnInput {
   sessionId: SessionId;
   // 事务内校验当前 active_leaf_id 仍等于该值；不匹配时抛 SessionLeafConflictError。
   expectedLeafId: SessionEntry["id"] | null;
-  entries: PendingTurnEntry[];
+  entries: PendingSessionEntry[];
 }
 
 export interface CommitTurnResult {

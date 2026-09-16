@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { SqliteSessionStore } from "@byte-mentor/session";
 import type { SessionId } from "@byte-mentor/core";
 import { runStoreContractTests, validCreateInput } from "./store-contract.js";
+import { makePendingEntries } from "./pending-entries.js";
 
 // SQLite 实现注册同一份 Store contract 测试，并额外覆盖 schema/PRAGMA/约束/错误归一化。
 
@@ -195,6 +196,7 @@ describe("SqliteSessionStore schema", () => {
 });
 
 describe("SqliteSessionStore checkpoint and commit persistence", () => {
+  // 场景：提交后重开 SQLite。预期：Entry 落库，runtime_checkpoint 与 Turn 提交一起清除。
   it("persists committed entries and runtime_checkpoint across reopen", async () => {
     const dbPath = await createDbPath();
     const first = new SqliteSessionStore({ dbPath });
@@ -203,7 +205,7 @@ describe("SqliteSessionStore checkpoint and commit persistence", () => {
     await first.commitTurnEntries({
       sessionId: session.id,
       expectedLeafId: null,
-      entries: [{ entry: { type: "user", content: "persist me" } }],
+      entries: makePendingEntries("reopen", null, [{ type: "user", content: "persist me" }]),
     });
     await first.close();
 
@@ -235,24 +237,36 @@ describe("SqliteSessionStore checkpoint and commit persistence", () => {
     await store.close();
   });
 
-  it("rolls back the whole batch when a constraint fails mid-insert", async () => {
+  // 场景：pending 批次含已有 ID。预期：校验失败时整批不写入，leaf/sequence 保持不变。
+  it("rejects a batch with a duplicate entry id without writing any entry", async () => {
     const store = await createStore();
     const session = await store.createSession(validCreateInput);
     await store.commitTurnEntries({
       sessionId: session.id,
       expectedLeafId: null,
-      entries: [{ entry: { type: "user", content: "q1" } }],
+      entries: makePendingEntries("rollback-base", null, [{ type: "user", content: "q1" }]),
     });
     const loadedBefore = await store.loadSession(session.id);
     const firstId = loadedBefore?.entries[0]?.id;
+    const q2 = {
+      id: "rollback-q2",
+      parentId: loadedBefore?.activeLeafId ?? null,
+      createdAt: "2026-01-01T00:00:01.000Z",
+      type: "user" as const,
+      content: "q2",
+    };
+    const duplicate = {
+      id: firstId!,
+      parentId: q2.id,
+      createdAt: "2026-01-01T00:00:02.000Z",
+      type: "user" as const,
+      content: "q3",
+    };
     await expect(
       store.commitTurnEntries({
         sessionId: session.id,
         expectedLeafId: loadedBefore?.activeLeafId ?? null,
-        entries: [
-          { entry: { type: "user", content: "q2" } },
-          { entry: { type: "user", content: "q3", id: firstId } }, // duplicate id
-        ],
+        entries: [q2, duplicate], // 第二条与已有 Entry 重复 ID
       }),
     ).rejects.toMatchObject({ name: "SessionStoreError", kind: "constraint" });
     const loadedAfter = await store.loadSession(session.id);

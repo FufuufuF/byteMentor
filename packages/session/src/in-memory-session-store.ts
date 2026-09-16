@@ -3,6 +3,7 @@ import { createSessionId } from "@byte-mentor/core";
 import type { SessionEntry } from "./entries.js";
 import { validatePendingCompaction } from "./compaction-validation.js";
 import { encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
+import { validatePendingSessionEntries } from "./pending-entry-validation.js";
 import {
   SessionLeafConflictError,
   SessionNotFoundError,
@@ -95,6 +96,7 @@ export class InMemorySessionStore implements SessionStore {
     return { ...record.metadata };
   }
 
+  // 校验并一次性物化稳定 pending Entry 链；Store 只补 sequence，并原子推进 leaf/seq、清除 checkpoint。
   async commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult> {
     const record = this.requireSession(input.sessionId);
     if (input.entries.length === 0) {
@@ -105,25 +107,21 @@ export class InMemorySessionStore implements SessionStore {
         `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(record.activeLeafId)}`,
       );
     }
+    validatePendingSessionEntries(input.entries, record.activeLeafId, (entryId) =>
+      record.entries.some((entry) => entry.id === entryId),
+    );
+
     const now = new Date().toISOString();
-    let parentId = record.activeLeafId;
-    for (const { entry } of input.entries) {
-      const materialized: SessionEntry = {
-        ...entry,
-        id: entry.id ?? randomEntryId(),
-        sequence: record.nextEntrySeq,
-        parentId,
-        createdAt: entry.createdAt ?? now,
-      } as SessionEntry;
-      record.entries.push(materialized);
-      parentId = materialized.id;
-      record.nextEntrySeq += 1;
-    }
-    record.activeLeafId = parentId;
+    const materializedEntries = input.entries.map(
+      (entry, index) => ({ ...entry, sequence: record.nextEntrySeq + index }) as SessionEntry,
+    );
+    record.entries.push(...materializedEntries);
+    const lastEntry = materializedEntries[materializedEntries.length - 1]!;
+    record.activeLeafId = lastEntry.id;
+    record.nextEntrySeq += materializedEntries.length;
     delete record.metadata.runtime_checkpoint;
     record.updatedAt = now;
-    // 循环至少执行一次（空批已在前面拒绝），parentId 必为非空 leaf。
-    return { activeLeafId: parentId as string, nextEntrySeq: record.nextEntrySeq };
+    return { activeLeafId: lastEntry.id, nextEntrySeq: record.nextEntrySeq };
   }
 
   // 在所有校验通过后一次性追加 Compaction，并同步推进 active leaf 与 sequence；不清理 checkpoint。

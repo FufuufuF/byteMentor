@@ -4,6 +4,7 @@ import type { SessionSnapshot } from "@byte-mentor/session";
 import type { SessionEntry } from "@byte-mentor/session";
 import type { SessionId, ToolCallId } from "@byte-mentor/core";
 import { InMemorySessionStore } from "@byte-mentor/session";
+import { makePendingEntries } from "./pending-entries.js";
 
 // 测试工具：把字符串字面量提升为品牌化 ToolCallId。
 function tc(id: string): ToolCallId {
@@ -204,19 +205,17 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("navigation-user", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "assistant",
-            content: "a1",
-            toolCalls: [],
-            model: { provider: "openai", modelId: "gpt-5" },
-            stopReason: "completed",
-          },
+          type: "assistant",
+          content: "a1",
+          toolCalls: [],
+          model: { provider: "openai", modelId: "gpt-5" },
+          stopReason: "completed",
         },
-        { entry: { type: "user", content: "q2" } },
-      ],
+        { type: "user", content: "q2" },
+      ]),
     });
     const loaded = await store.loadSession(snapshot.id);
     const u2 = loaded?.entries.at(-1); // q2 user
@@ -246,19 +245,17 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("navigation-assistant", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "assistant",
-            content: "a1",
-            toolCalls: [],
-            model: { provider: "openai", modelId: "gpt-5" },
-            stopReason: "completed",
-          },
+          type: "assistant",
+          content: "a1",
+          toolCalls: [],
+          model: { provider: "openai", modelId: "gpt-5" },
+          stopReason: "completed",
         },
-        { entry: { type: "user", content: "q2" } }, // leaf = q2，导航目标是 a1（不是当前 leaf）
-      ],
+        { type: "user", content: "q2" }, // leaf = q2，导航目标是 a1（不是当前 leaf）
+      ]),
     });
     const loaded = await store.loadSession(snapshot.id);
     const a1 = loaded?.entries[1]; // assistant a1
@@ -284,18 +281,16 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("navigation-noop", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "assistant",
-            content: "a1",
-            toolCalls: [],
-            model: { provider: "openai", modelId: "gpt-5" },
-            stopReason: "completed",
-          },
+          type: "assistant",
+          content: "a1",
+          toolCalls: [],
+          model: { provider: "openai", modelId: "gpt-5" },
+          stopReason: "completed",
         },
-      ],
+      ]),
     });
     const loaded = await store.loadSession(snapshot.id);
     const a1 = loaded?.entries.at(-1);
@@ -318,10 +313,10 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
-        { entry: { type: "user", content: "q2" } },
-      ],
+      entries: makePendingEntries("navigation-user-parent", null, [
+        { type: "user", content: "q1" },
+        { type: "user", content: "q2" },
+      ]),
     });
     // 先把 leaf 直接设为 q1（q2 的 parent），模拟“当前停留在 q2 的父节点”。
     const before = await store.loadSession(snapshot.id);
@@ -353,7 +348,7 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [{ entry: { type: "user", content: "q1" } }],
+      entries: makePendingEntries("navigation-stale", null, [{ type: "user", content: "q1" }]),
     });
     const result = await navigateDirectly({
       store,
@@ -377,18 +372,16 @@ describe("navigateDirectly", () => {
     await store.commitTurnEntries({
       sessionId: snapshot.id,
       expectedLeafId: null,
-      entries: [
-        { entry: { type: "user", content: "q1" } },
+      entries: makePendingEntries("navigation-tool", null, [
+        { type: "user", content: "q1" },
         {
-          entry: {
-            type: "assistant",
-            content: "",
-            toolCalls: [{ id: tc("c1"), name: "bash", args: {} }],
-            model: { provider: "openai", modelId: "gpt-5" },
-            stopReason: "tool_calls",
-          },
+          type: "assistant",
+          content: "",
+          toolCalls: [{ id: tc("c1"), name: "bash", args: {} }],
+          model: { provider: "openai", modelId: "gpt-5" },
+          stopReason: "tool_calls",
         },
-      ],
+      ]),
     });
     const loaded = await store.loadSession(snapshot.id);
     const pureToolCall = loaded?.entries.at(-1);
