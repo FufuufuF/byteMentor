@@ -1,17 +1,37 @@
 import Database from "better-sqlite3";
 import { createSessionId } from "@byte-mentor/core";
-import type { Message, SessionId } from "@byte-mentor/core";
+import type { Message, SessionId, ThinkingLevel } from "@byte-mentor/core";
+import type { SessionEntry } from "./entries.js";
+import { validatePendingCompaction } from "./compaction-validation.js";
+import { decodeEntry, encodeEntry, encodeMessagesToEntries, randomEntryId } from "./entry-codec.js";
+import { validatePendingSessionEntries } from "./pending-entry-validation.js";
 import {
+  SessionLeafConflictError,
+  SessionNotFoundError,
   SessionStoreClosedError,
+  SessionStoreError,
+  type CommitBranchSummaryInput,
+  type CommitBranchSummaryResult,
+  type CommitCompactionInput,
+  type CommitCompactionResult,
+  type CommitTurnInput,
+  type CommitTurnResult,
+  type CreateSessionInput,
+  type CreateSessionWithEntriesInput,
   type Session,
   type SessionMetadata,
+  type SessionSnapshot,
   type SessionStore,
+  type SessionStoreErrorKind,
 } from "./session-store.js";
 
 export interface SqliteSessionStoreInput {
   dbPath: string;
 }
 
+// SQLite SessionStore：实现最终 schema（sessions + session_entries），落实 M3 的连接配置
+// 与 M9 的稳定错误归一化。所有 SQLite 原始错误在边界处转换为 SessionStoreError 类别，
+// 领域层与上层不解析原始错误字符串。
 export class SqliteSessionStore implements SessionStore {
   private readonly db: Database.Database;
   private closed = false;
@@ -19,71 +39,112 @@ export class SqliteSessionStore implements SessionStore {
   constructor(input: SqliteSessionStoreInput) {
     this.db = new Database(input.dbPath);
     this.db.pragma("foreign_keys = ON");
+    this.db.pragma("journal_mode = WAL");
+    this.db.pragma("synchronous = FULL");
+    this.db.pragma("busy_timeout = 5000");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
-        id            TEXT NOT NULL PRIMARY KEY,
-        created_at    TEXT NOT NULL,
-        updated_at    TEXT NOT NULL,
-        metadata_json TEXT NOT NULL DEFAULT '{}'
-      );
+        id                TEXT    NOT NULL PRIMARY KEY,
+        workspace_root    TEXT    NOT NULL,
+        initial_provider       TEXT NOT NULL,
+        initial_model_id       TEXT NOT NULL,
+        initial_thinking_level TEXT NOT NULL CHECK (
+          initial_thinking_level IN (
+            'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'
+          )
+        ),
+        active_leaf_id    TEXT,
+        next_entry_seq    INTEGER NOT NULL DEFAULT 1 CHECK (next_entry_seq > 0),
+        metadata_json     TEXT    NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+        created_at        TEXT    NOT NULL,
+        updated_at        TEXT    NOT NULL,
+        FOREIGN KEY (id, active_leaf_id)
+          REFERENCES session_entries(session_id, id)
+          DEFERRABLE INITIALLY DEFERRED
+      ) WITHOUT ROWID;
 
-      CREATE TABLE IF NOT EXISTS messages (
+      CREATE TABLE IF NOT EXISTS session_entries (
         session_id   TEXT    NOT NULL,
-        seq          INTEGER NOT NULL,
-        role         TEXT    NOT NULL,
-        message_json TEXT    NOT NULL,
+        id           TEXT    NOT NULL,
+        entry_seq    INTEGER NOT NULL CHECK (entry_seq > 0),
+        parent_id    TEXT,
+        type         TEXT    NOT NULL CHECK (
+          type IN (
+            'user',
+            'assistant',
+            'tool_result',
+            'compaction',
+            'branch_summary',
+            'model_change',
+            'thinking_level_change'
+          )
+        ),
         created_at   TEXT    NOT NULL,
-        PRIMARY KEY (session_id, seq),
-        FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        payload_json TEXT    NOT NULL CHECK (json_valid(payload_json)),
+
+        PRIMARY KEY (session_id, id),
+        UNIQUE (session_id, entry_seq),
+
+        CHECK (parent_id IS NULL OR parent_id <> id),
+
+        FOREIGN KEY (session_id)
+          REFERENCES sessions(id)
+          ON DELETE CASCADE,
+        FOREIGN KEY (session_id, parent_id)
+          REFERENCES session_entries(session_id, id)
+          DEFERRABLE INITIALLY DEFERRED
       ) WITHOUT ROWID;
     `);
   }
 
-  async create(): Promise<Session> {
+  // 仅供测试检查连接配置与表结构；生产代码不依赖。
+  dbForTest(): Database.Database {
+    return this.db;
+  }
+
+  async createSession(input: CreateSessionInput): Promise<SessionSnapshot> {
     this.assertOpen();
     const id = createSessionId();
     const now = new Date().toISOString();
-    this.db
-      .prepare(
-        "INSERT INTO sessions (id, created_at, updated_at, metadata_json) VALUES (?, ?, ?, '{}')",
-      )
-      .run(id, now, now);
-    return { id, metadata: {} };
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO sessions (
+             id, workspace_root, initial_provider, initial_model_id, initial_thinking_level,
+             next_entry_seq, metadata_json, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, 1, '{}', ?, ?)`,
+        )
+        .run(
+          id,
+          input.workspaceRoot,
+          input.initialProvider,
+          input.initialModelId,
+          input.initialThinkingLevel,
+          now,
+          now,
+        );
+    } catch (error) {
+      throw normalizeError(error);
+    }
+    return this.requireSnapshot(id);
   }
 
-  async get(id: SessionId): Promise<Session | undefined> {
+  async loadSession(id: SessionId): Promise<SessionSnapshot | undefined> {
     this.assertOpen();
-    const row = this.db.prepare("SELECT id, metadata_json FROM sessions WHERE id = ?").get(id) as
-      { id: SessionId; metadata_json: string } | undefined;
-    return row === undefined
-      ? undefined
-      : { id: row.id, metadata: parseMetadata(row.metadata_json) };
+    const row = this.sessionRow(id);
+    if (row === undefined) {
+      return undefined;
+    }
+    return this.buildSnapshot(id, row);
   }
 
-  async appendMessages(id: SessionId, messages: Message[]): Promise<void> {
+  async getMetadata(id: SessionId): Promise<SessionMetadata> {
     this.assertOpen();
-    const now = new Date().toISOString();
-    const insertMessage = this.db.prepare(`
-      INSERT INTO messages (session_id, seq, role, message_json, created_at)
-      SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?
-      FROM messages WHERE session_id = ?
-    `);
-    const updateSession = this.db.prepare("UPDATE sessions SET updated_at = ? WHERE id = ?");
-    const append = this.db.transaction(() => {
-      for (const message of messages) {
-        insertMessage.run(id, message.role, JSON.stringify(message), now, id);
-      }
-      updateSession.run(now, id);
-    });
-    append();
-  }
-
-  async getHistory(id: SessionId): Promise<Message[]> {
-    this.assertOpen();
-    const rows = this.db
-      .prepare("SELECT message_json FROM messages WHERE session_id = ? ORDER BY seq ASC")
-      .all(id) as { message_json: string }[];
-    return rows.map((row) => JSON.parse(row.message_json) as Message);
+    const row = this.sessionRow(id);
+    if (row === undefined) {
+      throw new SessionNotFoundError(`session not found: ${id}`);
+    }
+    return parseMetadata(row.metadata_json);
   }
 
   async updateMetadata(
@@ -91,19 +152,353 @@ export class SqliteSessionStore implements SessionStore {
     updater: (metadata: SessionMetadata) => SessionMetadata,
   ): Promise<SessionMetadata> {
     this.assertOpen();
-    const update = this.db.transaction(() => {
-      const row = this.db.prepare("SELECT metadata_json FROM sessions WHERE id = ?").get(id) as
+    try {
+      const metadata = this.db.transaction(() => {
+        const row = this.sessionRow(id);
+        if (row === undefined) {
+          throw new SessionNotFoundError(`session not found: ${id}`);
+        }
+        const next = { ...updater(parseMetadata(row.metadata_json)) };
+        this.db
+          .prepare("UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE id = ?")
+          .run(JSON.stringify(next), new Date().toISOString(), id);
+        return next;
+      })();
+      return metadata;
+    } catch (error) {
+      throw normalizeError(error);
+    }
+  }
+
+  async setRuntimeCheckpoint(id: SessionId, checkpoint: unknown): Promise<SessionMetadata> {
+    this.assertOpen();
+    try {
+      const row = this.db
+        .prepare(
+          `UPDATE sessions
+           SET metadata_json = json_set(metadata_json, '$.runtime_checkpoint', json(:checkpoint_json)),
+               updated_at = :now
+           WHERE id = :id
+           RETURNING metadata_json`,
+        )
+        .get({ id, checkpoint_json: JSON.stringify(checkpoint), now: new Date().toISOString() }) as
         { metadata_json: string } | undefined;
       if (row === undefined) {
-        throw new Error(`session not found: ${id}`);
+        throw new SessionNotFoundError(`session not found: ${id}`);
       }
-      const metadata = { ...updater(parseMetadata(row.metadata_json)) };
-      this.db
-        .prepare("UPDATE sessions SET metadata_json = ?, updated_at = ? WHERE id = ?")
-        .run(JSON.stringify(metadata), new Date().toISOString(), id);
-      return metadata;
-    });
-    return update();
+      return parseMetadata(row.metadata_json);
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async clearRuntimeCheckpoint(id: SessionId): Promise<SessionMetadata> {
+    this.assertOpen();
+    try {
+      const row = this.db
+        .prepare(
+          `UPDATE sessions
+           SET metadata_json = json_remove(metadata_json, '$.runtime_checkpoint'),
+               updated_at = :now
+           WHERE id = :id
+           RETURNING metadata_json`,
+        )
+        .get({ id, now: new Date().toISOString() }) as { metadata_json: string } | undefined;
+      if (row === undefined) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+      return parseMetadata(row.metadata_json);
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  // 校验并在单一事务内物化稳定 pending Entry 链；Store 只补 sequence，并同步清除 checkpoint。
+  async commitTurnEntries(input: CommitTurnInput): Promise<CommitTurnResult> {
+    this.assertOpen();
+    try {
+      return this.db
+        .transaction(() => {
+          const row = this.sessionRow(input.sessionId);
+          if (row === undefined) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          if (input.entries.length === 0) {
+            throw new SessionStoreError(
+              "constraint",
+              "commitTurnEntries requires at least one entry",
+            );
+          }
+          if (row.active_leaf_id !== input.expectedLeafId) {
+            throw new SessionLeafConflictError(
+              `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+            );
+          }
+          validatePendingSessionEntries(input.entries, row.active_leaf_id, (entryId) =>
+            this.entryExists(input.sessionId, entryId),
+          );
+
+          const now = new Date().toISOString();
+          let nextSeq = row.next_entry_seq;
+          for (const entry of input.entries) {
+            const materialized: SessionEntry = { ...entry, sequence: nextSeq };
+            const encoded = encodeEntry(materialized);
+            this.db
+              .prepare(
+                `INSERT INTO session_entries
+                 (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+              )
+              .run(
+                input.sessionId,
+                encoded.id,
+                encoded.entry_seq,
+                encoded.parent_id,
+                encoded.type,
+                encoded.created_at,
+                encoded.payload_json,
+              );
+            nextSeq += 1;
+          }
+          const lastEntry = input.entries[input.entries.length - 1]!;
+          const update = this.db
+            .prepare(
+              `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 metadata_json = json_remove(metadata_json, '$.runtime_checkpoint'),
+                 updated_at = :now
+             WHERE id = :id`,
+            )
+            .run({ leaf: lastEntry.id, seq: nextSeq, now, id: input.sessionId });
+          if (update.changes !== 1) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          return { activeLeafId: lastEntry.id, nextEntrySeq: nextSeq };
+        })
+        .immediate();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  // 在一个短 SQLite 事务内提交 Compaction、推进 leaf/sequence，并保留 runtime_checkpoint。
+  async commitCompaction(input: CommitCompactionInput): Promise<CommitCompactionResult> {
+    this.assertOpen();
+    try {
+      return this.db
+        .transaction(() => {
+          const row = this.sessionRow(input.sessionId);
+          if (row === undefined) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          if (row.active_leaf_id !== input.expectedLeafId) {
+            throw new SessionLeafConflictError(
+              `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+            );
+          }
+          validatePendingCompaction(input.entry, row.active_leaf_id, (entryId) =>
+            this.entryExists(input.sessionId, entryId),
+          );
+
+          const materialized: SessionEntry = {
+            ...input.entry,
+            sequence: row.next_entry_seq,
+          };
+          const encoded = encodeEntry(materialized);
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+               (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              input.sessionId,
+              encoded.id,
+              encoded.entry_seq,
+              encoded.parent_id,
+              encoded.type,
+              encoded.created_at,
+              encoded.payload_json,
+            );
+
+          const now = new Date().toISOString();
+          const update = this.db
+            .prepare(
+              `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 updated_at = :now
+             WHERE id = :id`,
+            )
+            .run({
+              leaf: materialized.id,
+              seq: row.next_entry_seq + 1,
+              now,
+              id: input.sessionId,
+            });
+          if (update.changes !== 1) {
+            throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+          }
+          return {
+            entryId: materialized.id,
+            activeLeafId: materialized.id,
+            nextEntrySeq: row.next_entry_seq + 1,
+          };
+        })
+        .immediate();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async commitBranchSummary(input: CommitBranchSummaryInput): Promise<CommitBranchSummaryResult> {
+    this.assertOpen();
+    if (input.summary.trim().length === 0) {
+      throw new SessionStoreError("constraint", "commitBranchSummary requires a non-empty summary");
+    }
+    try {
+      return this.db.transaction(() => {
+        const row = this.sessionRow(input.sessionId);
+        if (row === undefined) {
+          throw new SessionNotFoundError(`session not found: ${input.sessionId}`);
+        }
+        if (row.active_leaf_id !== input.expectedLeafId) {
+          throw new SessionLeafConflictError(
+            `active leaf changed: expected ${String(input.expectedLeafId)}, got ${String(row.active_leaf_id)}`,
+          );
+        }
+        const entry: SessionEntry = {
+          type: "branch_summary",
+          id: randomEntryId(),
+          sequence: row.next_entry_seq,
+          parentId: input.parentId,
+          createdAt: new Date().toISOString(),
+          sourceLeafId: input.expectedLeafId,
+          summary: input.summary,
+          model: input.model,
+          ...(input.usage === undefined ? {} : { usage: input.usage }),
+        };
+        const encoded = encodeEntry(entry);
+        this.db
+          .prepare(
+            `INSERT INTO session_entries
+               (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            input.sessionId,
+            encoded.id,
+            encoded.entry_seq,
+            encoded.parent_id,
+            encoded.type,
+            encoded.created_at,
+            encoded.payload_json,
+          );
+        this.db
+          .prepare(
+            `UPDATE sessions
+             SET active_leaf_id = :leaf,
+                 next_entry_seq = :seq,
+                 updated_at = :now
+             WHERE id = :id`,
+          )
+          .run({
+            leaf: entry.id,
+            seq: row.next_entry_seq + 1,
+            now: entry.createdAt,
+            id: input.sessionId,
+          });
+        return { entryId: entry.id, activeLeafId: entry.id, nextEntrySeq: row.next_entry_seq + 1 };
+      })();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError || error instanceof SessionLeafConflictError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async updateLeaf(id: SessionId, leafId: string | null): Promise<void> {
+    this.assertOpen();
+    try {
+      const result = this.db
+        .prepare(`UPDATE sessions SET active_leaf_id = :leaf, updated_at = :now WHERE id = :id`)
+        .run({ leaf: leafId, now: new Date().toISOString(), id });
+      if (result.changes === 0) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  async createSessionWithEntries(input: CreateSessionWithEntriesInput): Promise<SessionSnapshot> {
+    this.assertOpen();
+    try {
+      return this.db.transaction(() => {
+        const id = createSessionId();
+        const now = new Date().toISOString();
+        this.db
+          .prepare(
+            `INSERT INTO sessions (
+               id, workspace_root, initial_provider, initial_model_id, initial_thinking_level,
+               next_entry_seq, metadata_json, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, '{}', ?, ?)`,
+          )
+          .run(
+            id,
+            input.workspaceRoot,
+            input.initialProvider,
+            input.initialModelId,
+            input.initialThinkingLevel,
+            input.entries.length + 1,
+            now,
+            now,
+          );
+        for (const entry of input.entries) {
+          const encoded = encodeEntry(entry);
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+                 (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              id,
+              encoded.id,
+              encoded.entry_seq,
+              encoded.parent_id,
+              encoded.type,
+              encoded.created_at,
+              encoded.payload_json,
+            );
+        }
+        if (input.entries.length > 0) {
+          this.db
+            .prepare("UPDATE sessions SET active_leaf_id = ? WHERE id = ?")
+            .run(input.entries[input.entries.length - 1].id, id);
+        }
+        return this.requireSnapshot(id, this.sessionRow(id));
+      })();
+    } catch (error) {
+      throw normalizeError(error);
+    }
   }
 
   async close(): Promise<void> {
@@ -114,17 +509,228 @@ export class SqliteSessionStore implements SessionStore {
     this.closed = true;
   }
 
+  // === deprecated 线性适配入口（仅短期兼容未迁移的 AgentLoop；B3 迁移完成后删除） ===
+
+  /** @deprecated 见 SessionStore 契约注释。 */
+  async create(): Promise<Session> {
+    const snapshot = await this.createSession({
+      workspaceRoot: "",
+      initialProvider: "",
+      initialModelId: "",
+      initialThinkingLevel: "off",
+    });
+    return { id: snapshot.id, metadata: snapshot.metadata };
+  }
+
+  /** @deprecated 见 SessionStore 契约注释。 */
+  async get(id: SessionId): Promise<Session | undefined> {
+    this.assertOpen();
+    const row = this.sessionRow(id);
+    return row === undefined ? undefined : { id, metadata: parseMetadata(row.metadata_json) };
+  }
+
+  /** @deprecated 见 SessionStore 契约注释。 */
+  async appendMessages(id: SessionId, messages: Message[]): Promise<void> {
+    this.assertOpen();
+    try {
+      const row = this.sessionRow(id);
+      if (row === undefined) {
+        throw new SessionNotFoundError(`session not found: ${id}`);
+      }
+      const newEntries = encodeMessagesToEntries(messages, {
+        provider: row.initial_provider,
+        modelId: row.initial_model_id,
+      });
+      this.db.transaction(() => {
+        let parentId = row.active_leaf_id;
+        for (const entry of newEntries) {
+          this.db
+            .prepare(
+              `INSERT INTO session_entries
+                 (session_id, id, entry_seq, parent_id, type, created_at, payload_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              id,
+              entry.id,
+              row.next_entry_seq,
+              parentId,
+              entry.type,
+              entry.createdAt,
+              encodeEntry(entry).payload_json,
+            );
+          parentId = entry.id;
+          row.next_entry_seq += 1;
+        }
+        this.db
+          .prepare(
+            "UPDATE sessions SET active_leaf_id = ?, next_entry_seq = ?, updated_at = ? WHERE id = ?",
+          )
+          .run(parentId, row.next_entry_seq, new Date().toISOString(), id);
+      })();
+    } catch (error) {
+      if (error instanceof SessionNotFoundError) {
+        throw error;
+      }
+      throw normalizeError(error);
+    }
+  }
+
+  /** @deprecated 见 SessionStore 契约注释。 */
+  async getHistory(id: SessionId): Promise<Message[]> {
+    this.assertOpen();
+    const snapshot = await this.loadSession(id);
+    if (snapshot === undefined) {
+      return [];
+    }
+    return linearHistoryFromSnapshot(snapshot);
+  }
+
   private assertOpen(): void {
     if (this.closed) {
       throw new SessionStoreClosedError();
     }
   }
+
+  private sessionRow(id: SessionId): SessionRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT id, workspace_root, initial_provider, initial_model_id, initial_thinking_level,
+                active_leaf_id, next_entry_seq, metadata_json, created_at, updated_at
+         FROM sessions WHERE id = ?`,
+      )
+      .get(id) as SessionRow | undefined;
+  }
+
+  // 查询同一 Session 中的 Entry 引用，供事务内的 pending Compaction 校验使用。
+  private entryExists(sessionId: SessionId, entryId: string): boolean {
+    const row = this.db
+      .prepare("SELECT 1 AS present FROM session_entries WHERE session_id = ? AND id = ?")
+      .get(sessionId, entryId) as { present: number } | undefined;
+    return row !== undefined;
+  }
+
+  private requireSnapshot(id: SessionId, row = this.sessionRow(id)): SessionSnapshot {
+    if (row === undefined) {
+      throw new SessionNotFoundError(`session not found: ${id}`);
+    }
+    return this.buildSnapshot(id, row);
+  }
+
+  private buildSnapshot(id: SessionId, row: SessionRow): SessionSnapshot {
+    const rows = this.db
+      .prepare(
+        `SELECT id, entry_seq, parent_id, type, created_at, payload_json
+         FROM session_entries WHERE session_id = ? ORDER BY entry_seq ASC`,
+      )
+      .all(id) as SessionEntryRow[];
+    return {
+      id,
+      workspaceRoot: row.workspace_root,
+      initialProvider: row.initial_provider,
+      initialModelId: row.initial_model_id,
+      initialThinkingLevel: row.initial_thinking_level,
+      activeLeafId: row.active_leaf_id,
+      nextEntrySeq: row.next_entry_seq,
+      metadata: parseMetadata(row.metadata_json),
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+      entries: rows.map((r) => decodeEntry(r)),
+    };
+  }
+}
+
+interface SessionRow {
+  id: SessionId;
+  workspace_root: string;
+  initial_provider: string;
+  initial_model_id: string;
+  initial_thinking_level: ThinkingLevel;
+  active_leaf_id: string | null;
+  next_entry_seq: number;
+  metadata_json: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface SessionEntryRow {
+  id: string;
+  entry_seq: number;
+  parent_id: string | null;
+  type: SessionEntry["type"];
+  created_at: string;
+  payload_json: string;
 }
 
 function parseMetadata(json: string): SessionMetadata {
   const value = JSON.parse(json) as unknown;
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error("session metadata_json must contain an object");
+    throw new SessionStoreError("corruption", "session metadata_json must contain an object");
   }
   return { ...(value as SessionMetadata) };
+}
+
+// deprecated getHistory 的线性重建：按 entry_seq 升序收集 user/assistant/tool_result，
+// 忽略状态与摘要 Entry（与旧线性历史语义一致）。
+function linearHistoryFromSnapshot(snapshot: SessionSnapshot): Message[] {
+  const messages: Message[] = [];
+  for (const entry of snapshot.entries) {
+    if (entry.type === "user") {
+      messages.push({ id: entry.id as Message["id"], role: "user", content: entry.content });
+    } else if (entry.type === "assistant") {
+      messages.push({
+        id: entry.id as Message["id"],
+        role: "assistant",
+        content: entry.content,
+        ...(entry.toolCalls.length > 0 ? { toolCalls: entry.toolCalls } : {}),
+      });
+    } else if (entry.type === "tool_result") {
+      messages.push({
+        id: entry.id as Message["id"],
+        role: "tool",
+        toolCallId: entry.toolCallId,
+        content: entry.content,
+      });
+    }
+  }
+  return messages;
+}
+
+// 把 SQLite 原始错误归一化为 M9 稳定类别；unknown 类别保留原错误信息供诊断。
+function normalizeError(error: unknown): SessionStoreError {
+  if (error instanceof SessionStoreError) {
+    return error;
+  }
+  const kind = classifySqliteError(error);
+  return new SessionStoreError(kind, error instanceof Error ? error.message : String(error));
+}
+
+function classifySqliteError(error: unknown): SessionStoreErrorKind {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = String((error as { code: unknown }).code);
+    if (code.startsWith("SQLITE_BUSY")) {
+      return "busy";
+    }
+    if (code.startsWith("SQLITE_FULL")) {
+      return "capacity";
+    }
+    if (code.startsWith("SQLITE_READONLY")) {
+      return "read_only";
+    }
+    if (code.startsWith("SQLITE_CORRUPT")) {
+      return "corruption";
+    }
+    if (code.startsWith("SQLITE_CONSTRAINT")) {
+      return "constraint";
+    }
+    if (
+      code.startsWith("SQLITE_IOERR") ||
+      code.startsWith("SQLITE_CANTOPEN") ||
+      code.startsWith("SQLITE_NOMEM") ||
+      code.startsWith("SQLITE_INTERRUPT")
+    ) {
+      return "io";
+    }
+  }
+  return "unknown";
 }

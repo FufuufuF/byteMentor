@@ -1,8 +1,10 @@
 import OpenAI from "openai";
+import { normalizeUsage } from "@byte-mentor/core";
 import type {
   AssistantMessage,
   Message,
   StopReason,
+  TokenUsage,
   ToolCall,
   ToolCallId,
 } from "@byte-mentor/core";
@@ -14,6 +16,7 @@ import type {
   ProviderStreamEvent,
   ToolDefinition,
 } from "./provider.js";
+import { ProviderInvocationError } from "./provider.js";
 
 export interface OpenAIChatProviderConfig {
   model: string;
@@ -52,6 +55,7 @@ export class OpenAIChatProvider implements ModelProvider {
     return {
       message: done.message,
       stopReason: done.stopReason,
+      ...(done.usage === undefined ? {} : { usage: done.usage }),
     };
   }
 
@@ -59,42 +63,109 @@ export class OpenAIChatProvider implements ModelProvider {
     req: ProviderRequest,
     options?: ProviderInvocationOptions,
   ): AsyncIterable<ProviderStreamEvent> {
-    const request: OpenAI.ChatCompletionCreateParamsStreaming = {
-      model: this.model,
-      messages: req.messages.map(toOpenAIMessage),
-      stream: true,
-      ...toolsRequestPart(req.tools),
-    };
-    const stream = await this.client.chat.completions.create(request, {
-      signal: options?.signal,
-    });
-    let content = "";
-    const toolCalls = new Map<number, StreamingToolCall>();
+    try {
+      const request: OpenAI.ChatCompletionCreateParamsStreaming = {
+        model: this.model,
+        messages: req.messages.map(toOpenAIMessage),
+        stream: true,
+        ...toolsRequestPart(req.tools),
+      };
+      const stream = await this.client.chat.completions.create(request, {
+        signal: options?.signal,
+      });
+      let content = "";
+      const toolCalls = new Map<number, StreamingToolCall>();
+      let usage: TokenUsage | undefined;
+      let terminalChunk:
+        | { content: string; toolCalls: Map<number, StreamingToolCall>; stopReason: StopReason }
+        | undefined;
 
-    for await (const chunk of stream) {
-      const choice = chunk.choices[0];
-      if (choice === undefined) {
-        continue;
+      for await (const chunk of stream) {
+        // usage chunk（choices 为空数组）：只携带 usage，不产生内容增量。
+        if (chunk.usage !== undefined && chunk.usage !== null) {
+          usage = normalizeOpenAIUsage(chunk.usage);
+          continue;
+        }
+        const choice = chunk.choices[0];
+        if (choice === undefined) {
+          continue;
+        }
+        const contentDelta = choice.delta.content;
+        if (hasTextContent(contentDelta)) {
+          content += contentDelta;
+          yield { type: "content_delta", text: contentDelta };
+        }
+        for (const toolCallDelta of choice.delta.tool_calls ?? []) {
+          applyToolCallDelta(toolCalls, toolCallDelta);
+        }
+        // finish_reason 可能出现在普通 chunk（后续还有 usage chunk）也可能在最后；
+        // 先记录终止状态，等流结束后统一产出 done，保证 usage 收集完整。
+        if (choice.finish_reason !== null) {
+          terminalChunk = {
+            content,
+            toolCalls: new Map(toolCalls),
+            stopReason: toStopReason(choice.finish_reason),
+          };
+        }
       }
-      const contentDelta = choice.delta.content;
-      if (hasTextContent(contentDelta)) {
-        content += contentDelta;
-        yield { type: "content_delta", text: contentDelta };
+      if (terminalChunk === undefined) {
+        throw new Error("OpenAI chat completion stream ended without finish_reason");
       }
-      for (const toolCallDelta of choice.delta.tool_calls ?? []) {
-        applyToolCallDelta(toolCalls, toolCallDelta);
-      }
-      if (choice.finish_reason !== null) {
-        yield {
-          type: "done",
-          message: toStreamedAssistantMessage(content, toolCalls),
-          stopReason: toStopReason(choice.finish_reason),
-        };
-        return;
-      }
+      yield {
+        type: "done",
+        message: toStreamedAssistantMessage(terminalChunk.content, terminalChunk.toolCalls),
+        stopReason: terminalChunk.stopReason,
+        ...(usage === undefined ? {} : { usage }),
+      };
+    } catch (error) {
+      throw normalizeOpenAIInvocationError(error);
     }
-    throw new Error("OpenAI chat completion stream ended without finish_reason");
   }
+}
+
+// 只读取 OpenAI SDK 暴露的结构化 code/type（含 APIError.error 的结构化字段），
+// 不根据 message 文案猜测；因此 rate limit、认证、网络和未知错误保持原样。
+function normalizeOpenAIInvocationError(error: unknown): unknown {
+  if (error instanceof ProviderInvocationError || !isOpenAIContextOverflow(error)) {
+    return error;
+  }
+  return new ProviderInvocationError(
+    "context-overflow",
+    "OpenAI request exceeded the model context window",
+    { cause: error },
+  );
+}
+
+function isOpenAIContextOverflow(error: unknown): boolean {
+  if (!isRecord(error)) {
+    return false;
+  }
+  if (isContextOverflowCode(error.code) || isContextOverflowCode(error.type)) {
+    return true;
+  }
+  return (
+    isRecord(error.error) &&
+    (isContextOverflowCode(error.error.code) || isContextOverflowCode(error.error.type))
+  );
+}
+
+function isContextOverflowCode(value: unknown): boolean {
+  return value === "context_length_exceeded";
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+// 把 OpenAI 上报的 usage 归一化为内部 TokenUsage：total 已含 cached 时扣减，避免重复计入。
+function normalizeOpenAIUsage(usage: OpenAI.CompletionUsage): TokenUsage {
+  const cachedInputTokens = usage.prompt_tokens_details?.cached_tokens;
+  return normalizeUsage({
+    inputTokens: usage.prompt_tokens,
+    outputTokens: usage.completion_tokens,
+    totalTokens: usage.total_tokens,
+    ...(cachedInputTokens !== undefined && cachedInputTokens > 0 ? { cachedInputTokens } : {}),
+  });
 }
 
 interface StreamingToolCall {
