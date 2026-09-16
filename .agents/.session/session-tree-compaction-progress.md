@@ -3,7 +3,7 @@
 - 分支：`feat/session-tree-compaction`
 - 计划：[`.agents/.plan/session-tree-compaction-implementation-plan.md`](../.plan/session-tree-compaction-implementation-plan.md)
 - 设计：[`.agents/.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)（M1～M6）
-- 状态：**Batch 1～10a、10b-session、10b-Turn、10b-agent 已提交；下一步进入 `feat/session-runtime`**
+- 状态：**Batch 1～10b 已完成并合并；`feat/session-runtime` 已进入 Batch 1 实现准备**
 
 ## 当前进度
 
@@ -21,7 +21,7 @@
 | 10a | Compaction 压缩算法（纯计算） | `4a36011` | ✅ 已提交 |
 | 10b-session | Compaction 原子提交事务（InMemory + SQLite） | `80fff2a` | ✅ 已提交 |
 | 10b-Turn | PendingSessionEntry 契约与 Turn 最终提交迁移 | `dd4722a` | ✅ 已提交 |
-| 10b-agent | Compaction pending/空闲期领域服务与 overflow 归一化 | 本次提交 | ✅ 已提交 |
+| 10b-agent | Compaction pending/空闲期领域服务与 overflow 归一化 | `1f482ba` | ✅ 已合并 |
 
 ## 重要架构决策（实现中用户确认，已偏离原始计划）
 
@@ -59,11 +59,11 @@
 - **B1 校验只做树级引用存在性**；路径级校验（toolCallId 在活动路径上、firstKeptEntryId 早于 compaction）在 B4/B5 处理。
 - **Batch 3 曾未经授权提交**，用户指出后已改正流程：此后每个 Batch GREEN 后先报告、等 review、授权后才提交。
 
-### 4. `SummaryModelPort.summarize` 的具体实现未实现（B8 确认）
+### 4. `SummaryModelPort.summarize` 的 Runtime 接线方案（M7 实施前确认）
 
 - 现状：`SummaryModelPort` 只是接口；`navigateWithBranchSummary` 经 `input.summarize` 注入、由 `executeSummaryWithRetry` 包装调用。全仓库无具体实现，测试均用 fake port。
 - 归属：语义上等价于一次单轮、无工具的 provider 调用，现有 `ModelProvider`（`providers/provider.ts`）已具备能力。
-- **待办（M7 Runtime 分支）**：在 agent 包新建 provider 桥接适配器（如 `summary/provider-summary-adapter.ts`），把 `SummaryRequest`（固定 instructions + historyText + model/thinking + 可选 maxOutputTokens）映射为具体 provider 请求，调用模型并把输出映射为 `SummaryResponse`（文本 + usage）；取消接 `signal`。M7 Runtime 组装时经 `summarize` 注入。
+- **已确认方案（M7 Runtime 分支）**：在 `summary/` 新建通用的 provider-backed 适配器，把 `SummaryRequest`（固定 instructions + historyText + model/thinking + 可选 maxOutputTokens）映射为一次无工具的普通 Provider 请求，再把 Assistant 文本/usage 映射为 `SummaryResponse`；取消接 `signal`。Provider 通用请求显式携带 model/thinking/instructions/messages/tools/output limit，但 Provider 不知道 Branch Summary、Compaction、cut point、checkpoint 或摘要业务来源。
 
 ### 5. `RuntimeEnvironment` 从 session 迁入 agent（B8 用户确认）
 
@@ -82,7 +82,8 @@
 - pending Entry 在写入 runtime checkpoint 前已经具有稳定 `id`、`createdAt` 和逻辑 `parentId`，只缺少最终事务分配的 `sequence`；统一导出 `PendingSessionEntry = DistributiveOmit<SessionEntry, "sequence">`，不再维护第二套同义 checkpoint 类型。
 - `commitTurnEntries` 直接接收并校验上述稳定 pending 链；Store 不在提交时生成新 ID/时间或推导另一条 parent 链。这样 Turn 内 `CompactionEntry.firstKeptEntryId` 可以安全引用尚未落库的同 Turn Entry。
 - `SummaryRequest` 增加固定 `instructions` 与可选 `maxOutputTokens`，和不可信 `historyText` 分离；Compaction/Branch Summary 领域服务负责填入各自固定指令，不开放自定义 prompt。
-- provider overflow 采用 adapter 翻译边界：每个 Provider Adapter 根据自身厂商的结构化错误映射为 Byte Mentor 的 `ProviderInvocationError(kind = "context-overflow")`；Agent/Runtime 不依赖 OpenAI SDK、不解析厂商错误文案，无法确认的错误不得猜测为 overflow。
+- provider 错误采用 adapter 翻译边界：B10b 已实现可靠结构化 `context-overflow`；M7 实施前进一步确认完整 union 为 `context-overflow | retryable | permanent | cancelled`。Agent/Runtime 不依赖 OpenAI SDK、不解析厂商错误文案，无法确认的错误不得猜测为 overflow。
+- 新 Session 使用延迟创建：`/new` 只回 Home 且不写数据库；Home 首发使用 `kind: "new"` Turn 输入，在一个 Store 原子操作中创建 Session 与首个 `ready_for_iteration` checkpoint。已有 Session 使用 `kind: "existing"`，只从持久化路径恢复状态，不消费所谓 `newSessionDefaults`。
 - B10b 的 29 个测试场景、明确范围与非目标已写入 implementation plan；实际 safe-point/checkpoint 接线和 overflow 后单次重试循环仍由下游 Runtime 分支实现。
 
 ## 各 Batch 交付细节
@@ -186,7 +187,7 @@
 - 新增 `compactSession`：空闲期先规划 no-op，再在 Store 事务外调用摘要模型，成功后复用 `commitCompaction`，提交后 reload/rebuild active path、有效 messages、ModelState、execution 和压缩后估算。
 - 新增 `CompactionError` 与 `PreparedCompaction`；摘要失败、取消、空摘要、模型不可用和提交失败均保持明确错误边界，提交失败可复用同一 Entry ID/摘要重试且不重复调用模型。
 - `SummaryRequest` 增加固定 `instructions` 与可选 `maxOutputTokens`；Branch Summary 使用固定指令，Compaction 使用固定章节提示词。
-- 新增 provider-neutral `ProviderInvocationError("context-overflow")`；OpenAI adapter 仅依据结构化 `code/type` 在 stream 创建/消费阶段归一化 context overflow，其他错误保持原样。
+- 新增 provider-neutral `ProviderInvocationError("context-overflow")`；OpenAI adapter 仅依据结构化 `code/type` 在 stream 创建/消费阶段归一化 context overflow。下游 M7 已确认继续扩展 retryable/permanent/cancelled 分类，并通过 summary 层通用适配器复用普通 Provider 调用。
 - 测试：新增 Compaction service 10 个场景，并补齐 Summary/Branch Summary/OpenAI overflow 契约；总计 57 文件 / 708 测试。
 - 边界：未接入 AgentLoop、Runtime checkpoint/safe-point、provider bridge 或 overflow 后实际重试循环；这些由 `feat/session-runtime` 消费本批冻结的能力。
 

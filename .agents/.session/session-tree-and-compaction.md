@@ -1,6 +1,6 @@
 # 树状会话与上下文压缩设计
 
-- 状态：M1～M9 已确认完成；Session Tree & Compaction 已完成 Batch 1～10a，Batch 10b 待实施
+- 状态：M1～M9 已确认完成；Session Tree & Compaction 已全部实现并合并，Session Runtime 已进入实现准备
 - 日期：2026-08-10
 
 > 本文件是总索引，不再承载详细设计。三个模块文档共同构成本功能的正式设计；发生跨模块冲突时，先回到本索引确认依赖和术语，再逐点回改对应模块。
@@ -65,5 +65,6 @@ feat/session-tui
 
 - M1～M9 已确认完成。
 - 三个 stacked implementation branches 的依赖、接口冻结点和 TDD Batch 已经定义。
-- `feat/session-tree-compaction` 已完成并提交 Batch 1～10a；Batch 10b 的 pending Entry、SummaryRequest 与 provider overflow 契约已经确认并写入正式设计/计划，等待按 TDD 实施。
-- `feat/session-runtime` 与 `feat/session-tui` 尚未开始，继续按 stacked branch 顺序推进。
+- `feat/session-tree-compaction` 已完成 Batch 1～10b 并合并到 `main`。
+- `feat/session-runtime` 已创建并完成 Batch 1 的设计覆盖审计；原子首次建会话、显式新旧 Session Turn 输入、provider-backed Summary 适配和 provider-neutral 错误分类已经确认，等待 Batch 1 briefing 最终确认后按 TDD 实施。
+- `feat/session-tui` 尚未开始，继续等待 Runtime 契约冻结。

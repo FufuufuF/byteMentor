@@ -105,7 +105,7 @@ interface AgentRuntime {
 - `OperationHandle` 提供稳定 `operationId` 和最终结果 Promise；方法返回即表示 envelope 已进入进程内 MessageBus。
 - publish 成功不是 durable confirmation。只有 `input.checkpointed` 或相应提交完成事件才表示内容已经稳定持久化。
 - MessageBus 不公开给 Controller；Controller 不能直接操作 mailbox、`pendingQueue` 或 ActiveTurnHandle。
-- 新 Session 的首次提交可以先在 Runtime 内分配 provisional Session ID；Controller 只有收到 `session.created` 后才把它设为当前 Session。
+- `/new` 本身只让 Controller 回到 Home，不创建数据库 Session。Home 首次提交可以先在 Runtime 内分配 provisional Session ID，并通过 `kind: "new"` Turn 输入原子创建 Session 与首 checkpoint；Controller 只有收到 `session.created` 后才把它设为当前 Session。已有 Session 使用 `kind: "existing"` 和正式 ID，不消费新 Session 初始值。
 
 ### 1.4 Session 顺序、逻辑 writer 与全局并发
 

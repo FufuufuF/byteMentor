@@ -1,6 +1,6 @@
 # Session Tree 与 Compaction 实现计划
 
-- 状态：待实现
+- 状态：已完成并合并
 - 实现分支：`feat/session-tree-compaction`
 - 对应设计：[`../.design/session-tree-compaction.md`](../.design/session-tree-compaction.md)
 - 下游计划：[`session-runtime-implementation-plan.md`](./session-runtime-implementation-plan.md)
@@ -360,7 +360,7 @@ Batch 之间基本线性，建议按编号顺序逐个实现、逐个 review。
 - `SessionStore.commitCompaction` 接收已经准备好的 `PendingCompactionEntry`，短事务内校验 leaf、分配 sequence、插入并推进 leaf。
 - agent 提供 `prepareCompaction`（只生成 pending 结果）和 `compactSession`（空闲期生成、提交与重建）；提交失败通过 `PreparedCompaction` 复用同一摘要和 Entry ID。
 - `SummaryRequest` 增加 `instructions` 和可选 `maxOutputTokens`，与 `historyText`、model/thinking、signal 一起构成 provider-neutral 摘要请求。
-- 各 provider adapter 把可可靠识别的厂商结构化 overflow 错误转换成 Byte Mentor 的 `ProviderInvocationError(kind = "context-overflow")`；上层不依赖厂商 SDK、不解析异常文案，其他错误不得误判。
+- 本分支先冻结 provider adapter 对可靠结构化 overflow 的 `ProviderInvocationError(kind = "context-overflow")` 映射；下游 Runtime 实施前已确认把同一 provider-neutral union 扩展为 `retryable | permanent | cancelled`，并在 `summary/` 用通用 Provider 适配 `SummaryModelPort`，不把压缩语义放入 Provider。
 
 ### 范围
 

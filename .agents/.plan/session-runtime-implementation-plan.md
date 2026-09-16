@@ -15,7 +15,7 @@
 
 - `feat/session-tree-compaction` 已完成或本分支明确基于其最终提交；
 - SessionEntry、`PendingSessionEntry`、SessionStore 原子操作、Context/Navigation/Compaction 服务契约已经冻结；
-- Runtime 直接消费上游冻结的 pending Entry（稳定 id/createdAt/parentId，仅缺 sequence）、结构化 `SummaryRequest` 和 provider-neutral `ProviderInvocationError("context-overflow")`，不再定义同义类型或解析厂商错误；
+- Runtime 直接消费上游冻结的 pending Entry（稳定 id/createdAt/parentId，仅缺 sequence）、结构化 `SummaryRequest` 和 provider-neutral `ProviderInvocationError`，不再定义同义类型或解析厂商错误；Runtime 分支将错误分类扩展为 `context-overflow | retryable | permanent | cancelled`；
 - deprecated 线性 Store API 只作为迁移起点，不再新增使用者。
 
 完成后，应用层只需通过 AgentRuntime 即可提交消息/命令、停止 Turn、响应 interaction、读取 snapshot、订阅事件和关闭资源。
@@ -34,23 +34,26 @@
 
 ### 范围
 
-- `packages/agent/src/loop/**`、`packages/agent/src/runner/**`、provider/context 接入点和 public exports。
+- `packages/agent/src/loop/**`、`packages/agent/src/runner/**`、provider/context/summary 接入点和 public exports。
 - `packages/session/src/**` 中冻结 Store 契约的必要实现修正。
 - `test/agent/**`、`test/session/**` 中 Runtime Turn 与 reopen 集成测试。
 
 ### 目标
 
 - 用最终 `RuntimeCheckpoint(version: 1)` 和 `ready_for_iteration | awaiting_tools` 替换旧 `pending_user_turn` 与旧 checkpoint phase。
-- 建立从首条 User 开始的稳定 pending Entry 链；新 Session 创建和首 checkpoint 原子完成。
+- 建立从首条 User 开始的稳定 pending Entry 链；`/new` 只回 Home、不写数据库，Home 首发时通过 `SessionStore.createSessionWithCheckpoint()` 原子创建新 Session 和首 checkpoint，失败不留下空 Session。
+- 用 `kind: "new" | "existing"` 的 Turn 输入 union 取代可选 `sessionId`：新 Session 输入携带 workspace/初始 model/thinking，已有 Session 只按正式 ID 恢复持久化状态。
 - 落实 streaming partial 不持久化、完整 Assistant 才入链、执行工具前 checkpoint、完整 ToolResult 批次后 checkpoint。
 - 实现 completed/cancelled/failed/max-iterations 的内存终态链和最终原子提交。
 - 实现两种 checkpoint 的保守恢复：不续跑旧 ReAct、不重试工具，未知副作用生成固定 ToolResult 后提交。
 - 把 turn 间/Turn 内 Compaction 接到 provider 前 safe point，直接使用上游 `PendingSessionEntry`/Compaction 服务；支持捕获 provider-neutral context overflow 后基于最近稳定 checkpoint 压缩并只重试一次。
+- 在 `summary/` 提供 provider-backed `SummaryModelPort` 适配器；Provider 只执行携带 model/thinking/instructions/messages/tools/output limit 的通用模型请求，不包含压缩语义。
 - 保持 AgentRunner 不依赖 SessionStore；AgentLoop 负责 durable boundary 与领域服务编排。
 
 ### 测试
 
-- 首条 User checkpoint 失败不调用 provider；完整 Assistant、tool batch 和 Compaction 的 checkpoint 顺序。
+- 新 Session 原子创建与首 checkpoint 成功/reopen/回滚；首条 User checkpoint 失败不留下空 Session且不调用 provider；完整 Assistant、tool batch 和 Compaction 的 checkpoint 顺序。
+- 新旧 Session discriminated input、Provider 通用请求、provider-backed Summary 适配和 retryable/permanent/cancelled/context-overflow 错误归一化。
 - `ready_for_iteration`/`awaiting_tools` reopen 恢复、稳定 ID/parent、未知工具结果和恢复事务幂等。
 - partial stream/partial tool arguments 丢弃，完整 done 才生成 Entry。
 - completed/cancelled/failed/max-iterations、取消工具批次、最终事务失败后不重复外部副作用。

@@ -1020,16 +1020,20 @@ summaryInputBudget =
 
 手动 Compaction 或 Branch Summary 失败时 Session/leaf 不变。自动 Compaction 失败时，不继续发送已经判定接近或超过安全阈值的 provider 请求；当前操作明确失败，已完成工具调用和 checkpoint 仍按既有恢复规则保存，不自动换模型。
 
-provider adapter 负责把各厂商错误归一化为 Byte Mentor 自己定义的 provider-neutral 错误，AgentLoop 不直接解析厂商异常文本，也不依赖任何厂商 SDK 类型。首版冻结 `ProviderInvocationError` 的 `context-overflow` 分类：
+provider adapter 负责把各厂商错误归一化为 Byte Mentor 自己定义的 provider-neutral 错误，AgentLoop 不直接解析厂商异常文本，也不依赖任何厂商 SDK 类型。M6 首先冻结 `context-overflow`；M7 Runtime 实施前进一步确认完整首版分类为：
 
 ```ts
 class ProviderInvocationError extends Error {
-  readonly kind: "context-overflow";
+  readonly kind: "context-overflow" | "retryable" | "permanent" | "cancelled";
   readonly cause?: unknown;
 }
 ```
 
-每个 provider adapter 只在厂商返回可可靠识别的结构化错误 code/type 时转换为 `context-overflow`；OpenAI adapter 可以在自身内部依赖 OpenAI SDK 的错误结构，未来其他 adapter 分别实现各自映射。rate limit、quota、authentication、网络错误和无法确认的异常不得猜测为 overflow，保持其原有普通 provider 错误语义。上层只识别 Byte Mentor 的错误契约。
+每个 provider adapter 只依据自身厂商的可靠结构化状态归类：网络、429 和可恢复 5xx 为 `retryable`，认证、权限和非法请求为 `permanent`，显式取消为 `cancelled`，可靠结构化上下文超限为 `context-overflow`。OpenAI adapter 可以在自身内部依赖 OpenAI SDK 的错误结构，未来其他 adapter 分别实现各自映射；无法确认的异常不得猜测为 overflow。上层只识别 Byte Mentor 的错误契约。
+
+无法可靠归类的厂商异常可以保持原异常：普通 ReAct 按普通 provider failure 收口，provider-backed Summary 保守映射为 permanent；任何上层都不得解析 message 文案补猜分类。
+
+Summary/Compaction 不进入 Provider 层。M7 在 `summary/` 提供 `ProviderBackedSummaryModel`：它把 `SummaryRequest` 适配为一次普通、无工具的 Provider 调用；Provider 的通用请求显式携带 model、thinking level、可选 instructions、messages、tools 和输出上限，但不知道 cut point、摘要 prompt 的业务来源、CompactionEntry 或 checkpoint。摘要适配器再把 provider-neutral 错误机械映射为 `SummaryError`，重试仍由摘要执行边界负责。
 
 provider 调用发生 overflow 时，在最近安全 checkpoint 上自动压缩并重试该 provider 调用一次：失败请求的 partial stream 被丢弃，已完成工具不会重新执行。同一次调用最多恢复一次；压缩后仍 overflow 时停止并建议切换更大窗口模型。成功响应若 usage 已接近阈值，不重试该响应，只在下一个安全点压缩。
 

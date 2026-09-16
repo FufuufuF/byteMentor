@@ -39,7 +39,32 @@
 - pending Entry 一旦形成就获得稳定 ID 和确定的逻辑 parent；checkpoint 始终保存从 pending User 到当前稳定 pending leaf 的完整链。
 - 正式 Session 树只包含已提交 Entry；pending 链只由运行中 transcript 展示，不可被 Tree 导航。
 - Turn 到达可提交终态后，使用一个事务校验 `active_leaf_id = baseLeafId`，物化全部 pending Entry，推进 leaf/sequence，并删除 runtime checkpoint。
-- 新 Session 延续 M4 的延迟创建语义：首次发送时在同一个原子操作中创建 Session 行并写入 `ready_for_iteration` checkpoint。
+- 新 Session 延续 M4 的延迟创建语义：`/new` 只回到 `currentSessionId = null` 的 Home，不写数据库；只有用户在 Home 发送第一条消息时，才在同一个原子操作中创建 Session 行并写入 `ready_for_iteration` checkpoint。创建失败不留下空 Session、不调用 provider，并保留 Home 与用户输入。
+- SessionStore 为上述边界提供专用的“创建 Session + 首 checkpoint”原子操作；已有 Session 的后续 Turn 仍使用单条 checkpoint 更新，不重复创建 Session。
+- AgentLoop 的 Turn 输入使用显式 discriminated union 区分新旧会话：`kind = "new"` 携带 workspace、初始 model 和 thinking level，`kind = "existing"` 只携带正式 `sessionId`。不得再用可选 `sessionId` 或构造期 `newSessionDefaults` 隐式推断创建语义；已有 Session 的状态始终从持久化活动路径恢复。
+
+```ts
+interface CreateSessionWithCheckpointInput extends CreateSessionInput {
+  checkpoint: unknown; // session 包只原子保存 JSON；M7 Runtime 负责结构校验
+}
+
+type HeadlessTurnInput =
+  | {
+      session: {
+        kind: "new";
+        workspaceRoot: string;
+        initialModel: ModelRef;
+        initialThinkingLevel: ThinkingLevel;
+      };
+      userMessage: string;
+    }
+  | {
+      session: { kind: "existing"; sessionId: SessionId };
+      userMessage: string;
+    };
+```
+
+SessionStore 对应公开原语命名为 `createSessionWithCheckpoint()`；它和 `createSessionWithEntries()` 分别服务首次 Runtime Turn 与 Fork，不互相复用含义不同的事务。
 
 准确 checkpoint phase 与各阶段恢复语义已在 1.3、1.4 确认；本小节定义统一 checkpoint、Turn 开始的 durable 边界和 pending 链语义。
 
@@ -251,3 +276,34 @@ provider 产生不含 tool calls 的完整 Assistant 时，当前 Turn 不立即
 最终事务失败时，Turn 尚未完成收口，不打包、不重新入队，mailbox worker 继续由当前 operation 占用，并保留封闭的 `pendingQueue` 与内存最终链重试同一事务。进程直接崩溃时，`pendingQueue` 和 MessageBus 中尚未 checkpoint 的消息仍可丢失。
 
 `stop` 不属于上述普通异常重入队流程。它会按 1.6 直接丢弃尚未 checkpoint、且仍可归入当前 Turn 的补充消息，不打包、不重新入队。
+
+### 1.8 Provider、SummaryModelPort 与 overflow 边界（已确认）
+
+Compaction/Branch Summary 与普通 ReAct 都是模型调用，但 Provider 不感知“压缩”或“摘要”业务语义：
+
+```text
+Compaction / Branch Summary
+  → SummaryModelPort
+      → ProviderBackedSummaryModel（summary 层适配器）
+          → ModelProvider（普通模型调用）
+```
+
+- `ProviderBackedSummaryModel` 位于 `summary/`，把 `SummaryRequest.instructions/historyText/model/thinkingLevel/maxOutputTokens/signal` 映射为一次无工具的通用 Provider 请求，并把 Assistant 文本/usage 映射回 `SummaryResponse`。
+- Provider 的通用请求显式携带 model、thinking level、可选 instructions、messages、tools 与输出上限；普通 AgentRunner 和摘要适配器消费同一请求契约。
+- Provider adapter 只负责厂商协议与 provider-neutral 调用错误归一化，不包含 cut point、摘要 prompt、CompactionEntry、重试编排或 checkpoint 逻辑。
+- `ProviderInvocationError.kind` 首版为 `context-overflow | retryable | permanent | cancelled`：网络、429、可恢复 5xx 为 retryable；认证、权限、非法请求为 permanent；显式取消为 cancelled；可靠结构化上下文超限保持独立的 context-overflow。
+- `ProviderBackedSummaryModel` 将 retryable/permanent/cancelled 机械映射到同名 `SummaryError`，将 context-overflow 映射为 permanent；摘要重试次数仍由 `executeSummaryWithRetry` 决定。
+- AgentRunner 仅让 `context-overflow` 保持结构化并原样交给 AgentLoop；普通 provider 错误继续形成当前 Turn 的 failed/cancelled 结果。AgentLoop 在最近稳定 checkpoint 上最多执行一次 Compaction 并重试同一次 provider 调用，第二次 overflow 不再压缩。
+
+```ts
+interface ProviderRequest {
+  model: ModelRef;
+  thinkingLevel: ThinkingLevel;
+  instructions?: string;
+  messages: Message[];
+  tools?: ToolDefinition[];
+  maxOutputTokens?: number;
+}
+```
+
+无法可靠归类的厂商异常不得根据 message 文案猜测；普通 ReAct 将其作为普通 provider failure，provider-backed Summary 将其保守映射为 permanent，不自动重试。
